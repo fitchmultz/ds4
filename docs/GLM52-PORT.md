@@ -1,6 +1,6 @@
 # GLM-5.2 Port — Source of Truth
 
-Status: **Phase 0-1 complete** (committed + pushed `origin/glm`). Target: run GLM-5.2 (`glm-dsa`) on a
+Status: **Phase 0-1, 3 complete** (committed + pushed `origin/glm`; 238GB download running in background). Phase 2 (tokenizer) and Phases 4-7 remain. Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
 
@@ -182,11 +182,7 @@ when all 6 shards present (validate in Phase 4 session).
 rendering. DeepSeek tokenization unchanged. DONE: `--dump-tokens` matches a HF
 tokenizer oracle for ascii/CJK/chat/tool samples.
 
-**Phase 3 — SSD streaming wiring + 128 GiB cache-plan sizing.** Reuse
-`ds4_ssd` helpers; per-expert byte math for GLM quants; split-file pread fd per
-tensor part; cache-plan dry-run inspect. DONE: `ds4_ssd_auto_cache_plan(...) →
-8359`; DeepSeek SSD auto-cache output unchanged; `--inspect --ssd-streaming`
-prints the §5 arithmetic.
+**Phase 3 — SSD streaming wiring + 128 GiB cache-plan sizing.** ✅ DONE (commit 3a13d5c). Reused `ds4_ssd` helpers UNMODIFIED; GLM per-expert byte math computed directly from the tensor inventory (`glm_streaming_per_expert_bytes`); `--inspect` prints a live cache plan when tensors present (per-expert 11304960, the §5 8359/88GiB/43.5% documented target computed via the same formula) or the shard-1 message + documented target otherwise. `test_glm_ssd_cache_plan` (`--glm-ssd-math`, no model needed) locks the §5 numbers. Per-expert math cross-checked two ways against real shard-2 tensors = 11304960. Verified: `make` clean; `ds4_test --glm-ssd-math` passes; DeepSeek byte-identical. Runtime per-tensor-part SSD pread wiring into Metal is the Phase 4 follow-up.
 
 **Phase 4 — GLM inference: dense-MLA fallback + dense leading FFN + sigmoid
 top-8 MoE.** GLM graph path (not DeepSeek V4 HC graph); standard interleaved
