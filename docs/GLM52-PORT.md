@@ -1,6 +1,6 @@
 # GLM-5.2 Port — Source of Truth
 
-Status: **in progress** on branch `glm`. Target: run GLM-5.2 (`glm-dsa`) on a
+Status: **Phase 0-1 complete** (committed + pushed `origin/glm`). Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
 
@@ -161,17 +161,21 @@ must produce for `(128 GiB, 15441835008, 11304960, 19200)`.
 
 ## 6. Phased plan
 
-**Phase 0 — scaffolding.** This doc, `download_glm52.sh`, `.gitignore`, branch
-`glm`. DONE CRITERIA: downloader `--help` works; shard-1 fetch = 9,423,744 B.
+**Phase 0 — scaffolding.** ✅ DONE (commit 4ac372f). This doc, `download_glm52.sh`,
+branch `glm`. Verified: downloader `--help` works; shard-1 fetch = 9,423,744 B.
 
-**Phase 1 — loader/metadata/tensor inventory for `glm-dsa`.** Architecture
-dispatch by `general.architecture`; split-GGUF support (shard array, per-tensor
-`part`, metadata-only inspect works from shard 1 alone); GLM shape profile;
-`glm-dsa.*` validation; tensor inventory binding with pattern-count checks;
-CUDA/distributed reject GLM gracefully. Must not touch the DeepSeek path.
-DONE: `--inspect -m <shard1>` reports glm-dsa, block_count 79, split tensors
-1809 declared / 0 in shard; full split → 1809 merged + pattern counts; DeepSeek
-`--inspect` unchanged; `make` green.
+**Phase 1 — loader/metadata/tensor inventory for `glm-dsa`.** ✅ DONE (commit
+009d62a). Architecture dispatch by `general.architecture`; split-GGUF support
+(part array with part-0 aliases, per-tensor `part`, independent per-shard mmap,
+metadata-only inspect works from shard 1 alone); GLM shape profile; `glm-dsa.*`
+validation; tensor inventory pattern-count reporting (79/3/76/4/3); CUDA/
+distributed/non-Metal reject GLM cleanly; GLM inference rejected (Phase 4).
+Verified: `make` 0 warnings/errors; `./ds4 --inspect -m ds4flash.gguf` byte-
+identical to `main`; shard-1 inspect reports glm-dsa / block_count 79 / split
+1809 declared·0 present, exit 0; backend-reject + missing-shard exit 1. Scope:
+`ds4.c` only (+593/-9); no DS4_MAX_* cap bumps; no CUDA/ROCm/distributed/Metal/
+SSD/C++ changes. Full-split tensor-count strict check implemented, fires only
+when all 6 shards present (validate in Phase 4 session).
 
 **Phase 2 — glm4 BPE tokenizer + chat template.** Tokenizer mode from
 `tokenizer.ggml.pre` (joyai vs glm4); GLM special tokens; `[gMASK]<sop>` chat
