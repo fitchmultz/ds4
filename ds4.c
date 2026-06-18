@@ -146,6 +146,13 @@ typedef enum {
     DS4_ARCH_GLM_DSA  = 1,   /* glm-dsa.* metadata, GLM-5.2 shape       */
 } ds4_arch;
 
+/* Tokenizer family, selected by tokenizer.ggml.pre during vocab_load.  The
+ * BPE merge engine is shared; only the pre-tokenizer split differs. */
+typedef enum {
+    DS4_TOK_JOYAI = 0,   /* DeepSeek: joyai-llm CJK/punct heuristic split. */
+    DS4_TOK_GLM4  = 1,   /* GLM-5.2: glm4 GPT-2/GPT-4 byte-level split.    */
+} ds4_tokenizer_mode;
+
 typedef struct {
     const char *name;
     ds4_variant variant;
@@ -21867,6 +21874,14 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     return true;
 }
 
+/* A special/added token matched as a single id during tokenization.  Loaded
+ * from the GGUF (token_type for GLM, the DeepSeek role literals for joyai)
+ * so the split set is data-driven, not hardcoded per architecture. */
+typedef struct {
+    ds4_str text;
+    int     id;
+} ds4_special_token;
+
 struct ds4_vocab {
     ds4_str *token;
     int n_vocab;
@@ -21877,6 +21892,13 @@ struct ds4_vocab {
     int think_start_id;
     int think_end_id;
     int dsml_id;
+    ds4_tokenizer_mode mode;     /* joyai vs glm4 pre-tokenizer             */
+    /* GLM-only chat sentinels; -1 on the DeepSeek path. */
+    int sop_id;                  /* <sop> (follows [gMASK] bos)             */
+    int system_id;               /* <|system|>                              */
+    int observation_id;          /* <|observation|>                         */
+    ds4_special_token *specials; /* special-token split set, longest-first  */
+    int n_specials;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -22054,6 +22076,18 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
 static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
+
+    /* GLM's BPE model sets ignore_merges=true: if the whole byte-level word is
+     * already a vocab token, emit it directly and skip the merge loop.  This is
+     * how multi-byte scripts (CJK, Cyrillic, ...) collapse to a single id. */
+    if (vocab->mode == DS4_TOK_GLM4) {
+        int whole = -1;
+        if (table_get(&vocab->token_to_id, encoded, encoded_len, &whole)) {
+            token_vec_push(out, whole);
+            free(encoded);
+            return;
+        }
+    }
 
     int n_sym = 0;
     int cap_sym = 32;
@@ -22296,6 +22330,298 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
 }
 
+/* ---------------------------------------------------------------------
+ * glm4 pre-tokenizer (GLM-5.2).  Byte-level BPE shares bpe_emit_piece with
+ * the joyai path; only the pre-tokenizer split differs.  The regex below is
+ * the exact one from zai-org/GLM-5.2 tokenizer.json:
+ *
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+ *   | [^\r\n\p{L}\p{N}]?\p{L}+
+ *   | \p{N}{1,3}
+ *   |  ?[^\s\p{L}\p{N}]+[\r\n]*
+ *   | \s*[\r\n]+
+ *   | \s+(?!\S)
+ *   | \s+
+ *
+ * The Unicode \p{L}/\p{N} tables are generated ranges (binary-searched).
+ * The tables carry no behavior beyond codepoint classification, so they are
+ * inert for the DeepSeek path, which never calls glm4_tokenize_text.
+ * --------------------------------------------------------------------- */
+
+/* glm_unicode_L: 677 inclusive codepoint ranges (\p{L}), binary-searched. */
+static const uint32_t glm_unicode_L[] = {
+    0x00041, 0x0005a, 0x00061, 0x0007a, 0x000aa, 0x000aa, 0x000b5, 0x000b5, 0x000ba, 0x000ba, 0x000c0, 0x000d6,
+    0x000d8, 0x000f6, 0x000f8, 0x002c1, 0x002c6, 0x002d1, 0x002e0, 0x002e4, 0x002ec, 0x002ec, 0x002ee, 0x002ee,
+    0x00370, 0x00374, 0x00376, 0x00377, 0x0037a, 0x0037d, 0x0037f, 0x0037f, 0x00386, 0x00386, 0x00388, 0x0038a,
+    0x0038c, 0x0038c, 0x0038e, 0x003a1, 0x003a3, 0x003f5, 0x003f7, 0x00481, 0x0048a, 0x0052f, 0x00531, 0x00556,
+    0x00559, 0x00559, 0x00560, 0x00588, 0x005d0, 0x005ea, 0x005ef, 0x005f2, 0x00620, 0x0064a, 0x0066e, 0x0066f,
+    0x00671, 0x006d3, 0x006d5, 0x006d5, 0x006e5, 0x006e6, 0x006ee, 0x006ef, 0x006fa, 0x006fc, 0x006ff, 0x006ff,
+    0x00710, 0x00710, 0x00712, 0x0072f, 0x0074d, 0x007a5, 0x007b1, 0x007b1, 0x007ca, 0x007ea, 0x007f4, 0x007f5,
+    0x007fa, 0x007fa, 0x00800, 0x00815, 0x0081a, 0x0081a, 0x00824, 0x00824, 0x00828, 0x00828, 0x00840, 0x00858,
+    0x00860, 0x0086a, 0x00870, 0x00887, 0x00889, 0x0088e, 0x008a0, 0x008c9, 0x00904, 0x00939, 0x0093d, 0x0093d,
+    0x00950, 0x00950, 0x00958, 0x00961, 0x00971, 0x00980, 0x00985, 0x0098c, 0x0098f, 0x00990, 0x00993, 0x009a8,
+    0x009aa, 0x009b0, 0x009b2, 0x009b2, 0x009b6, 0x009b9, 0x009bd, 0x009bd, 0x009ce, 0x009ce, 0x009dc, 0x009dd,
+    0x009df, 0x009e1, 0x009f0, 0x009f1, 0x009fc, 0x009fc, 0x00a05, 0x00a0a, 0x00a0f, 0x00a10, 0x00a13, 0x00a28,
+    0x00a2a, 0x00a30, 0x00a32, 0x00a33, 0x00a35, 0x00a36, 0x00a38, 0x00a39, 0x00a59, 0x00a5c, 0x00a5e, 0x00a5e,
+    0x00a72, 0x00a74, 0x00a85, 0x00a8d, 0x00a8f, 0x00a91, 0x00a93, 0x00aa8, 0x00aaa, 0x00ab0, 0x00ab2, 0x00ab3,
+    0x00ab5, 0x00ab9, 0x00abd, 0x00abd, 0x00ad0, 0x00ad0, 0x00ae0, 0x00ae1, 0x00af9, 0x00af9, 0x00b05, 0x00b0c,
+    0x00b0f, 0x00b10, 0x00b13, 0x00b28, 0x00b2a, 0x00b30, 0x00b32, 0x00b33, 0x00b35, 0x00b39, 0x00b3d, 0x00b3d,
+    0x00b5c, 0x00b5d, 0x00b5f, 0x00b61, 0x00b71, 0x00b71, 0x00b83, 0x00b83, 0x00b85, 0x00b8a, 0x00b8e, 0x00b90,
+    0x00b92, 0x00b95, 0x00b99, 0x00b9a, 0x00b9c, 0x00b9c, 0x00b9e, 0x00b9f, 0x00ba3, 0x00ba4, 0x00ba8, 0x00baa,
+    0x00bae, 0x00bb9, 0x00bd0, 0x00bd0, 0x00c05, 0x00c0c, 0x00c0e, 0x00c10, 0x00c12, 0x00c28, 0x00c2a, 0x00c39,
+    0x00c3d, 0x00c3d, 0x00c58, 0x00c5a, 0x00c5d, 0x00c5d, 0x00c60, 0x00c61, 0x00c80, 0x00c80, 0x00c85, 0x00c8c,
+    0x00c8e, 0x00c90, 0x00c92, 0x00ca8, 0x00caa, 0x00cb3, 0x00cb5, 0x00cb9, 0x00cbd, 0x00cbd, 0x00cdd, 0x00cde,
+    0x00ce0, 0x00ce1, 0x00cf1, 0x00cf2, 0x00d04, 0x00d0c, 0x00d0e, 0x00d10, 0x00d12, 0x00d3a, 0x00d3d, 0x00d3d,
+    0x00d4e, 0x00d4e, 0x00d54, 0x00d56, 0x00d5f, 0x00d61, 0x00d7a, 0x00d7f, 0x00d85, 0x00d96, 0x00d9a, 0x00db1,
+    0x00db3, 0x00dbb, 0x00dbd, 0x00dbd, 0x00dc0, 0x00dc6, 0x00e01, 0x00e30, 0x00e32, 0x00e33, 0x00e40, 0x00e46,
+    0x00e81, 0x00e82, 0x00e84, 0x00e84, 0x00e86, 0x00e8a, 0x00e8c, 0x00ea3, 0x00ea5, 0x00ea5, 0x00ea7, 0x00eb0,
+    0x00eb2, 0x00eb3, 0x00ebd, 0x00ebd, 0x00ec0, 0x00ec4, 0x00ec6, 0x00ec6, 0x00edc, 0x00edf, 0x00f00, 0x00f00,
+    0x00f40, 0x00f47, 0x00f49, 0x00f6c, 0x00f88, 0x00f8c, 0x01000, 0x0102a, 0x0103f, 0x0103f, 0x01050, 0x01055,
+    0x0105a, 0x0105d, 0x01061, 0x01061, 0x01065, 0x01066, 0x0106e, 0x01070, 0x01075, 0x01081, 0x0108e, 0x0108e,
+    0x010a0, 0x010c5, 0x010c7, 0x010c7, 0x010cd, 0x010cd, 0x010d0, 0x010fa, 0x010fc, 0x01248, 0x0124a, 0x0124d,
+    0x01250, 0x01256, 0x01258, 0x01258, 0x0125a, 0x0125d, 0x01260, 0x01288, 0x0128a, 0x0128d, 0x01290, 0x012b0,
+    0x012b2, 0x012b5, 0x012b8, 0x012be, 0x012c0, 0x012c0, 0x012c2, 0x012c5, 0x012c8, 0x012d6, 0x012d8, 0x01310,
+    0x01312, 0x01315, 0x01318, 0x0135a, 0x01380, 0x0138f, 0x013a0, 0x013f5, 0x013f8, 0x013fd, 0x01401, 0x0166c,
+    0x0166f, 0x0167f, 0x01681, 0x0169a, 0x016a0, 0x016ea, 0x016f1, 0x016f8, 0x01700, 0x01711, 0x0171f, 0x01731,
+    0x01740, 0x01751, 0x01760, 0x0176c, 0x0176e, 0x01770, 0x01780, 0x017b3, 0x017d7, 0x017d7, 0x017dc, 0x017dc,
+    0x01820, 0x01878, 0x01880, 0x01884, 0x01887, 0x018a8, 0x018aa, 0x018aa, 0x018b0, 0x018f5, 0x01900, 0x0191e,
+    0x01950, 0x0196d, 0x01970, 0x01974, 0x01980, 0x019ab, 0x019b0, 0x019c9, 0x01a00, 0x01a16, 0x01a20, 0x01a54,
+    0x01aa7, 0x01aa7, 0x01b05, 0x01b33, 0x01b45, 0x01b4c, 0x01b83, 0x01ba0, 0x01bae, 0x01baf, 0x01bba, 0x01be5,
+    0x01c00, 0x01c23, 0x01c4d, 0x01c4f, 0x01c5a, 0x01c7d, 0x01c80, 0x01c8a, 0x01c90, 0x01cba, 0x01cbd, 0x01cbf,
+    0x01ce9, 0x01cec, 0x01cee, 0x01cf3, 0x01cf5, 0x01cf6, 0x01cfa, 0x01cfa, 0x01d00, 0x01dbf, 0x01e00, 0x01f15,
+    0x01f18, 0x01f1d, 0x01f20, 0x01f45, 0x01f48, 0x01f4d, 0x01f50, 0x01f57, 0x01f59, 0x01f59, 0x01f5b, 0x01f5b,
+    0x01f5d, 0x01f5d, 0x01f5f, 0x01f7d, 0x01f80, 0x01fb4, 0x01fb6, 0x01fbc, 0x01fbe, 0x01fbe, 0x01fc2, 0x01fc4,
+    0x01fc6, 0x01fcc, 0x01fd0, 0x01fd3, 0x01fd6, 0x01fdb, 0x01fe0, 0x01fec, 0x01ff2, 0x01ff4, 0x01ff6, 0x01ffc,
+    0x02071, 0x02071, 0x0207f, 0x0207f, 0x02090, 0x0209c, 0x02102, 0x02102, 0x02107, 0x02107, 0x0210a, 0x02113,
+    0x02115, 0x02115, 0x02119, 0x0211d, 0x02124, 0x02124, 0x02126, 0x02126, 0x02128, 0x02128, 0x0212a, 0x0212d,
+    0x0212f, 0x02139, 0x0213c, 0x0213f, 0x02145, 0x02149, 0x0214e, 0x0214e, 0x02183, 0x02184, 0x02c00, 0x02ce4,
+    0x02ceb, 0x02cee, 0x02cf2, 0x02cf3, 0x02d00, 0x02d25, 0x02d27, 0x02d27, 0x02d2d, 0x02d2d, 0x02d30, 0x02d67,
+    0x02d6f, 0x02d6f, 0x02d80, 0x02d96, 0x02da0, 0x02da6, 0x02da8, 0x02dae, 0x02db0, 0x02db6, 0x02db8, 0x02dbe,
+    0x02dc0, 0x02dc6, 0x02dc8, 0x02dce, 0x02dd0, 0x02dd6, 0x02dd8, 0x02dde, 0x02e2f, 0x02e2f, 0x03005, 0x03006,
+    0x03031, 0x03035, 0x0303b, 0x0303c, 0x03041, 0x03096, 0x0309d, 0x0309f, 0x030a1, 0x030fa, 0x030fc, 0x030ff,
+    0x03105, 0x0312f, 0x03131, 0x0318e, 0x031a0, 0x031bf, 0x031f0, 0x031ff, 0x03400, 0x04dbf, 0x04e00, 0x0a48c,
+    0x0a4d0, 0x0a4fd, 0x0a500, 0x0a60c, 0x0a610, 0x0a61f, 0x0a62a, 0x0a62b, 0x0a640, 0x0a66e, 0x0a67f, 0x0a69d,
+    0x0a6a0, 0x0a6e5, 0x0a717, 0x0a71f, 0x0a722, 0x0a788, 0x0a78b, 0x0a7cd, 0x0a7d0, 0x0a7d1, 0x0a7d3, 0x0a7d3,
+    0x0a7d5, 0x0a7dc, 0x0a7f2, 0x0a801, 0x0a803, 0x0a805, 0x0a807, 0x0a80a, 0x0a80c, 0x0a822, 0x0a840, 0x0a873,
+    0x0a882, 0x0a8b3, 0x0a8f2, 0x0a8f7, 0x0a8fb, 0x0a8fb, 0x0a8fd, 0x0a8fe, 0x0a90a, 0x0a925, 0x0a930, 0x0a946,
+    0x0a960, 0x0a97c, 0x0a984, 0x0a9b2, 0x0a9cf, 0x0a9cf, 0x0a9e0, 0x0a9e4, 0x0a9e6, 0x0a9ef, 0x0a9fa, 0x0a9fe,
+    0x0aa00, 0x0aa28, 0x0aa40, 0x0aa42, 0x0aa44, 0x0aa4b, 0x0aa60, 0x0aa76, 0x0aa7a, 0x0aa7a, 0x0aa7e, 0x0aaaf,
+    0x0aab1, 0x0aab1, 0x0aab5, 0x0aab6, 0x0aab9, 0x0aabd, 0x0aac0, 0x0aac0, 0x0aac2, 0x0aac2, 0x0aadb, 0x0aadd,
+    0x0aae0, 0x0aaea, 0x0aaf2, 0x0aaf4, 0x0ab01, 0x0ab06, 0x0ab09, 0x0ab0e, 0x0ab11, 0x0ab16, 0x0ab20, 0x0ab26,
+    0x0ab28, 0x0ab2e, 0x0ab30, 0x0ab5a, 0x0ab5c, 0x0ab69, 0x0ab70, 0x0abe2, 0x0ac00, 0x0d7a3, 0x0d7b0, 0x0d7c6,
+    0x0d7cb, 0x0d7fb, 0x0f900, 0x0fa6d, 0x0fa70, 0x0fad9, 0x0fb00, 0x0fb06, 0x0fb13, 0x0fb17, 0x0fb1d, 0x0fb1d,
+    0x0fb1f, 0x0fb28, 0x0fb2a, 0x0fb36, 0x0fb38, 0x0fb3c, 0x0fb3e, 0x0fb3e, 0x0fb40, 0x0fb41, 0x0fb43, 0x0fb44,
+    0x0fb46, 0x0fbb1, 0x0fbd3, 0x0fd3d, 0x0fd50, 0x0fd8f, 0x0fd92, 0x0fdc7, 0x0fdf0, 0x0fdfb, 0x0fe70, 0x0fe74,
+    0x0fe76, 0x0fefc, 0x0ff21, 0x0ff3a, 0x0ff41, 0x0ff5a, 0x0ff66, 0x0ffbe, 0x0ffc2, 0x0ffc7, 0x0ffca, 0x0ffcf,
+    0x0ffd2, 0x0ffd7, 0x0ffda, 0x0ffdc, 0x10000, 0x1000b, 0x1000d, 0x10026, 0x10028, 0x1003a, 0x1003c, 0x1003d,
+    0x1003f, 0x1004d, 0x10050, 0x1005d, 0x10080, 0x100fa, 0x10280, 0x1029c, 0x102a0, 0x102d0, 0x10300, 0x1031f,
+    0x1032d, 0x10340, 0x10342, 0x10349, 0x10350, 0x10375, 0x10380, 0x1039d, 0x103a0, 0x103c3, 0x103c8, 0x103cf,
+    0x10400, 0x1049d, 0x104b0, 0x104d3, 0x104d8, 0x104fb, 0x10500, 0x10527, 0x10530, 0x10563, 0x10570, 0x1057a,
+    0x1057c, 0x1058a, 0x1058c, 0x10592, 0x10594, 0x10595, 0x10597, 0x105a1, 0x105a3, 0x105b1, 0x105b3, 0x105b9,
+    0x105bb, 0x105bc, 0x105c0, 0x105f3, 0x10600, 0x10736, 0x10740, 0x10755, 0x10760, 0x10767, 0x10780, 0x10785,
+    0x10787, 0x107b0, 0x107b2, 0x107ba, 0x10800, 0x10805, 0x10808, 0x10808, 0x1080a, 0x10835, 0x10837, 0x10838,
+    0x1083c, 0x1083c, 0x1083f, 0x10855, 0x10860, 0x10876, 0x10880, 0x1089e, 0x108e0, 0x108f2, 0x108f4, 0x108f5,
+    0x10900, 0x10915, 0x10920, 0x10939, 0x10980, 0x109b7, 0x109be, 0x109bf, 0x10a00, 0x10a00, 0x10a10, 0x10a13,
+    0x10a15, 0x10a17, 0x10a19, 0x10a35, 0x10a60, 0x10a7c, 0x10a80, 0x10a9c, 0x10ac0, 0x10ac7, 0x10ac9, 0x10ae4,
+    0x10b00, 0x10b35, 0x10b40, 0x10b55, 0x10b60, 0x10b72, 0x10b80, 0x10b91, 0x10c00, 0x10c48, 0x10c80, 0x10cb2,
+    0x10cc0, 0x10cf2, 0x10d00, 0x10d23, 0x10d4a, 0x10d65, 0x10d6f, 0x10d85, 0x10e80, 0x10ea9, 0x10eb0, 0x10eb1,
+    0x10ec2, 0x10ec4, 0x10f00, 0x10f1c, 0x10f27, 0x10f27, 0x10f30, 0x10f45, 0x10f70, 0x10f81, 0x10fb0, 0x10fc4,
+    0x10fe0, 0x10ff6, 0x11003, 0x11037, 0x11071, 0x11072, 0x11075, 0x11075, 0x11083, 0x110af, 0x110d0, 0x110e8,
+    0x11103, 0x11126, 0x11144, 0x11144, 0x11147, 0x11147, 0x11150, 0x11172, 0x11176, 0x11176, 0x11183, 0x111b2,
+    0x111c1, 0x111c4, 0x111da, 0x111da, 0x111dc, 0x111dc, 0x11200, 0x11211, 0x11213, 0x1122b, 0x1123f, 0x11240,
+    0x11280, 0x11286, 0x11288, 0x11288, 0x1128a, 0x1128d, 0x1128f, 0x1129d, 0x1129f, 0x112a8, 0x112b0, 0x112de,
+    0x11305, 0x1130c, 0x1130f, 0x11310, 0x11313, 0x11328, 0x1132a, 0x11330, 0x11332, 0x11333, 0x11335, 0x11339,
+    0x1133d, 0x1133d, 0x11350, 0x11350, 0x1135d, 0x11361, 0x11380, 0x11389, 0x1138b, 0x1138b, 0x1138e, 0x1138e,
+    0x11390, 0x113b5, 0x113b7, 0x113b7, 0x113d1, 0x113d1, 0x113d3, 0x113d3, 0x11400, 0x11434, 0x11447, 0x1144a,
+    0x1145f, 0x11461, 0x11480, 0x114af, 0x114c4, 0x114c5, 0x114c7, 0x114c7, 0x11580, 0x115ae, 0x115d8, 0x115db,
+    0x11600, 0x1162f, 0x11644, 0x11644, 0x11680, 0x116aa, 0x116b8, 0x116b8, 0x11700, 0x1171a, 0x11740, 0x11746,
+    0x11800, 0x1182b, 0x118a0, 0x118df, 0x118ff, 0x11906, 0x11909, 0x11909, 0x1190c, 0x11913, 0x11915, 0x11916,
+    0x11918, 0x1192f, 0x1193f, 0x1193f, 0x11941, 0x11941, 0x119a0, 0x119a7, 0x119aa, 0x119d0, 0x119e1, 0x119e1,
+    0x119e3, 0x119e3, 0x11a00, 0x11a00, 0x11a0b, 0x11a32, 0x11a3a, 0x11a3a, 0x11a50, 0x11a50, 0x11a5c, 0x11a89,
+    0x11a9d, 0x11a9d, 0x11ab0, 0x11af8, 0x11bc0, 0x11be0, 0x11c00, 0x11c08, 0x11c0a, 0x11c2e, 0x11c40, 0x11c40,
+    0x11c72, 0x11c8f, 0x11d00, 0x11d06, 0x11d08, 0x11d09, 0x11d0b, 0x11d30, 0x11d46, 0x11d46, 0x11d60, 0x11d65,
+    0x11d67, 0x11d68, 0x11d6a, 0x11d89, 0x11d98, 0x11d98, 0x11ee0, 0x11ef2, 0x11f02, 0x11f02, 0x11f04, 0x11f10,
+    0x11f12, 0x11f33, 0x11fb0, 0x11fb0, 0x12000, 0x12399, 0x12480, 0x12543, 0x12f90, 0x12ff0, 0x13000, 0x1342f,
+    0x13441, 0x13446, 0x13460, 0x143fa, 0x14400, 0x14646, 0x16100, 0x1611d, 0x16800, 0x16a38, 0x16a40, 0x16a5e,
+    0x16a70, 0x16abe, 0x16ad0, 0x16aed, 0x16b00, 0x16b2f, 0x16b40, 0x16b43, 0x16b63, 0x16b77, 0x16b7d, 0x16b8f,
+    0x16d40, 0x16d6c, 0x16e40, 0x16e7f, 0x16f00, 0x16f4a, 0x16f50, 0x16f50, 0x16f93, 0x16f9f, 0x16fe0, 0x16fe1,
+    0x16fe3, 0x16fe3, 0x17000, 0x187f7, 0x18800, 0x18cd5, 0x18cff, 0x18d08, 0x1aff0, 0x1aff3, 0x1aff5, 0x1affb,
+    0x1affd, 0x1affe, 0x1b000, 0x1b122, 0x1b132, 0x1b132, 0x1b150, 0x1b152, 0x1b155, 0x1b155, 0x1b164, 0x1b167,
+    0x1b170, 0x1b2fb, 0x1bc00, 0x1bc6a, 0x1bc70, 0x1bc7c, 0x1bc80, 0x1bc88, 0x1bc90, 0x1bc99, 0x1d400, 0x1d454,
+    0x1d456, 0x1d49c, 0x1d49e, 0x1d49f, 0x1d4a2, 0x1d4a2, 0x1d4a5, 0x1d4a6, 0x1d4a9, 0x1d4ac, 0x1d4ae, 0x1d4b9,
+    0x1d4bb, 0x1d4bb, 0x1d4bd, 0x1d4c3, 0x1d4c5, 0x1d505, 0x1d507, 0x1d50a, 0x1d50d, 0x1d514, 0x1d516, 0x1d51c,
+    0x1d51e, 0x1d539, 0x1d53b, 0x1d53e, 0x1d540, 0x1d544, 0x1d546, 0x1d546, 0x1d54a, 0x1d550, 0x1d552, 0x1d6a5,
+    0x1d6a8, 0x1d6c0, 0x1d6c2, 0x1d6da, 0x1d6dc, 0x1d6fa, 0x1d6fc, 0x1d714, 0x1d716, 0x1d734, 0x1d736, 0x1d74e,
+    0x1d750, 0x1d76e, 0x1d770, 0x1d788, 0x1d78a, 0x1d7a8, 0x1d7aa, 0x1d7c2, 0x1d7c4, 0x1d7cb, 0x1df00, 0x1df1e,
+    0x1df25, 0x1df2a, 0x1e030, 0x1e06d, 0x1e100, 0x1e12c, 0x1e137, 0x1e13d, 0x1e14e, 0x1e14e, 0x1e290, 0x1e2ad,
+    0x1e2c0, 0x1e2eb, 0x1e4d0, 0x1e4eb, 0x1e5d0, 0x1e5ed, 0x1e5f0, 0x1e5f0, 0x1e7e0, 0x1e7e6, 0x1e7e8, 0x1e7eb,
+    0x1e7ed, 0x1e7ee, 0x1e7f0, 0x1e7fe, 0x1e800, 0x1e8c4, 0x1e900, 0x1e943, 0x1e94b, 0x1e94b, 0x1ee00, 0x1ee03,
+    0x1ee05, 0x1ee1f, 0x1ee21, 0x1ee22, 0x1ee24, 0x1ee24, 0x1ee27, 0x1ee27, 0x1ee29, 0x1ee32, 0x1ee34, 0x1ee37,
+    0x1ee39, 0x1ee39, 0x1ee3b, 0x1ee3b, 0x1ee42, 0x1ee42, 0x1ee47, 0x1ee47, 0x1ee49, 0x1ee49, 0x1ee4b, 0x1ee4b,
+    0x1ee4d, 0x1ee4f, 0x1ee51, 0x1ee52, 0x1ee54, 0x1ee54, 0x1ee57, 0x1ee57, 0x1ee59, 0x1ee59, 0x1ee5b, 0x1ee5b,
+    0x1ee5d, 0x1ee5d, 0x1ee5f, 0x1ee5f, 0x1ee61, 0x1ee62, 0x1ee64, 0x1ee64, 0x1ee67, 0x1ee6a, 0x1ee6c, 0x1ee72,
+    0x1ee74, 0x1ee77, 0x1ee79, 0x1ee7c, 0x1ee7e, 0x1ee7e, 0x1ee80, 0x1ee89, 0x1ee8b, 0x1ee9b, 0x1eea1, 0x1eea3,
+    0x1eea5, 0x1eea9, 0x1eeab, 0x1eebb, 0x20000, 0x2a6df, 0x2a700, 0x2b739, 0x2b740, 0x2b81d, 0x2b820, 0x2cea1,
+    0x2ceb0, 0x2ebe0, 0x2ebf0, 0x2ee5d, 0x2f800, 0x2fa1d, 0x30000, 0x3134a, 0x31350, 0x323af
+};
+static bool glm_unicode_is_letter(uint32_t cp) {
+    size_t lo = 0, hi = sizeof(glm_unicode_L)/sizeof(glm_unicode_L[0])/2;
+    while (lo < hi) { size_t mid = (lo+hi)/2; uint32_t s = glm_unicode_L[mid*2]; if (cp < s) hi = mid; else lo = mid+1; }
+    if (lo == 0) return false;
+    return cp >= glm_unicode_L[(lo-1)*2] && cp <= glm_unicode_L[(lo-1)*2+1];
+}
+
+/* glm_unicode_N: 144 inclusive codepoint ranges (\p{N}), binary-searched. */
+static const uint32_t glm_unicode_N[] = {
+    0x00030, 0x00039, 0x000b2, 0x000b3, 0x000b9, 0x000b9, 0x000bc, 0x000be, 0x00660, 0x00669, 0x006f0, 0x006f9,
+    0x007c0, 0x007c9, 0x00966, 0x0096f, 0x009e6, 0x009ef, 0x009f4, 0x009f9, 0x00a66, 0x00a6f, 0x00ae6, 0x00aef,
+    0x00b66, 0x00b6f, 0x00b72, 0x00b77, 0x00be6, 0x00bf2, 0x00c66, 0x00c6f, 0x00c78, 0x00c7e, 0x00ce6, 0x00cef,
+    0x00d58, 0x00d5e, 0x00d66, 0x00d78, 0x00de6, 0x00def, 0x00e50, 0x00e59, 0x00ed0, 0x00ed9, 0x00f20, 0x00f33,
+    0x01040, 0x01049, 0x01090, 0x01099, 0x01369, 0x0137c, 0x016ee, 0x016f0, 0x017e0, 0x017e9, 0x017f0, 0x017f9,
+    0x01810, 0x01819, 0x01946, 0x0194f, 0x019d0, 0x019da, 0x01a80, 0x01a89, 0x01a90, 0x01a99, 0x01b50, 0x01b59,
+    0x01bb0, 0x01bb9, 0x01c40, 0x01c49, 0x01c50, 0x01c59, 0x02070, 0x02070, 0x02074, 0x02079, 0x02080, 0x02089,
+    0x02150, 0x02182, 0x02185, 0x02189, 0x02460, 0x0249b, 0x024ea, 0x024ff, 0x02776, 0x02793, 0x02cfd, 0x02cfd,
+    0x03007, 0x03007, 0x03021, 0x03029, 0x03038, 0x0303a, 0x03192, 0x03195, 0x03220, 0x03229, 0x03248, 0x0324f,
+    0x03251, 0x0325f, 0x03280, 0x03289, 0x032b1, 0x032bf, 0x0a620, 0x0a629, 0x0a6e6, 0x0a6ef, 0x0a830, 0x0a835,
+    0x0a8d0, 0x0a8d9, 0x0a900, 0x0a909, 0x0a9d0, 0x0a9d9, 0x0a9f0, 0x0a9f9, 0x0aa50, 0x0aa59, 0x0abf0, 0x0abf9,
+    0x0ff10, 0x0ff19, 0x10107, 0x10133, 0x10140, 0x10178, 0x1018a, 0x1018b, 0x102e1, 0x102fb, 0x10320, 0x10323,
+    0x10341, 0x10341, 0x1034a, 0x1034a, 0x103d1, 0x103d5, 0x104a0, 0x104a9, 0x10858, 0x1085f, 0x10879, 0x1087f,
+    0x108a7, 0x108af, 0x108fb, 0x108ff, 0x10916, 0x1091b, 0x109bc, 0x109bd, 0x109c0, 0x109cf, 0x109d2, 0x109ff,
+    0x10a40, 0x10a48, 0x10a7d, 0x10a7e, 0x10a9d, 0x10a9f, 0x10aeb, 0x10aef, 0x10b58, 0x10b5f, 0x10b78, 0x10b7f,
+    0x10ba9, 0x10baf, 0x10cfa, 0x10cff, 0x10d30, 0x10d39, 0x10d40, 0x10d49, 0x10e60, 0x10e7e, 0x10f1d, 0x10f26,
+    0x10f51, 0x10f54, 0x10fc5, 0x10fcb, 0x11052, 0x1106f, 0x110f0, 0x110f9, 0x11136, 0x1113f, 0x111d0, 0x111d9,
+    0x111e1, 0x111f4, 0x112f0, 0x112f9, 0x11450, 0x11459, 0x114d0, 0x114d9, 0x11650, 0x11659, 0x116c0, 0x116c9,
+    0x116d0, 0x116e3, 0x11730, 0x1173b, 0x118e0, 0x118f2, 0x11950, 0x11959, 0x11bf0, 0x11bf9, 0x11c50, 0x11c6c,
+    0x11d50, 0x11d59, 0x11da0, 0x11da9, 0x11f50, 0x11f59, 0x11fc0, 0x11fd4, 0x12400, 0x1246e, 0x16130, 0x16139,
+    0x16a60, 0x16a69, 0x16ac0, 0x16ac9, 0x16b50, 0x16b59, 0x16b5b, 0x16b61, 0x16d70, 0x16d79, 0x16e80, 0x16e96,
+    0x1ccf0, 0x1ccf9, 0x1d2c0, 0x1d2d3, 0x1d2e0, 0x1d2f3, 0x1d360, 0x1d378, 0x1d7ce, 0x1d7ff, 0x1e140, 0x1e149,
+    0x1e2f0, 0x1e2f9, 0x1e4f0, 0x1e4f9, 0x1e5f1, 0x1e5fa, 0x1e8c7, 0x1e8cf, 0x1e950, 0x1e959, 0x1ec71, 0x1ecab,
+    0x1ecad, 0x1ecaf, 0x1ecb1, 0x1ecb4, 0x1ed01, 0x1ed2d, 0x1ed2f, 0x1ed3d, 0x1f100, 0x1f10c, 0x1fbf0, 0x1fbf9
+};
+static bool glm_unicode_is_number(uint32_t cp) {
+    size_t lo = 0, hi = sizeof(glm_unicode_N)/sizeof(glm_unicode_N[0])/2;
+    while (lo < hi) { size_t mid = (lo+hi)/2; uint32_t s = glm_unicode_N[mid*2]; if (cp < s) hi = mid; else lo = mid+1; }
+    if (lo == 0) return false;
+    return cp >= glm_unicode_N[(lo-1)*2] && cp <= glm_unicode_N[(lo-1)*2+1];
+}
+
+/* Unicode whitespace (Rust regex \s with unicode enabled). */
+static bool glm_unicode_is_space(uint32_t cp) {
+    if (cp == 0x20 || (cp >= 0x09 && cp <= 0x0d) || cp == 0x85 || cp == 0xa0 ||
+        cp == 0x1680 || cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f ||
+        cp == 0x3000 || (cp >= 0x2000 && cp <= 0x200a)) return true;
+    return false;
+}
+
+static uint32_t glm_ascii_lower(uint32_t c) {
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
+/* Decode the codepoint at byte offset pos; 0 (with *next=pos) marks end. */
+static uint32_t glm_cp_at(const char *s, uint64_t len, uint64_t pos, uint64_t *next) {
+    if (pos >= len) { *next = pos; return 0; }
+    return utf8_peek_one(s, len, pos, next);
+}
+
+/* Return the exclusive end byte offset of the glm4 pre-token match at `start`. */
+static uint64_t glm4_match(const char *s, uint64_t len, uint64_t start) {
+    uint64_t n1, n2, n3;
+    uint32_t c0 = glm_cp_at(s, len, start, &n1);
+    if (c0 == 0) return start;
+
+    /* rule 1: (?i:'s|'t|'re|'ve|'m|'ll|'d) */
+    if (c0 == 0x27) {
+        uint32_t c1 = glm_cp_at(s, len, n1, &n2);
+        uint32_t l1 = glm_ascii_lower(c1);
+        if (l1 == 's' || l1 == 't' || l1 == 'm' || l1 == 'd') return n1;
+        uint32_t c2 = glm_cp_at(s, len, n2, &n3);
+        uint32_t l2 = glm_ascii_lower(c2);
+        if ((l1 == 'r' && l2 == 'e') || (l1 == 'v' && l2 == 'e') ||
+            (l1 == 'l' && l2 == 'l')) return n2;
+        /* fall through: "'x" becomes one piece via rule 2 */
+    }
+
+    /* rule 2: [^\r\n\p{L}\p{N}]?\p{L}+ */
+    {
+        uint64_t pos = start;
+        if (c0 != 0x0d && c0 != 0x0a &&
+            !glm_unicode_is_letter(c0) && !glm_unicode_is_number(c0)) {
+            pos = n1;  /* consume the optional leading non-letter/number */
+        }
+        uint64_t k = pos, kn, last = pos;
+        uint32_t kc = glm_cp_at(s, len, k, &kn);
+        while (glm_unicode_is_letter(kc)) { last = kn; k = kn; kc = glm_cp_at(s, len, kn, &kn); }
+        if (last > pos) return last;
+    }
+
+    /* rule 3: \p{N}{1,3} */
+    if (glm_unicode_is_number(c0)) {
+        uint64_t k = start, kn;
+        for (int cnt = 0; cnt < 3; cnt++) {
+            uint32_t kc = glm_cp_at(s, len, k, &kn);
+            if (!glm_unicode_is_number(kc)) break;
+            k = kn;
+        }
+        return k;
+    }
+
+    /* rule 4:  ?[^\s\p{L}\p{N}]+[\r\n]* */
+    {
+        uint64_t pos = (c0 == 0x20) ? n1 : start;
+        uint64_t k = pos, kn, body_end = pos;
+        for (;;) {
+            uint32_t kc = glm_cp_at(s, len, k, &kn);
+            if (kc == 0 || glm_unicode_is_space(kc) ||
+                glm_unicode_is_letter(kc) || glm_unicode_is_number(kc)) break;
+            body_end = kn; k = kn;
+        }
+        if (body_end > pos) {
+            uint64_t te = body_end, tn;
+            for (;;) {
+                uint32_t tc = glm_cp_at(s, len, te, &tn);
+                if (tc != 0x0d && tc != 0x0a) break;
+                te = tn;
+            }
+            return te;
+        }
+    }
+
+    /* rules 5/6/7: whitespace runs */
+    if (glm_unicode_is_space(c0)) {
+        uint64_t run_end = start, prev = start, rn;
+        int n_cps = 0;
+        bool has_nl = false;
+        uint64_t last_nl_after = start;
+        for (;;) {
+            uint32_t rc = glm_cp_at(s, len, run_end, &rn);
+            if (rc == 0 || !glm_unicode_is_space(rc)) break;
+            if (rc == 0x0d || rc == 0x0a) { has_nl = true; last_nl_after = rn; }
+            prev = run_end; run_end = rn; n_cps++;
+        }
+        if (has_nl) return last_nl_after;          /* rule 5 \s*[\r\n]+ */
+        if (run_end >= len) return run_end;         /* rule 6 trailing at EOS */
+        if (n_cps >= 2) return prev;                /* rule 6 \s+(?!\S): leave last */
+        return run_end;                             /* rule 7 \s+ */
+    }
+
+    return n1;  /* single codepoint fallback */
+}
+
+/* glm4 pre-tokenize + byte-level BPE.  Mirrors HF tokenizers for pre=glm4. */
+static void glm4_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    uint64_t len = strlen(text), pos = 0;
+    while (pos < len) {
+        uint64_t end = glm4_match(text, len, pos);
+        if (end <= pos) {
+            uint64_t nx;
+            (void)utf8_peek_one(text, len, pos, &nx);
+            end = (nx > pos) ? nx : pos + 1;
+        }
+        bpe_emit_piece(vocab, (ds4_str){ text + pos, end - pos }, out);
+        pos = end;
+    }
+}
+
 static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
@@ -22306,6 +22632,71 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
 }
 
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
+/* Resolve a chat-sentinel id: prefer the GGUF scalar metadata, fall back to a
+ * literal lookup in the token table. */
+static int vocab_sentinel_id(const ds4_model *model, const ds4_vocab *vocab,
+                             const char *meta_key, const char *fallback) {
+    uint32_t id;
+    if (meta_key && model_get_u32(model, meta_key, &id) && id < (uint32_t)vocab->n_vocab) {
+        return (int)id;
+    }
+    int token = -1;
+    if (table_get(&vocab->token_to_id, fallback, strlen(fallback), &token)) return token;
+    return -1;
+}
+
+/* Load the special-token split set.  DeepSeek uses its fixed role literals so
+ * its rendered-chat split stays byte-identical; GLM derives the set from the
+ * GGUF token_type (USER_DEFINED/UNUSED added tokens).  Stored longest-first. */
+static void vocab_load_specials(ds4_vocab *vocab, const ds4_model *model,
+                                ds4_tokenizer_mode mode) {
+    static const char *ds_specials[] = {
+        "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜Assistant｜>",
+        "<｜User｜>", "</think>", "<think>", "｜DSML｜",
+    };
+    int cap = (mode == DS4_TOK_GLM4) ? 64 : (int)(sizeof(ds_specials)/sizeof(ds_specials[0]));
+    vocab->specials = xcalloc((size_t)cap, sizeof(vocab->specials[0]));
+    vocab->n_specials = 0;
+
+    if (mode == DS4_TOK_GLM4) {
+        ds4_array_ref types;
+        if (model_get_array(model, "tokenizer.ggml.token_type", &types) &&
+            types.type == GGUF_VALUE_INT32 && types.len == (uint64_t)vocab->n_vocab) {
+            ds4_cursor c = cursor_at(model, types.data_pos);
+            for (int i = 0; i < vocab->n_vocab; i++) {
+                int32_t ty;
+                if (!cursor_read(&c, &ty, sizeof(ty))) break;
+                if (ty == 3 || ty == 4) {  /* USER_DEFINED or UNUSED (added) */
+                    vocab->specials[vocab->n_specials].text = vocab->token[i];
+                    vocab->specials[vocab->n_specials].id = i;
+                    vocab->n_specials++;
+                }
+            }
+        }
+    } else {
+        for (size_t i = 0; i < sizeof(ds_specials)/sizeof(ds_specials[0]); i++) {
+            int id;
+            if (table_get(&vocab->token_to_id, ds_specials[i], strlen(ds_specials[i]), &id)) {
+                vocab->specials[vocab->n_specials].text.ptr = ds_specials[i];
+                vocab->specials[vocab->n_specials].text.len = strlen(ds_specials[i]);
+                vocab->specials[vocab->n_specials].id = id;
+                vocab->n_specials++;
+            }
+        }
+    }
+
+    /* longest-first so e.g. "<|begin_of_image|>" wins over a shorter prefix */
+    for (int i = 0; i < vocab->n_specials; i++) {
+        int best = i;
+        for (int j = i + 1; j < vocab->n_specials; j++) {
+            if (vocab->specials[j].text.len > vocab->specials[best].text.len) best = j;
+        }
+        ds4_special_token tmp = vocab->specials[i];
+        vocab->specials[i] = vocab->specials[best];
+        vocab->specials[best] = tmp;
+    }
+}
+
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
 
@@ -22319,6 +22710,14 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
         merges.type != GGUF_VALUE_STRING) {
         ds4_die("GGUF tokenizer merge table is missing or invalid");
+    }
+
+    ds4_str pre;
+    if (model_get_string(model, "tokenizer.ggml.pre", &pre) &&
+        ds4_streq(pre, "glm4")) {
+        vocab->mode = DS4_TOK_GLM4;
+    } else {
+        vocab->mode = DS4_TOK_JOYAI;
     }
 
     vocab->n_vocab = (int)tokens.len;
@@ -22339,17 +22738,34 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
-    vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
-    vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
-    vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
-    vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
-    vocab->think_start_id = vocab_lookup(vocab, "<think>");
-    vocab->think_end_id = vocab_lookup(vocab, "</think>");
-    vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    vocab_load_specials(vocab, model, vocab->mode);
+
+    if (vocab->mode == DS4_TOK_GLM4) {
+        /* GLM-5.2 chat sentinels.  bos = [gMASK], followed by <sop>. */
+        vocab->bos_id          = vocab_sentinel_id(model, vocab, "tokenizer.ggml.bos_token_id", "[gMASK]");
+        vocab->eos_id          = vocab_sentinel_id(model, vocab, "tokenizer.ggml.eos_token_id", "<|endoftext|>");
+        vocab->sop_id          = vocab_sentinel_id(model, vocab, NULL, "<sop>");
+        vocab->system_id       = vocab_sentinel_id(model, vocab, NULL, "<|system|>");
+        vocab->user_id         = vocab_sentinel_id(model, vocab, "tokenizer.ggml.eot_token_id", "<|user|>");
+        vocab->assistant_id    = vocab_sentinel_id(model, vocab, NULL, "<|assistant|>");
+        vocab->observation_id  = vocab_sentinel_id(model, vocab, "tokenizer.ggml.eom_token_id", "<|observation|>");
+        vocab->think_start_id  = vocab_sentinel_id(model, vocab, NULL, "<think>");
+        vocab->think_end_id    = vocab_sentinel_id(model, vocab, NULL, "</think>");
+        vocab->dsml_id = -1;
+    } else {
+        vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
+        vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
+        vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
+        vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    }
 }
 
 static void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
+    free(vocab->specials);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
     memset(vocab, 0, sizeof(*vocab));
@@ -22358,12 +22774,44 @@ static void vocab_free(ds4_vocab *vocab) {
 /* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
+/* GLM-5.2 chat prompt: [gMASK]<sop>, optional reasoning-effort system block
+ * when thinking is on, the caller's system text, <|user|> prompt, then
+ * <|assistant|> opened with <think> (or <think></think> when thinking is off).
+ * Mirrors the zai-org/GLM-5.2 chat_template structure. */
+static void glm_encode_chat_prompt(const ds4_vocab *vocab, const char *system,
+                                   const char *prompt, ds4_think_mode think_mode,
+                                   token_vec *out) {
+    token_vec_push(out, vocab->bos_id);  /* [gMASK] */
+    if (vocab->sop_id >= 0) token_vec_push(out, vocab->sop_id);  /* <sop> */
+    if (ds4_think_mode_enabled(think_mode)) {
+        const char *effort = (think_mode == DS4_THINK_HIGH) ?
+            "Reasoning Effort: High" : "Reasoning Effort: Max";
+        if (vocab->system_id >= 0) token_vec_push(out, vocab->system_id);
+        glm4_tokenize_text(vocab, effort, out);
+    }
+    if (system && system[0]) {
+        if (vocab->system_id >= 0) token_vec_push(out, vocab->system_id);
+        glm4_tokenize_text(vocab, system, out);
+    }
+    if (vocab->user_id >= 0) token_vec_push(out, vocab->user_id);
+    glm4_tokenize_text(vocab, prompt, out);
+    if (vocab->assistant_id >= 0) token_vec_push(out, vocab->assistant_id);
+    token_vec_push(out, vocab->think_start_id);  /* <think> */
+    if (!ds4_think_mode_enabled(think_mode) && vocab->think_end_id >= 0) {
+        token_vec_push(out, vocab->think_end_id);  /* </think> for the nothink path */
+    }
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (vocab->mode == DS4_TOK_GLM4) {
+        glm_encode_chat_prompt(vocab, system, prompt, think_mode, out);
+        return;
+    }
     token_vec_push(out, vocab->bos_id);
     if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
@@ -22381,55 +22829,42 @@ static void encode_chat_prompt(
     }
 }
 
-void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
-    bpe_tokenize_text(&e->vocab, text ? text : "", out);
+/* Tokenize a raw text span with the architecture's pre-tokenizer. */
+static void vocab_span_tokenize(const ds4_vocab *vocab, const char *p, size_t n, token_vec *out) {
+    if (!n) return;
+    char *tmp = xmalloc(n + 1);
+    memcpy(tmp, p, n);
+    tmp[n] = '\0';
+    if (vocab->mode == DS4_TOK_GLM4) glm4_tokenize_text(vocab, tmp, out);
+    else bpe_tokenize_text(vocab, tmp, out);
+    free(tmp);
 }
 
-static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
-    struct special {
-        const char *text;
-        int token;
-    } specials[] = {
-        {"<｜begin▁of▁sentence｜>", vocab->bos_id},
-        {"<｜end▁of▁sentence｜>",   vocab->eos_id},
-        {"<｜User｜>",              vocab->user_id},
-        {"<｜Assistant｜>",         vocab->assistant_id},
-        {"<think>",                vocab->think_start_id},
-        {"</think>",               vocab->think_end_id},
-        {"｜DSML｜",                vocab->dsml_id},
-    };
-
-    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
-        size_t n = strlen(specials[i].text);
-        if (!strncmp(p, specials[i].text, n)) {
-            *token = specials[i].token;
-            *len = n;
+/* Longest-match special-token lookup against the vocab's data-driven split set. */
+static bool vocab_special_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    for (int i = 0; i < vocab->n_specials; i++) {
+        ds4_str s = vocab->specials[i].text;
+        if (!strncmp(p, s.ptr, s.len)) {
+            *token = vocab->specials[i].id;
+            *len = s.len;
             return true;
         }
     }
     return false;
 }
 
-static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token_vec *out) {
-    if (!n) return;
-    char *tmp = xmalloc(n + 1);
-    memcpy(tmp, p, n);
-    tmp[n] = '\0';
-    bpe_tokenize_text(vocab, tmp, out);
-    free(tmp);
-}
-
-static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
-                                         token_vec *out) {
+/* Split out special tokens, tokenizing the spans between them with the
+ * architecture's pre-tokenizer.  This is HF's default encode behavior. */
+static void vocab_split_specials_tokenize(const ds4_vocab *vocab, const char *text,
+                                          token_vec *out) {
     if (!text) text = "";
-
     const char *span = text;
     const char *p = text;
     while (*p) {
         int token = -1;
         size_t len = 0;
-        if (special_token_at(vocab, p, &token, &len)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
+        if (vocab_special_at(vocab, p, &token, &len)) {
+            vocab_span_tokenize(vocab, span, (size_t)(p - span), out);
             token_vec_push(out, token);
             p += len;
             span = p;
@@ -22437,7 +22872,22 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
         }
         p++;
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    vocab_span_tokenize(vocab, span, (size_t)(p - span), out);
+}
+
+void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
+    /* GLM encodes special tokens as single ids (HF default); DeepSeek leaves
+     * raw text tokenization unsplit, matching its prior byte-identical path. */
+    if (e->vocab.mode == DS4_TOK_GLM4) {
+        vocab_split_specials_tokenize(&e->vocab, text ? text : "", out);
+    } else {
+        bpe_tokenize_text(&e->vocab, text ? text : "", out);
+    }
+}
+
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out) {
+    vocab_split_specials_tokenize(vocab, text, out);
 }
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
@@ -22446,6 +22896,9 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     token_vec_push(tokens, e->vocab.bos_id);
+    if (e->vocab.mode == DS4_TOK_GLM4 && e->vocab.sop_id >= 0) {
+        token_vec_push(tokens, e->vocab.sop_id);
+    }
 }
 
 void ds4_encode_chat_prompt(
@@ -22472,7 +22925,7 @@ static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content,
     const char *p = span;
     while (*p) {
         if (!strncmp(p, end, endlen)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
+            vocab_span_tokenize(vocab, span, (size_t)(p - span), out);
             bpe_tokenize_text(vocab, "&lt;", out);
             p++;
             span = p;
@@ -22480,13 +22933,39 @@ static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content,
             p++;
         }
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    vocab_span_tokenize(vocab, span, (size_t)(p - span), out);
 }
 
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
+
+    if (vocab->mode == DS4_TOK_GLM4) {
+        /* GLM role sentinels.  System/user open a turn; assistant carries its
+         * own <think> framing; tool results come back under <|observation|>. */
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            if (vocab->system_id >= 0) token_vec_push(tokens, vocab->system_id);
+            glm4_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            if (vocab->assistant_id >= 0) token_vec_push(tokens, vocab->assistant_id);
+            token_vec_push(tokens, vocab->think_start_id);
+            if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0 &&
+                vocab->think_end_id >= 0) {
+                token_vec_push(tokens, vocab->think_end_id);
+            }
+            glm4_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
+            glm4_tokenize_text(vocab, "<tool_response>", tokens);
+            glm4_tokenize_text(vocab, content, tokens);
+            glm4_tokenize_text(vocab, "</tool_response>", tokens);
+        } else {
+            if (vocab->user_id >= 0) token_vec_push(tokens, vocab->user_id);
+            glm4_tokenize_text(vocab, content, tokens);
+        }
+        return;
+    }
 
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
@@ -22508,9 +22987,19 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    token_vec_push(tokens, e->vocab.assistant_id);
-    token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
-                   e->vocab.think_start_id : e->vocab.think_end_id);
+    ds4_vocab *vocab = &e->vocab;
+    token_vec_push(tokens, vocab->assistant_id);
+    if (vocab->mode == DS4_TOK_GLM4) {
+        /* GLM opens the assistant turn with <think>, or <think></think> when
+         * thinking is disabled (enable_thinking:false in the chat template). */
+        token_vec_push(tokens, vocab->think_start_id);
+        if (!ds4_think_mode_enabled(think_mode) && vocab->think_end_id >= 0) {
+            token_vec_push(tokens, vocab->think_end_id);
+        }
+    } else {
+        token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
+                       vocab->think_start_id : vocab->think_end_id);
+    }
 }
 
 static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
@@ -22588,22 +23077,23 @@ static bool vocab_token_is_literal_special(ds4_str s) {
     return false;
 }
 
-char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
-    ds4_vocab *vocab = &e->vocab;
+/* Decode one token id to its raw text.  Special/added tokens (GLM role
+ * sentinels, the DeepSeek fullwidth-bar literals) pass through verbatim so the
+ * exact sentinel string survives; byte-level BPE tokens are mapped back from
+ * the bytes_to_unicode codepoints to their raw bytes.  out must hold s.len+1. */
+static void vocab_decode_token(const ds4_vocab *vocab, int token, char *out, size_t *len) {
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
-        char *out = xmalloc(1);
         out[0] = '\0';
-        return out;
+        return;
     }
 
     ds4_str s = vocab->token[token];
-    char *out = xmalloc((size_t)s.len + 1);
     if (vocab_token_is_literal_special(s)) {
         memcpy(out, s.ptr, (size_t)s.len);
         out[s.len] = '\0';
         if (len) *len = (size_t)s.len;
-        return out;
+        return;
     }
 
     size_t n = 0;
@@ -22615,6 +23105,13 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     }
     out[n] = '\0';
     if (len) *len = n;
+}
+
+char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
+    ds4_vocab *vocab = &e->vocab;
+    char *out = xmalloc((token >= 0 && token < vocab->n_vocab)
+                            ? (size_t)vocab->token[token].len + 1 : 1);
+    vocab_decode_token(vocab, token, out, len);
     return out;
 }
 
@@ -25017,6 +25514,87 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     vocab_free(&vocab);
     model_close(&model);
     return 0;
+}
+
+/* Tokenize text using only a model's tokenizer tables (no inference).  Writes
+ * up to max_out ids and returns the total id count (which may exceed max_out).
+ * Used by the GLM BPE oracle test, which validates GGUF tokenizer parsing. */
+int ds4_tokenize_model_text(const char *model_path, const char *text,
+                            int *out, int max_out) {
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+
+    model_open(&model, model_path, false, false);
+    vocab_load(&vocab, &model);
+    vocab_split_specials_tokenize(&vocab, text ? text : "", &tokens);
+
+    int total = tokens.len;
+    int n = (max_out > 0 && total < max_out) ? total : max_out;
+    for (int i = 0; i < n; i++) out[i] = tokens.v[i];
+
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return total;
+}
+
+/* Render a single-turn chat prompt from a model's tokenizer tables (no
+ * inference).  Returns the total prompt length (may exceed max_out).  Used by
+ * the GLM chat-template smoke, which loads only shard 1. */
+int ds4_render_chat_prompt(const char *model_path, const char *system,
+                           const char *prompt, ds4_think_mode think_mode,
+                           int *out, int max_out) {
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+
+    model_open(&model, model_path, false, false);
+    vocab_load(&vocab, &model);
+    encode_chat_prompt(&vocab, system, prompt ? prompt : "", think_mode, &tokens);
+
+    int total = tokens.len;
+    int n = (max_out > 0 && total < max_out) ? total : max_out;
+    for (int i = 0; i < n; i++) out[i] = tokens.v[i];
+
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return total;
+}
+
+/* Decode a token-id stream back to text using a model's tokenizer tables
+ * (no inference).  Writes a NUL-terminated malloc'd string to *out_text and
+ * returns its length.  Used by the GLM chat round-trip smoke. */
+size_t ds4_decode_model_text(const char *model_path, const int *ids, int n_ids,
+                             char **out_text) {
+    ds4_model model;
+    ds4_vocab vocab;
+    model_open(&model, model_path, false, false);
+    vocab_load(&vocab, &model);
+
+    size_t cap = 256, len = 0;
+    char *buf = xmalloc(cap);
+    for (int i = 0; i < n_ids; i++) {
+        size_t tl = 0;
+        size_t need = (ids[i] >= 0 && ids[i] < vocab.n_vocab)
+                          ? vocab.token[ids[i]].len + 1 : 1;
+        char *piece = xmalloc(need);
+        vocab_decode_token(&vocab, ids[i], piece, &tl);
+        if (len + tl + 1 > cap) {
+            while (len + tl + 1 > cap) cap *= 2;
+            buf = xrealloc(buf, cap);
+        }
+        memcpy(buf + len, piece, tl);
+        len += tl;
+        free(piece);
+    }
+    buf[len] = '\0';
+
+    vocab_free(&vocab);
+    model_close(&model);
+    *out_text = buf;
+    return len;
 }
 
 #ifndef DS4_NO_GPU

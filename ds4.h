@@ -188,6 +188,12 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int max_tokens);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+int ds4_tokenize_model_text(const char *model_path, const char *text, int *out, int max_out);
+int ds4_render_chat_prompt(const char *model_path, const char *system,
+                           const char *prompt, ds4_think_mode think_mode,
+                           int *out, int max_out);
+size_t ds4_decode_model_text(const char *model_path, const int *ids, int n_ids,
+                             char **out_text);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

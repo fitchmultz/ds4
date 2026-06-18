@@ -2211,6 +2211,255 @@ static void test_glm_ssd_cache_plan(void) {
             max_experts);
 }
 
+/* ---------------- GLM-5.2 BPE oracle (Phase 2) ---------------- */
+
+static char *test_read_whole_file(const char *path, size_t *len_out) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long sz = ftell(fp);
+    if (sz < 0) { fclose(fp); return NULL; }
+    rewind(fp);
+    char *buf = malloc((size_t)sz + 1);
+    TEST_ASSERT(buf != NULL);
+    size_t rd = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    buf[rd] = '\0';
+    if (len_out) *len_out = rd;
+    return buf;
+}
+
+/* Decode a JSON string literal (opening quote at p[0]) into a malloc'd
+ * NUL-terminated byte buffer.  Handles \" \\ \/ \b \f \n \r \t and \uXXXX
+ * (BMP + surrogate pairs); all other bytes (including raw UTF-8) pass through.
+ * *next_out points just past the closing quote. */
+static char *test_json_decode_string(const char *p, const char **next_out) {
+    TEST_ASSERT(*p == '"');
+    p++;
+    size_t cap = 64, len = 0;
+    char *out = malloc(cap);
+    TEST_ASSERT(out != NULL);
+    while (*p && *p != '"') {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\') {
+            p++;
+            char e = *p++;
+            unsigned int cp = 0;
+            switch (e) {
+                case '"':  c = '"'; break;
+                case '\\': c = '\\'; break;
+                case '/':  c = '/'; break;
+                case 'b':  c = '\b'; break;
+                case 'f':  c = '\f'; break;
+                case 'n':  c = '\n'; break;
+                case 'r':  c = '\r'; break;
+                case 't':  c = '\t'; break;
+                case 'u':
+                    for (int k = 0; k < 4; k++) {
+                        char h = *p++;
+                        cp <<= 4;
+                        if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                    }
+                    if (cp >= 0xd800 && cp <= 0xdbff && p[0] == '\\' && p[1] == 'u') {
+                        unsigned int lo = 0;
+                        p += 2;
+                        for (int k = 0; k < 4; k++) {
+                            char h = *p++;
+                            lo <<= 4;
+                            if (h >= '0' && h <= '9') lo |= (unsigned)(h - '0');
+                            else if (h >= 'a' && h <= 'f') lo |= (unsigned)(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
+                        }
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                    }
+                    /* emit cp as UTF-8 */
+                    {
+                        char tmp[4]; int n = 0;
+                        if (cp < 0x80) { tmp[n++] = (char)cp; }
+                        else if (cp < 0x800) {
+                            tmp[n++] = (char)(0xc0 | (cp >> 6));
+                            tmp[n++] = (char)(0x80 | (cp & 0x3f));
+                        } else if (cp < 0x10000) {
+                            tmp[n++] = (char)(0xe0 | (cp >> 12));
+                            tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+                            tmp[n++] = (char)(0x80 | (cp & 0x3f));
+                        } else {
+                            tmp[n++] = (char)(0xf0 | (cp >> 18));
+                            tmp[n++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+                            tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+                            tmp[n++] = (char)(0x80 | (cp & 0x3f));
+                        }
+                        for (int k = 0; k < n; k++) {
+                            if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); TEST_ASSERT(out); }
+                            out[len++] = tmp[k];
+                        }
+                        continue;
+                    }
+                default: c = (unsigned char)e; break;
+            }
+            /* simple escape: c holds the decoded byte, p already advanced past it */
+            if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); TEST_ASSERT(out); }
+            out[len++] = (char)c;
+            continue;
+        }
+        if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); TEST_ASSERT(out); }
+        out[len++] = (char)c;
+        p++;
+    }
+    TEST_ASSERT(*p == '"');
+    p++;
+    out[len] = '\0';
+    if (next_out) *next_out = p;
+    return out;
+}
+
+static const char *test_json_find_key(const char *p, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *hit = strstr(p, pat);
+    return hit ? hit + strlen(pat) : NULL;
+}
+
+static void test_glm_bpe(void) {
+    const char *model_path = getenv("DS4_TEST_GLM52_SHARD1");
+    if (!model_path || !model_path[0]) {
+        model_path = "gguf/glm52/GLM-5.2-UD-IQ2_M-00001-of-00006.gguf";
+    }
+    const char *vec_path = getenv("DS4_TEST_GLM52_TOKENIZE");
+    if (!vec_path || !vec_path[0]) {
+        vec_path = "tests/test-vectors/glm52-tokenize.json";
+    }
+
+    size_t json_len = 0;
+    char *json = test_read_whole_file(vec_path, &json_len);
+    if (!json) {
+        fprintf(stderr, "  glm-bpe: SKIP (oracle %s not found)\n", vec_path);
+        return;
+    }
+
+    /* Sanity: shard 1 must actually be loadable for this to validate parsing. */
+    FILE *probe = fopen(model_path, "rb");
+    if (!probe) {
+        fprintf(stderr, "  glm-bpe: SKIP (shard %s not found)\n", model_path);
+        free(json);
+        return;
+    }
+    fclose(probe);
+
+    int max_ids = 4096;
+    int *got = malloc(sizeof(int) * (size_t)max_ids);
+    int *exp = malloc(sizeof(int) * (size_t)max_ids);
+    TEST_ASSERT(got && exp);
+
+    int n_cases = 0, n_pass = 0;
+    const char *p = json;
+    while ((p = test_json_find_key(p, "text")) != NULL) {
+        while (*p && (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')) p++;
+        const char *after = NULL;
+        char *text = test_json_decode_string(p, &after);
+        p = after;
+
+        const char *ids_p = test_json_find_key(p, "ids");
+        TEST_ASSERT(ids_p != NULL);
+        while (*ids_p && *ids_p != '[') ids_p++;
+        ids_p++;
+        int n_exp = 0;
+        while (*ids_p && *ids_p != ']') {
+            if (*ids_p == '-' || (*ids_p >= '0' && *ids_p <= '9')) {
+                char *end = NULL;
+                long v = strtol(ids_p, &end, 10);
+                TEST_ASSERT(end != ids_p);
+                if (n_exp < max_ids) exp[n_exp] = (int)v;
+                n_exp++;
+                ids_p = end;
+            } else {
+                ids_p++;
+            }
+        }
+        p = ids_p + 1;
+
+        int n_got = ds4_tokenize_model_text(model_path, text, got, max_ids);
+        n_cases++;
+        bool ok = (n_got == n_exp);
+        for (int i = 0; ok && i < n_got && i < n_exp; i++) {
+            if (got[i] != exp[i]) ok = false;
+        }
+        if (ok) {
+            n_pass++;
+        } else {
+            fprintf(stderr, "  glm-bpe: MISMATCH (%d ids exp, %d got) text=%s\n", n_exp, n_got, text);
+            fprintf(stderr, "    exp:");
+            for (int i = 0; i < n_exp && i < 16; i++) fprintf(stderr, " %d", exp[i]);
+            fprintf(stderr, "\n    got:");
+            for (int i = 0; i < n_got && i < 16; i++) fprintf(stderr, " %d", got[i]);
+            fprintf(stderr, "\n");
+        }
+        free(text);
+    }
+
+    fprintf(stderr, "  glm-bpe: %d/%d cases match HF tokenizers oracle\n", n_pass, n_cases);
+    TEST_ASSERT(n_cases == 34);
+    TEST_ASSERT(n_pass >= 32);
+
+    /* Chat-template smoke: render system+user, confirm [gMASK]<sop> prefix and
+     * the role sentinels are present, and that the prefix round-trips. */
+    int chat[256];
+    int n_chat = ds4_render_chat_prompt(model_path, "You are helpful.", "Hi",
+                                        DS4_THINK_HIGH, chat, 256);
+    TEST_ASSERT(n_chat >= 2);
+    bool has_prefix = (chat[0] == 154822 && chat[1] == 154824);
+    fprintf(stderr, "  glm-bpe: chat prefix [%d, %d] (expect 154822, 154824)\n",
+            n_chat > 0 ? chat[0] : -1, n_chat > 1 ? chat[1] : -1);
+    bool has_sys = false, has_user = false, has_asst = false;
+    for (int i = 0; i < n_chat; i++) {
+        if (chat[i] == 154826) has_sys = true;
+        if (chat[i] == 154827) has_user = true;
+        if (chat[i] == 154828) has_asst = true;
+    }
+    TEST_ASSERT(has_prefix);
+    TEST_ASSERT(has_sys && has_user && has_asst);
+    TEST_ASSERT(chat[n_chat - 1] == 154841);  /* opens with <think> */
+
+    /* Nothink path renders the empty <think></think> block at the end. */
+    int nothink[256];
+    int n_no = ds4_render_chat_prompt(model_path, "You are helpful.", "Hi",
+                                       DS4_THINK_NONE, nothink, 256);
+    TEST_ASSERT(n_no >= 2);
+    fprintf(stderr, "  glm-bpe: nothink tail [%d, %d] (expect 154841, 154842)\n",
+            nothink[n_no - 2], nothink[n_no - 1]);
+    TEST_ASSERT(nothink[n_no - 2] == 154841 && nothink[n_no - 1] == 154842);
+
+    /* Genuine round-trip: render → decode ids back to text (shard 1) →
+     * re-tokenize → must reproduce the same id stream.  This proves special
+     * tokens survive decode as single ids and BPE words re-merge identically. */
+    int rt[512];
+    int n_rt = ds4_render_chat_prompt(model_path, "You are helpful.", "Hi",
+                                      DS4_THINK_HIGH, rt, 512);
+    TEST_ASSERT(n_rt > 0 && n_rt <= 512);
+    char *rt_text = NULL;
+    size_t rt_len = ds4_decode_model_text(model_path, rt, n_rt, &rt_text);
+    TEST_ASSERT(rt_text != NULL && rt_len > 0);
+    int rt2[512];
+    int n_rt2 = ds4_tokenize_model_text(model_path, rt_text, rt2, 512);
+    bool rt_ok = (n_rt2 == n_rt);
+    for (int i = 0; rt_ok && i < n_rt; i++) {
+        if (rt2[i] != rt[i]) rt_ok = false;
+    }
+    if (!rt_ok) {
+        fprintf(stderr, "  glm-bpe: round-trip drift (%d -> %d ids) decoded=%s\n",
+                n_rt, n_rt2, rt_text);
+    }
+    TEST_ASSERT(rt_ok);
+    fprintf(stderr, "  glm-bpe: round-trip stable (%d ids, %zu bytes)\n", n_rt, rt_len);
+    free(rt_text);
+
+    free(got);
+    free(exp);
+    free(json);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -2236,6 +2485,7 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--glm-ssd-math", "glm-ssd-math", "GLM-5.2 SSD cache-plan arithmetic regression (no model needed)", test_glm_ssd_cache_plan},
+    {"--glm-bpe", "glm-bpe", "GLM-5.2 glm4 BPE tokenizer vs HF tokenizers oracle (shard 1)", test_glm_bpe},
 };
 
 static void test_print_help(const char *prog) {
