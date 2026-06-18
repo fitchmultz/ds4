@@ -1,6 +1,6 @@
 # GLM-5.2 Port — Source of Truth
 
-Status: **Phases 0, 1, 2, 3 complete** (committed + pushed `origin/glm`; full 238GB
+Status: **Phases 0,1,2,3 + 4b complete** (committed + pushed `origin/glm`; full 238GB
 `UD-IQ2_M` model downloaded, all 6 shards verified). Phases 4-7 (inference) remain.
 Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
