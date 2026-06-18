@@ -384,11 +384,30 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+/* GLM-5.2 (glm-dsa) routed/dense K-quants. Layout matches ggml-common.h so the
+ * dequant below is a direct port of llama.cpp's dequantize_row_{q5,q6}_K. */
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qh[QK_K / 8];
+    uint8_t  qs[QK_K / 2];
+} block_q5_K;
+
+typedef struct {
+    uint8_t  ql[QK_K / 2];
+    uint8_t  qh[QK_K / 4];
+    int8_t   scales[QK_K / 16];
+    uint16_t d;
+} block_q6_K;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
+DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
+DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 
 typedef struct {
     uint32_t ctx_size;
@@ -26258,6 +26277,103 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
  * config_validate_model / weights_bind / the graph backends.  Phase 1 only
  * inspects metadata and the tensor inventory; GLM inference is Phase 4+ and is
  * rejected here with a clear message.  See docs/GLM52-PORT.md sections 1/3/6. */
+
+/* -------------------------------------------------------------------------
+ * GLM CPU reference dequant (Phase 4b).  The engine's main path uses fused
+ * quant*activation dot kernels, but the GLM reference/oracle needs plain
+ * dequant-to-F32 to (a) build a per-component CPU oracle and (b) validate the
+ * new quant types against an authoritative llama.cpp dequant oracle.  These are
+ * direct ports of llama.cpp's dequantize_row_{q4,q5,q6}_K; see
+ * tests/test-vectors/glm52-quant/.  IQ2_S/IQ3_XXS/IQ4_XS still TODO. */
+
+static inline void ds4_get_scale_min_k4(int j, const uint8_t *q,
+                                        uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63; *m = q[j + 4] & 63;
+    } else {
+        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4));
+    }
+}
+
+static void ds4_dequant_q4_K(const block_q4_K *x, float *y, uint32_t k) {
+    const uint32_t nb = k / QK_K;
+    for (uint32_t i = 0; i < nb; i++) {
+        const uint8_t *q = x[i].qs;
+        const float d   = f16_to_f32(x[i].d);
+        const float min = f16_to_f32(x[i].dmin);
+        int is = 0; uint8_t sc, m;
+        for (int j = 0; j < QK_K; j += 64) {
+            ds4_get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc, m1 = min * m;
+            ds4_get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc, m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
+            q += 32; is += 2;
+        }
+    }
+}
+
+static void ds4_dequant_q5_K(const block_q5_K *x, float *y, uint32_t k) {
+    const uint32_t nb = k / QK_K;
+    for (uint32_t i = 0; i < nb; i++) {
+        const uint8_t *ql = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const float d   = f16_to_f32(x[i].d);
+        const float min = f16_to_f32(x[i].dmin);
+        int is = 0; uint8_t sc, m;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK_K; j += 64) {
+            ds4_get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc, m1 = min * m;
+            ds4_get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc, m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l] >> 4)   + (qh[l] & u2 ? 16 : 0)) - m2;
+            ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+        }
+    }
+}
+
+static void ds4_dequant_q6_K(const block_q6_K *x, float *y, uint32_t k) {
+    const uint32_t nb = k / QK_K;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t  *sc = x[i].scales;
+        for (int n = 0; n < QK_K; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                const int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = (int)((ql[l]      >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+            y += 128; ql += 64; qh += 32; sc += 8;
+        }
+    }
+}
+
+/* Public dispatcher used by the --glm-quant-dequant oracle test.  Returns true
+ * and fills out[0..n) for the supported K-quants; false for unsupported types
+ * (IQ2_S/IQ3_XXS/IQ4_XS are Phase 4b TODO).  n must be a multiple of 256. */
+bool ds4_dequant_glm_row(uint32_t gguf_type, const void *block_data,
+                         float *out, size_t n) {
+    if (n == 0 || (n % QK_K) != 0) return false;
+    switch (gguf_type) {
+        case 12 /*q4_k*/: ds4_dequant_q4_K(block_data, out, (uint32_t)n); return true;
+        case 13 /*q5_k*/: ds4_dequant_q5_K(block_data, out, (uint32_t)n); return true;
+        case 14 /*q6_k*/: ds4_dequant_q6_K(block_data, out, (uint32_t)n); return true;
+        default: return false;
+    }
+}
+
 
 static ds4_arch ds4_detect_arch(const ds4_model *m) {
     ds4_str arch = {0};

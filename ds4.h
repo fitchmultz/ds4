@@ -188,6 +188,13 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int max_tokens);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+
+/* GLM (glm-dsa) CPU reference dequant (Phase 4b). Dequantizes n elements (a
+ * multiple of 256) of the given GGUF tensor type to F32. Returns true for the
+ * supported K-quants (q4_k/q5_k/q6_k); false for unsupported types. Used by the
+ * --glm-quant-dequant oracle test and the GLM CPU reference. */
+bool ds4_dequant_glm_row(uint32_t gguf_type, const void *block_data,
+                         float *out, size_t n);
 int ds4_tokenize_model_text(const char *model_path, const char *text, int *out, int max_out);
 int ds4_render_chat_prompt(const char *model_path, const char *system,
                            const char *prompt, ds4_think_mode think_mode,

@@ -2517,6 +2517,65 @@ typedef struct {
     test_fn fn;
 } ds4_test_entry;
 
+/* GLM-5.2 K-quant CPU dequant vs the authoritative llama.cpp oracle
+ * (tests/test-vectors/glm52-quant/<TYPE>.bin + <TYPE>.oracle.txt). Covers q4_k
+ * (engine sanity), q5_k, q6_k. IQ2_S/IQ3_XXS/IQ4_XS still TODO. */
+static void test_glm_quant_dequant(void) {
+    const char *dir = getenv("DS4_TEST_GLM52_QUANT_DIR");
+    if (!dir || !dir[0]) dir = "tests/test-vectors/glm52-quant";
+    static const struct { const char *name; uint32_t type; uint32_t block_bytes; } types[] = {
+        {"Q4_K", 12, 144}, {"Q5_K", 13, 176}, {"Q6_K", 14, 210},
+    };
+    const size_t n_types = sizeof(types) / sizeof(types[0]);
+    int n_pass = 0, n_run = 0;
+    for (size_t t = 0; t < n_types; t++) {
+        char bin[512], oracle[512];
+        snprintf(bin, sizeof(bin), "%s/%s.bin", dir, types[t].name);
+        snprintf(oracle, sizeof(oracle), "%s/%s.oracle.txt", dir, types[t].name);
+        size_t blen = 0, olen = 0;
+        char *b = test_read_whole_file(bin, &blen);
+        char *o = test_read_whole_file(oracle, &olen);
+        if (!b || !o) {
+            fprintf(stderr, "  glm-quant-dequant: SKIP %s (fixture missing in %s)\n", types[t].name, dir);
+            free(b); free(o); continue;
+        }
+        const size_t n_blocks = blen / types[t].block_bytes;
+        const size_t n_elem   = n_blocks * 256;
+        float ref[8192];
+        size_t nref = 0;
+        for (char *p = o; *p && nref < 8192; ) {
+            char *e = NULL; double v = strtod(p, &e);
+            if (e == p) { p++; continue; }
+            ref[nref++] = (float)v; p = e;
+        }
+        if (n_elem > 8192 || nref < n_elem) {
+            fprintf(stderr, "  glm-quant-dequant: FAIL %s (fixture size: %zu blocks/%zu ref)\n", types[t].name, n_blocks, nref);
+            free(b); free(o); continue;
+        }
+        float *out = malloc(sizeof(float) * n_elem);
+        TEST_ASSERT(out != NULL);
+        if (!ds4_dequant_glm_row(types[t].type, b, out, n_elem)) {
+            fprintf(stderr, "  glm-quant-dequant: FAIL %s (unsupported type %u)\n", types[t].name, types[t].type);
+            free(out); free(b); free(o); continue;
+        }
+        float maxabs = 0.0f, maxrel = 0.0f;
+        for (size_t i = 0; i < n_elem; i++) {
+            float d = fabsf(out[i] - ref[i]);
+            if (d > maxabs) maxabs = d;
+            if (fabsf(ref[i]) > 1e-9f) { float r = d / fabsf(ref[i]); if (r > maxrel) maxrel = r; }
+        }
+        bool ok = (maxabs < 1e-4f) || (maxrel < 1e-5f);
+        fprintf(stderr, "  glm-quant-dequant: %s %s (n=%zu maxabs=%.3g maxrel=%.3g)\n",
+                types[t].name, ok ? "PASS" : "FAIL", n_elem, (double)maxabs, (double)maxrel);
+        if (ok) n_pass++;
+        n_run++;
+        free(out); free(b); free(o);
+    }
+    fprintf(stderr, "  glm-quant-dequant: %d/%d types match llama.cpp oracle\n", n_pass, (int)n_types);
+    TEST_ASSERT(n_run == (int)n_types);
+    TEST_ASSERT(n_pass == (int)n_types);
+}
+
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
@@ -2534,6 +2593,7 @@ static const ds4_test_entry test_entries[] = {
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--glm-ssd-math", "glm-ssd-math", "GLM-5.2 SSD cache-plan arithmetic regression (no model needed)", test_glm_ssd_cache_plan},
     {"--glm-bpe", "glm-bpe", "GLM-5.2 glm4 BPE tokenizer vs HF tokenizers oracle (shard 1)", test_glm_bpe},
+    {"--glm-quant-dequant", "glm-quant-dequant", "GLM-5.2 K-quant CPU dequant vs llama.cpp oracle", test_glm_quant_dequant},
 };
 
 static void test_print_help(const char *prog) {
