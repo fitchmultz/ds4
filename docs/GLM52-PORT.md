@@ -1,6 +1,8 @@
 # GLM-5.2 Port — Source of Truth
 
-Status: **Phase 0-1, 3 complete** (committed + pushed `origin/glm`; 238GB download running in background). Phase 2 (tokenizer) and Phases 4-7 remain. Target: run GLM-5.2 (`glm-dsa`) on a
+Status: **Phases 0, 1, 2, 3 complete** (committed + pushed `origin/glm`; full 238GB
+`UD-IQ2_M` model downloaded, all 6 shards verified). Phases 4-7 (inference) remain.
+Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
 
@@ -177,10 +179,18 @@ identical to `main`; shard-1 inspect reports glm-dsa / block_count 79 / split
 SSD/C++ changes. Full-split tensor-count strict check implemented, fires only
 when all 6 shards present (validate in Phase 4 session).
 
-**Phase 2 — glm4 BPE tokenizer + chat template.** Tokenizer mode from
-`tokenizer.ggml.pre` (joyai vs glm4); GLM special tokens; `[gMASK]<sop>` chat
-rendering. DeepSeek tokenization unchanged. DONE: `--dump-tokens` matches a HF
-tokenizer oracle for ascii/CJK/chat/tool samples.
+**Phase 2 — glm4 BPE tokenizer + chat template.** ✅ DONE (commits adda569 + 6ac32c1).
+Mode dispatch by `tokenizer.ggml.pre` (joyai-llm vs glm4). glm4 pre-tokenizer =
+exact HF regex (`\p{L}`/`\p{N}` via 677+144 generated range tables); shared BPE
+merge engine + gated `ignore_merges` fast-path (CJK/Cyrillic collapse to one
+id). GLM specials read from GGUF `token_type` (growing array, bound-checked);
+chat sentinels metadata-first. GLM chat renders `[gMASK]<sop>` + role sentinels +
+`<think>`/nothink. `test_glm_bpe` (`--glm-bpe`, loads tables FROM shard 1):
+**43/43 HF-tokenizers oracle match** (incl. 9 contraction cases). Review found 5
+bugs the oracle missed (contraction offsets, undpatched max-effort, double
+`<think>`, unbounded specials array, loose assertion) — all fixed with new
+regression coverage. Verified: DeepSeek `--dump-tokens` + `--inspect` byte-
+identical vs main across ASCII/CJK/code/whitespace/contraction prompts.
 
 **Phase 3 — SSD streaming wiring + 128 GiB cache-plan sizing.** ✅ DONE (commit 3a13d5c). Reused `ds4_ssd` helpers UNMODIFIED; GLM per-expert byte math computed directly from the tensor inventory (`glm_streaming_per_expert_bytes`); `--inspect` prints a live cache plan when tensors present (per-expert 11304960, the §5 8359/88GiB/43.5% documented target computed via the same formula) or the shard-1 message + documented target otherwise. `test_glm_ssd_cache_plan` (`--glm-ssd-math`, no model needed) locks the §5 numbers. Per-expert math cross-checked two ways against real shard-2 tensors = 11304960. Verified: `make` clean; `ds4_test --glm-ssd-math` passes; DeepSeek byte-identical. Runtime per-tensor-part SSD pread wiring into Metal is the Phase 4 follow-up.
 
@@ -205,17 +215,38 @@ microkernels), `DS4_TEST_GLM52_SHARD1`, `DS4_TEST_GLM52_GGUF`, `DS4_TEST_GLM52_L
 
 ## 7. Session scope
 
-This session = **Phase 0 + Phase 1** (verifiable with shard-1 alone), plus
-Phase 2-3 if time. Phases 4-7 require the full 238GB `UD-IQ2_M` split on disk
-for per-kernel / full-model validation — separate sessions.
+Done this session: **Phases 0, 1, 2, 3** — all committed + pushed `origin/glm`, all
+verified against the real 238GB `UD-IQ2_M` model (now fully downloaded). The
+inspect/tokenizer/SSD-sizing foundation is complete and tested:
+- 1809/1809 tensors load across 6 shards (split invariant enforced).
+- glm4 BPE = 43/43 HF-tokenizers oracle match (incl. contractions).
+- SSD cache plan live = documented: 8359 experts / 88 GiB / 43.5% @ 128 GiB.
+- DeepSeek path byte-identical to `main` throughout.
+
+Next: **Phase 4** (inference). This is the large, multi-session core. Recommended
+first sub-step: a GLM **CPU reference** forward pass for a single layer on
+synthetic fixtures (the engine keeps CPU as reference/debug per AGENT.md) to
+serve as the oracle for the Metal kernels, then port kernels one at a time
+(RoPE → MLA projections → dense FFN → sigmoid MoE → quant dots → per-part SSD
+pread), each validated against the CPU ref. Needs: Q5_K/Q6_K dense +
+IQ2_S/IQ3_XXS/IQ4_XS/Q3_K routed quant kernels; standard interleaved RoPE
+(theta 8e6, dim 64); single `attn_output`; dense FFN for blk.0-2; sigmoid
+top-8 MoE (bias + norm + scale 2.5). DSA (Phase 5) and NextN/MTP (Phase 6)
+after. A llama.cpp `glm-dsa` dense-fallback build is the natural full-model
+logit oracle once Phase 4 produces tokens.
 
 ## 8. Risks / blockers
 
-- Split GGUF is mandatory and foundational (single-file loader today).
-- `UD-IQ2_M` uses quant types current kernels lack (Q5_K/Q6_K dense;
-  IQ2_S/IQ3_XXS/IQ4_XS/Q3_K routed) — Phase 4 net-new kernels.
-- `DS4_MAX_*` cap bumps must not change DeepSeek shapes/allocs.
-- Global Metal `g_model_fd` pread is single-file — Phase 3 must make it
-  per-tensor-part.
-- DSA correctness needs an external oracle (Transformers/vLLM/SGLang).
-- No official 128 GiB SSD recipe exists — cache sizing is measurement-based.
+- Phase 4 needs net-new quant kernels: Q5_K/Q6_K dense; IQ2_S/IQ3_XXS/IQ4_XS/Q3_K
+  routed. Engine currently supports IQ2_XXS/Q2_K/Q4_K routed + the dense set.
+- `DS4_MAX_*` cap bumps (DS4_MAX_LAYER>=79, DS4_MAX_VOCAB>=154880) for inference
+  must not change DeepSeek shapes/allocs — decide between bumping vs a GLM-specific
+  shape struct in Phase 4.
+- Global Metal `g_model_fd` pread is single-file; runtime per-tensor-part SSD
+  streaming wiring into Metal is Phase 4 work (Phase 3 did sizing + dry-run only).
+- The DeepSeek V4 graph assumes HC / compressed attention / grouped output /
+  top-6 routing / all-layers-routed. GLM breaks all of these — Phase 4 must add a
+  separate GLM graph path, not retrofit the DeepSeek graph.
+- DSA correctness (Phase 5) needs an external oracle (Transformers/vLLM/SGLang).
+- No official 128 GiB SSD recipe exists; runtime streaming throughput is
+  measurement-based once Phase 4 runs.
