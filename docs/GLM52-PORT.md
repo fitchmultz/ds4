@@ -1,7 +1,6 @@
 # GLM-5.2 Port — Source of Truth
 
-Status: **Phases 0,1,2,3 + 4b complete** (committed + pushed `origin/glm`; full 238GB
-`UD-IQ2_M` model downloaded, all 6 shards verified). Phases 4-7 (inference) remain.
+Status: **Phases 0,1,2,3,4a,4b,4c-i,4c-ii complete + verified**; **4a-full runnable but not yet correct** (real-model CPU forward runs all 78 layers; a numerics bug in the MLA k_b tensor layout / MoE shared-expert convention collapses common prompts to one high-logit token — needs a llama.cpp logit-diff oracle to diagnose). Committed + pushed origin/glm; full 238GB UD_IQ2_M model on disk.
 Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
