@@ -25881,13 +25881,20 @@ static uint32_t glm_open_split(ds4_model *m, const char *ref_path, bool metal_ma
     return missing;
 }
 
-/* Count tensors whose name is blk.{lo..hi}.<suffix> (inclusive layer range). */
+/* Count tensors whose name is blk.{lo..hi}.<suffix> (inclusive layer range).
+ * Every GLM tensor ends in ".weight" or ".bias"; patterns passed without that
+ * suffix (e.g. "attn_norm", "ffn_gate_exps", "indexer.proj") are matched as
+ * ".weight", while "exp_probs_b.bias" / "indexer.k_norm.weight" match as-is. */
 static uint32_t glm_count_blk(const ds4_model *m, const char *suffix,
                               uint32_t lo, uint32_t hi) {
+    const bool has_suffix = strstr(suffix, ".weight") || strstr(suffix, ".bias");
     char buf[160];
     uint32_t cnt = 0;
     for (uint32_t il = lo; il <= hi; il++) {
-        snprintf(buf, sizeof(buf), "blk.%u.%s", il, suffix);
+        const int n = has_suffix
+            ? snprintf(buf, sizeof(buf), "blk.%u.%s", il, suffix)
+            : snprintf(buf, sizeof(buf), "blk.%u.%s.weight", il, suffix);
+        if (n <= 0 || (size_t)n >= sizeof(buf)) return 0;
         if (model_find_tensor(m, buf)) cnt++;
     }
     return cnt;
@@ -25903,6 +25910,98 @@ static bool glm_str_contains(const char *hay, uint64_t haylen, const char *needl
     for (uint64_t i = 0; i + nl <= haylen; i++)
         if (memcmp(hay + i, needle, nl) == 0) return true;
     return false;
+}
+
+/* Look up a per-layer backbone tensor by its base name (without the blk.N.
+ * prefix or .weight suffix), e.g. glm_layer_tensor(m, 3, "ffn_gate_exps").
+ * GLM reuses the DeepSeek GGUF naming convention (blk.N.<base>.weight). */
+static const ds4_tensor *glm_layer_tensor(const ds4_model *m,
+                                          uint32_t il, const char *base) {
+    char buf[160];
+    const int n = snprintf(buf, sizeof(buf), "blk.%u.%s.weight", il, base);
+    if (n <= 0 || (size_t)n >= sizeof(buf)) return NULL;
+    return model_find_tensor(m, buf);
+}
+
+/* GLM SSD-streaming per-expert byte math, computed directly from the tensor
+ * inventory (GLM does not populate ds4_weights).  Mirrors the DeepSeek
+ * per-expert slot math from docs/GLM52-PORT.md section 5: gate==up, so
+ * per_expert = (gate + up + down tensor bytes) / n_expert, using the
+ * GGUF-reported tensor .bytes which already accounts for the quant block.
+ * non_routed is the resident footprint: every present tensor that is NOT a
+ * routed expert weight (_exps) and NOT in the deferred blk.78 NextN block
+ * (shared experts _shexp, attention, norms and globals are all resident).
+ * Returns false when the tensor inventory is empty (shard-1-only) or no routed
+ * layer is present, so the caller can emit a "full shards needed" message. */
+static bool glm_streaming_per_expert_bytes(const ds4_model *m,
+                                           uint64_t  *per_expert_out,
+                                           uint64_t  *non_routed_out,
+                                           uint32_t  *n_routed_layer_out) {
+    if (per_expert_out)     *per_expert_out = 0;
+    if (non_routed_out)     *non_routed_out = 0;
+    if (n_routed_layer_out) *n_routed_layer_out = 0;
+    if (!m || m->n_tensors == 0) return false;
+
+    uint32_t block_count = 0, nextn = 0, n_dense = 0, n_expert = 0;
+    model_get_u32(m, "glm-dsa.block_count",               &block_count);
+    model_get_u32(m, "glm-dsa.nextn_predict_layers",      &nextn);
+    model_get_u32(m, "glm-dsa.leading_dense_block_count", &n_dense);
+    model_get_u32(m, "glm-dsa.expert_count",              &n_expert);
+    const uint32_t backbone = block_count > nextn ? block_count - nextn : 0;
+    const uint32_t moe_lo   = n_dense;                         /* blk.3      */
+    const uint32_t moe_hi   = backbone > 0 ? backbone - 1 : 0; /* blk.77     */
+
+    /* Per-expert bytes from the first routed layer with a full expert stack.
+     * Single-slab class comes from the base layer (blk.3); off-size layers are
+     * served via mapped views, matching the existing mixed-precision behavior. */
+    uint64_t per_expert = 0;
+    if (moe_hi >= moe_lo) {
+        for (uint32_t il = moe_lo; il <= moe_hi && per_expert == 0; il++) {
+            const ds4_tensor *gate = glm_layer_tensor(m, il, "ffn_gate_exps");
+            const ds4_tensor *up   = glm_layer_tensor(m, il, "ffn_up_exps");
+            const ds4_tensor *down = glm_layer_tensor(m, il, "ffn_down_exps");
+            if (!gate || !up || !down || gate->bytes == 0) continue;
+            uint32_t ne = n_expert;
+            if (ne == 0 && gate->ndim >= 1) ne = (uint32_t)gate->dim[gate->ndim - 1];
+            if (ne == 0) continue;
+            if (gate->bytes % ne != 0 ||
+                up->bytes   % ne != 0 ||
+                down->bytes % ne != 0) continue;
+            per_expert = (gate->bytes + up->bytes + down->bytes) / ne;
+        }
+    }
+    if (per_expert_out) *per_expert_out = per_expert;
+
+    /* Routed backbone layer count (blk.3..77 = 75 for the full split). */
+    uint32_t n_routed_layer = 0;
+    for (uint32_t il = moe_lo; il <= moe_hi; il++) {
+        if (glm_layer_tensor(m, il, "ffn_gate_exps")) n_routed_layer++;
+    }
+    if (n_routed_layer_out) *n_routed_layer_out = n_routed_layer;
+
+    /* Resident non-routed footprint: exclude routed expert weights (_exps) and
+     * the deferred blk.78 NextN block (Phase 6).  Shared experts stay resident. */
+    char nextn_prefix[32];
+    int np = 0;
+    if (nextn > 0 && backbone > 0 && backbone < block_count) {
+        np = snprintf(nextn_prefix, sizeof(nextn_prefix), "blk.%u.", backbone);
+    }
+    uint64_t non_routed = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        const bool routed = glm_str_contains(t->name.ptr, t->name.len, "_exps") &&
+                            !glm_str_contains(t->name.ptr, t->name.len, "_shexp");
+        if (routed) continue;
+        if (np > 0 && (size_t)np < sizeof(nextn_prefix) &&
+            t->name.len >= (uint64_t)np &&
+            memcmp(t->name.ptr, nextn_prefix, (size_t)np) == 0) {
+            continue;  /* blk.78 NextN: deferred, not part of the resident set */
+        }
+        non_routed += t->bytes;
+    }
+    if (non_routed_out) *non_routed_out = non_routed;
+
+    return per_expert != 0 && n_routed_layer != 0;
 }
 
 /* If all declared shards are present, enforce the GGUF split invariant that the
@@ -26068,6 +26167,86 @@ static void glm_model_summary(const ds4_model *m) {
     printf("\nshard 1 file size:  ");
     print_size(m->parts[0].size);
     printf("\n");
+
+    /* GLM SSD streaming cache plan (docs/GLM52-PORT.md section 5).  When the
+     * full tensor inventory is present the plan is computed live from the GLM
+     * per-expert byte math; with shard-1 only the byte math is unavailable, so
+     * the documented 128 GiB target is printed instead (it is itself derived
+     * from the same ds4_ssd_auto_cache_plan formula, so it can never drift
+     * from the unit test).  Phase 3 is sizing + dry-run only: this does NOT
+     * wire SSD streaming into the Metal runtime (that is the Phase 4 work). */
+    {
+        const uint64_t gib             = 1024ull * 1024ull * 1024ull;
+        const uint64_t recommended     = 128ull * gib;
+        const uint64_t doc_non_routed  = 15441835008ull;  /* ~14.381 GiB      */
+        const uint64_t doc_per_expert  = 11304960ull;      /* 10.78125 MiB     */
+        const uint32_t doc_max_experts = 19200u;           /* 75 layers * 256  */
+        ds4_ssd_cache_plan doc_plan;
+        const bool doc_ok = ds4_ssd_auto_cache_plan(recommended, doc_non_routed,
+                                                    doc_per_expert, doc_max_experts,
+                                                    &doc_plan);
+
+        uint64_t per_expert = 0, non_routed = 0;
+        uint32_t n_routed_layer = 0;
+        const bool have_inv = glm_streaming_per_expert_bytes(m, &per_expert,
+                                                             &non_routed,
+                                                             &n_routed_layer);
+        uint32_t n_expert = 0;
+        model_get_u32(m, "glm-dsa.expert_count", &n_expert);
+        if (n_expert == 0) n_expert = 256u;
+        const uint64_t max_model_experts =
+            (uint64_t)n_routed_layer * (uint64_t)n_expert;
+
+        /* The §5 documented 128 GiB target for the FULL model, computed from
+         * the same ds4_ssd_auto_cache_plan formula as the unit test so it can
+         * never drift.  Printed in every state as the authoritative sizing. */
+        const double doc_pct = doc_ok ?
+            100.0 * (double)doc_plan.cache_experts / (double)doc_max_experts : 0.0;
+
+        printf("GLM SSD streaming cache plan:\n");
+        if (have_inv) {
+            /* Live per-expert byte math measured from the blk.3 slab; must equal
+             * the §5 class (11304960) no matter how many shards are mapped. */
+            const uint32_t expected_full =
+                (backbone > n_dense) ? (backbone - n_dense) : 0u;
+            const char *split_state =
+                (expected_full != 0 && n_routed_layer == expected_full) ?
+                    " (full split)" :
+                (expected_full != 0 && n_routed_layer <  expected_full) ?
+                    " (partial split)" : "";
+            ds4_ssd_cache_plan plan;
+            ds4_ssd_auto_cache_plan(recommended, non_routed, per_expert,
+                                    max_model_experts, &plan);
+            printf("  per-expert bytes: %" PRIu64 " (%.5g MiB)\n",
+                   per_expert, (double)per_expert / (1024.0 * 1024.0));
+            printf("  non-routed footprint: ");
+            print_size(non_routed);
+            printf("\n  routed backbone layers: %u / %u expected%s, "
+                   "max_model_experts: %" PRIu64 "\n",
+                   n_routed_layer, expected_full, split_state, max_model_experts);
+            printf("  auto-plan @ 128 GiB (this inventory): cache_experts %u, "
+                   "effective ", plan.cache_experts);
+            print_size(plan.effective_cache_bytes);
+            printf(" (%.1f%% of mapped backbone)\n",
+                   max_model_experts ?
+                   100.0 * (double)plan.cache_experts / (double)max_model_experts : 0.0);
+            printf("  documented target @ 128 GiB (full 75-layer model): "
+                   "%u experts (~%.3f GiB effective, ~%.1f%% of %u backbone)\n",
+                   doc_plan.cache_experts,
+                   (double)doc_plan.effective_cache_bytes / (double)gib,
+                   doc_pct, doc_max_experts);
+        } else if (doc_ok) {
+            /* Shard-1 only: no tensor inventory to measure from.  The target is
+             * the §5 documented 128 GiB outcome. */
+            printf("  requires the full tensor inventory (shards 2-6); with shard-1 "
+                   "only the byte math is unavailable.\n"
+                   "  Expected target on 128 GiB: %u experts (~%.3f GiB effective, "
+                   "~%.1f%% of %u backbone experts).\n",
+                   doc_plan.cache_experts,
+                   (double)doc_plan.effective_cache_bytes / (double)gib,
+                   doc_pct, doc_max_experts);
+        }
+    }
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {

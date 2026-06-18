@@ -2180,6 +2180,37 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+/* Locks docs/GLM52-PORT.md section 5: the GLM-5.2 UD-IQ2_M SSD streaming
+ * cache plan at a 128 GiB recommended working set.  Needs no model file -- it
+ * is the pure cache-arithmetic regression for the reused ds4_ssd helpers, so it
+ * runs on every build (Metal/CPU/CUDA/ROCm). */
+static void test_glm_ssd_cache_plan(void) {
+    const uint64_t gib         = 1024ull * 1024ull * 1024ull;
+    const uint64_t recommended = 128ull * gib;
+    const uint64_t non_routed  = 15441835008ull;   /* ~14.381 GiB resident   */
+    const uint64_t per_expert  = 11304960ull;       /* 10.78125 MiB / expert  */
+    const uint32_t max_experts = 19200u;            /* 75 routed layers * 256 */
+
+    ds4_ssd_cache_plan plan;
+    TEST_ASSERT(ds4_ssd_auto_cache_plan(recommended, non_routed, per_expert,
+                                        max_experts, &plan));
+    TEST_ASSERT(plan.cache_experts == 8359u);
+    TEST_ASSERT(plan.effective_cache_bytes ==
+                (uint64_t)plan.cache_experts * per_expert);
+
+    /* 88 GiB budget must floor to >= 8000 experts at this slab size. */
+    TEST_ASSERT(ds4_ssd_cache_experts_for_byte_budget(88ull * gib, per_expert)
+                >= 8000u);
+
+    fprintf(stderr,
+            "  glm-ssd-math: per-expert bytes %llu, cache experts %u, "
+            "effective cache %.3f GiB (%.1f%% of %u backbone)\n",
+            (unsigned long long)per_expert, plan.cache_experts,
+            (double)plan.effective_cache_bytes / (double)gib,
+            100.0 * (double)plan.cache_experts / (double)max_experts,
+            max_experts);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -2204,6 +2235,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--glm-ssd-math", "glm-ssd-math", "GLM-5.2 SSD cache-plan arithmetic regression (no model needed)", test_glm_ssd_cache_plan},
 };
 
 static void test_print_help(const char *prog) {
