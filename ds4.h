@@ -195,6 +195,152 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
  * --glm-quant-dequant oracle test and the GLM CPU reference. */
 bool ds4_dequant_glm_row(uint32_t gguf_type, const void *block_data,
                          float *out, size_t n);
+
+/* === GLM-5.2 (glm-dsa) CPU reference forward path (Phase 4a) =============
+ *
+ * The Metal graph is the production path for GLM.  This CPU reference exists
+ * only as a correctness oracle for the Metal port (per AGENT.md: "Keep the CPU
+ * backend CPU-only and use it only as reference/debug code").  It is fully
+ * additive, dispatched by arch == DS4_ARCH_GLM_DSA, and never touches the
+ * DeepSeek path.  All math mirrors tests/test-vectors/glm52-ref/
+ * glm52_mla_moe_ref.py line-for-line; the --glm-cpu-ref-components test pins it
+ * to those numpy fixtures (1e-4 abs / 1e-5 rel). */
+
+/* GLM-5.2 shape profile.  The synthetic fixture uses tiny dims with the same
+ * STRUCTURE; the real model uses the §1 values from docs/GLM52-PORT.md. */
+typedef struct {
+    uint32_t hidden;           /* H                                              */
+    uint32_t n_head;           /* attention heads                                */
+    uint32_t q_lora;           /* q_a LoRA rank (2048 real, 8 fixture)           */
+    uint32_t kv_lora;          /* kv latent rank (512 real, 6 fixture)           */
+    uint32_t qk_nope;          /* per-head no-RoPE q/k dim (192 real, 3 fixture) */
+    uint32_t qk_rope;          /* per-head RoPE slice dim (64 real, 2 fixture)   */
+    uint32_t v_dim;            /* per-head v dim (256 real, 4 fixture)           */
+    uint32_t ff_inter;         /* dense FFN intermediate (12288 real, 8 fixture) */
+    uint32_t n_expert;         /* routed experts (256 real, 8 fixture)           */
+    uint32_t n_expert_used;    /* top-k (8 real, 2 fixture)                      */
+    float    rms_eps;          /* RMSNorm epsilon (1e-5)                         */
+    float    rope_base;        /* RoPE theta (8e6)                               */
+    float    moe_scale;        /* routed weight scale (2.5)                      */
+} glm_cpu_shape;
+
+/* Standard interleaved RoPE on a d-dim slice (d even).  Mirrors numpy:
+ *   theta_i = 1 / base^(2i/d), ang = t*theta_i
+ *   out[2i]   = x[2i]*cos(ang) - x[2i+1]*sin(ang)
+ *   out[2i+1] = x[2i]*sin(ang) + x[2i+1]*cos(ang)
+ * Rotates n_head independent rows of width d. */
+void glm_rope_interleaved_f32(float *out, const float *x,
+                              uint32_t d, uint32_t n_head,
+                              float base, uint32_t t);
+
+/* Standard RMSNorm with learned per-channel scale. */
+void glm_rmsnorm_f32(float *out, const float *x, const float *weight,
+                     uint32_t n, float eps);
+
+/* F32 matvec: out[r] = sum_c W[r*cols + c] * x[c]  for r in [0,rows). */
+void glm_matvec_f32(float *out, const float *W, const float *x,
+                    uint32_t rows, uint32_t cols);
+
+/* SiLU: out[i] = x[i] / (1 + exp(-x[i])). */
+void glm_silu_f32(float *out, const float *x, uint32_t n);
+
+/* Sigmoid MoE router: sigmoid(logits)+bias, top-k, normalize selected sigmoid
+ * weights, scale by moe_scale.  Mirrors numpy exactly.
+ *   logits[E] = gate[E][H] @ x[H]
+ *   prob[i]   = sigmoid(logits[i])
+ *   sel[i]    = prob[i] + bias[i]
+ *   idx       = top-k of sel (descending; ties broken by lower index)
+ *   w[j]      = prob[idx[j]] / sum_j(prob[idx[j]]) * moe_scale
+ * Writes idx[k] and w[k].  scratch must hold >= E floats. */
+void glm_moe_route_sigmoid(int *idx, float *w,
+                           const float *gate, const float *x,
+                           const float *bias,
+                           const glm_cpu_shape *shape, float *scratch);
+
+/* Dense SwiGLU FFN for blk.0-2: out = down @ (silu(gate @ x) * (up @ x)).
+ * gate/up are [ff_inter, hidden]; down is [hidden, ff_inter]. */
+void glm_swiglu_dense_f32(float *out, const float *x,
+                          const float *gate, const float *up, const float *down,
+                          const glm_cpu_shape *shape,
+                          float *scratch_gate, float *scratch_up);
+
+/* === Composite MLA decode attention for one token ======================
+ *
+ * Mirrors glm52_mla_moe_ref.py:
+ *   q[h,:]  = (WqB[h*(nope+rope):, :] @ rmsnorm(WqA @ x, ones))
+ *   kva     = WkvA @ x                      // [kv_lora + rope]
+ *   latent  = kva[:kv_lora]; k_rope = kva[kv_lora:]
+ *   kvln    = rmsnorm(latent, ones)         // latent-only norm
+ *   k_nope[h,:] = WkB[h*nope:, :] @ kvln
+ *   v[h,:]      = WvB[h*vdim:, :]  @ kvln
+ *   q_rope, k_rope rotated by interleaved RoPE at position t
+ *   scores[h,n] = (q_nope[h].K_nope[h,n] + q_rope[h].K_rope[h,n]) / sqrt(nope+rope)
+ *   causal mask n<=t, softmax, sum V -> attn_out[h,:] (shape.v_dim per head)
+ * K/V/R rope caches are [n_head, seq_n, <dim>] row-major; the current position
+ * t row is overwritten by the freshly projected k/v before scoring.
+ * out is the post-attention residual contribution: Wo @ attn_out.flatten(). */
+void glm_mla_forward_token_f32(float *out,
+                               const float *x,
+                               const float *WqA, const float *WqB,
+                               const float *WkvA, const float *WkB,
+                               const float *WvB, const float *Wo,
+                               float *K_nope_cache, float *V_cache,
+                               float *K_rope_cache,
+                               uint32_t seq_n, uint32_t t,
+                               const glm_cpu_shape *shape,
+                               float *scratch);
+
+/* Default GLM-5.2 (real model) shape profile from docs/GLM52-PORT.md §1. */
+glm_cpu_shape glm_cpu_shape_real(void);
+
+/* Synthetic fixture shape (tiny dims, same structure) used by the
+ * --glm-cpu-ref-components oracle test. */
+glm_cpu_shape glm_cpu_shape_fixture(void);
+
+/* === Tensor binding (Phase 4a shape + binding) =========================
+ *
+ * Resolved pointers into the mmap'd split GGUF, mirroring the DeepSeek
+ * ds4_layer_weights pattern but with GLM-5.2 tensor names/shapes.  Pointers
+ * stay NULL when the corresponding tensor is absent (e.g. dense FFN on a MoE
+ * layer, or MoE tensors on a dense layer).  Binding is arch-gated and only
+ * resolves tensors for DS4_ARCH_GLM_DSA; it never touches the DeepSeek path. */
+typedef struct {
+    const void *token_embd;        /* [vocab, hidden]                       */
+    const void *output_norm;       /* [hidden] F32                          */
+    const void *output;            /* [vocab, hidden]                       */
+    /* Per-layer attention (all 79 backbone blocks). */
+    const void *attn_norm;         /* [hidden] F32                          */
+    const void *attn_q_a;          /* [q_lora, hidden]                      */
+    const void *attn_q_a_norm;     /* [q_lora] F32                          */
+    const void *attn_q_b;          /* [n_head*(nope+rope), q_lora]           */
+    const void *attn_kv_a_mqa;     /* [kv_lora+rope, hidden]                */
+    const void *attn_kv_a_norm;    /* [kv_lora] F32                         */
+    const void *attn_k_b;          /* [n_head*nope, kv_lora]                */
+    const void *attn_v_b;          /* [n_head*v_dim, kv_lora]               */
+    const void *attn_output;       /* [hidden, n_head*v_dim]                */
+    /* Dense FFN (blk.0-2 only). */
+    const void *ffn_gate;          /* [ff_inter, hidden]                    */
+    const void *ffn_up;            /* [ff_inter, hidden]                    */
+    const void *ffn_down;          /* [hidden, ff_inter]                    */
+    /* MoE (blk.3-77 only). */
+    const void *ffn_norm;          /* [hidden] F32                          */
+    const void *exp_probs_b;       /* [n_expert] F32 bias                   */
+    const void *ffn_gate_inp;      /* [n_expert, hidden] F32 router         */
+    const void *ffn_gate_exps;     /* [n_expert, ff_expert_inter, hidden]   */
+    const void *ffn_up_exps;       /* [n_expert, ff_expert_inter, hidden]   */
+    const void *ffn_down_exps;     /* [n_expert, hidden, ff_expert_inter]   */
+    const void *ffn_gate_shexp;    /* [ff_expert_inter, hidden]             */
+    const void *ffn_up_shexp;      /* [ff_expert_inter, hidden]             */
+    const void *ffn_down_shexp;    /* [hidden, ff_expert_inter]             */
+} glm_layer_weights;
+
+/* Bind one backbone layer's GLM tensors from the loaded split GGUF.  Returns
+ * the number of tensors resolved (>0 on success).  layer_idx in [0,79).
+ * Dense-layer tensors (ffn_gate/up/down) are left NULL for MoE layers and
+ * vice-versa; the caller checks presence.  This is structural binding only;
+ * materializing F32 from quant tensors uses ds4_dequant_glm_row. */
+uint32_t glm_layer_bind(const void *engine_or_model, uint32_t layer_idx,
+                        glm_layer_weights *out);
 int ds4_tokenize_model_text(const char *model_path, const char *text, int *out, int max_out);
 int ds4_render_chat_prompt(const char *model_path, const char *system,
                            const char *prompt, ds4_think_mode think_mode,

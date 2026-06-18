@@ -26786,6 +26786,350 @@ static ds4_arch ds4_detect_arch(const ds4_model *m) {
     return DS4_ARCH_DEEPSEEK;  /* engine was DeepSeek-only before arch dispatch */
 }
 
+/* =======================================================================
+ * GLM-5.2 (glm-dsa) CPU reference forward path (Phase 4a).
+ *
+ * Additive, arch-gated correctness oracle for the Metal port.  Mirrors
+ * tests/test-vectors/glm52-ref/glm52_mla_moe_ref.py line-for-line.  Does not
+ * touch the DeepSeek path.  See AGENT.md: CPU is reference/debug only.
+ * ======================================================================= */
+
+glm_cpu_shape glm_cpu_shape_real(void) {
+    glm_cpu_shape s;
+    s.hidden        = 6144;
+    s.n_head        = 64;
+    s.q_lora        = 2048;
+    s.kv_lora       = 512;
+    s.qk_nope       = 192;
+    s.qk_rope       = 64;
+    s.v_dim         = 256;
+    s.ff_inter      = 12288;
+    s.n_expert      = 256;
+    s.n_expert_used = 8;
+    s.rms_eps       = 1e-5f;
+    s.rope_base     = 8e6f;
+    s.moe_scale     = 2.5f;
+    return s;
+}
+
+glm_cpu_shape glm_cpu_shape_fixture(void) {
+    /* Tiny synthetic config matching dump_fixtures.py / glm52_mla_moe_ref.py.
+     * Same STRUCTURE as the real model; used by --glm-cpu-ref-components. */
+    glm_cpu_shape s;
+    s.hidden        = 16;
+    s.n_head        = 4;
+    s.q_lora        = 8;
+    s.kv_lora       = 6;
+    s.qk_nope       = 3;
+    s.qk_rope       = 2;
+    s.v_dim         = 4;
+    s.ff_inter      = 8;
+    s.n_expert      = 8;
+    s.n_expert_used = 2;
+    s.rms_eps       = 1e-5f;
+    s.rope_base     = 8e6f;
+    s.moe_scale     = 2.5f;
+    return s;
+}
+
+void glm_rmsnorm_f32(float *out, const float *x, const float *weight,
+                     uint32_t n, float eps) {
+    /* numpy: x * w / sqrt(mean(x^2) + eps).  Accumulate in double for the same
+     * mean reduction numpy uses; the F32 cast then matches within 1e-6. */
+    double ss = 0.0;
+    for (uint32_t i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
+    const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
+    for (uint32_t i = 0; i < n; i++) out[i] = x[i] * scale * weight[i];
+}
+
+void glm_rope_interleaved_f32(float *out, const float *x,
+                              uint32_t d, uint32_t n_head,
+                              float base, uint32_t t) {
+    /* Pairs (x[2i], x[2i+1]) rotate by theta_i = 1 / base^(2i/d), ang = t*theta.
+     * Operates on n_head independent rows of width d (the rope slice). */
+    const uint32_t half = d / 2;
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *xh = x + (size_t)h * d;
+        float *oh = out + (size_t)h * d;
+        for (uint32_t i = 0; i < half; i++) {
+            const float theta = 1.0f / powf(base, (float)(2u * i) / (float)d);
+            const float ang = (float)t * theta;
+            const float c = cosf(ang), s = sinf(ang);
+            const float a = xh[2u * i];
+            const float b = xh[2u * i + 1u];
+            oh[2u * i]     = a * c - b * s;
+            oh[2u * i + 1u] = a * s + b * c;
+        }
+    }
+}
+
+void glm_matvec_f32(float *out, const float *W, const float *x,
+                    uint32_t rows, uint32_t cols) {
+    /* out[r] = sum_c W[r*cols + c] * x[c].  F32 accumulation matches numpy's
+     * float32 matvec at these sizes; the oracle tolerance is 1e-4 abs. */
+    for (uint32_t r = 0; r < rows; r++) {
+        const float *wr = W + (size_t)r * cols;
+        float acc = 0.0f;
+        for (uint32_t c = 0; c < cols; c++) acc += wr[c] * x[c];
+        out[r] = acc;
+    }
+}
+
+void glm_silu_f32(float *out, const float *x, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        const float xi = x[i];
+        /* Stable sigmoid to mirror sigmoid_stable() used elsewhere. */
+        const float sig = (xi >= 0.0f) ? 1.0f / (1.0f + expf(-xi))
+                                      : expf(xi) / (1.0f + expf(xi));
+        out[i] = xi * sig;
+    }
+}
+
+void glm_moe_route_sigmoid(int *idx, float *w,
+                           const float *gate, const float *x,
+                           const float *bias,
+                           const glm_cpu_shape *shape, float *scratch) {
+    /* numpy: logits = gate @ x; prob = sigmoid(logits); sel = prob + bias;
+     *        idx = argsort(-sel)[:topk]; w = prob[idx]/sum*scale. */
+    const uint32_t E = shape->n_expert;
+    const uint32_t H = shape->hidden;
+    const uint32_t K = shape->n_expert_used;
+    float *prob = scratch;
+    float sel[1024];  /* >= n_expert; real model is 256 */
+
+    glm_matvec_f32(prob, gate, x, E, H);
+    for (uint32_t i = 0; i < E; i++) {
+        const float li = prob[i];
+        prob[i] = (li >= 0.0f) ? 1.0f / (1.0f + expf(-li))
+                               : expf(li) / (1.0f + expf(li));
+    }
+    for (uint32_t i = 0; i < E; i++) sel[i] = prob[i] + bias[i];
+
+    /* argsort(-sel)[:K] with stable lower-index tie-break, matching numpy's
+     * argsort (stable for equal keys picks lower idx).  Same insertion pattern
+     * as the DeepSeek topk_desc() helper. */
+    for (uint32_t k = 0; k < K; k++) idx[k] = -1;
+    for (uint32_t i = 0; i < E; i++) {
+        for (uint32_t j = 0; j < K; j++) {
+            if (idx[j] < 0 || sel[i] > sel[(uint32_t)idx[j]]) {
+                for (uint32_t m = K - 1; m > j; m--) idx[m] = idx[m - 1];
+                idx[j] = (int)i;
+                break;
+            }
+        }
+    }
+
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < K; k++) {
+        w[k] = prob[(uint32_t)idx[k]];
+        sum += w[k];
+    }
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    const float inv = shape->moe_scale / sum;
+    for (uint32_t k = 0; k < K; k++) w[k] *= inv;
+}
+
+void glm_swiglu_dense_f32(float *out, const float *x,
+                          const float *gate, const float *up, const float *down,
+                          const glm_cpu_shape *shape,
+                          float *scratch_gate, float *scratch_up) {
+    /* Dense FFN (blk.0-2): out = down @ (silu(gate @ x) * (up @ x)). */
+    const uint32_t H = shape->hidden;
+    const uint32_t I = shape->ff_inter;
+    glm_matvec_f32(scratch_gate, gate, x, I, H);
+    glm_matvec_f32(scratch_up, up, x, I, H);
+    glm_silu_f32(scratch_gate, scratch_gate, I);
+    for (uint32_t i = 0; i < I; i++) scratch_gate[i] *= scratch_up[i];
+    glm_matvec_f32(out, down, scratch_gate, H, I);
+}
+
+void glm_mla_forward_token_f32(float *out,
+                               const float *x,
+                               const float *WqA, const float *WqB,
+                               const float *WkvA, const float *WkB,
+                               const float *WvB, const float *Wo,
+                               float *K_nope_cache, float *V_cache,
+                               float *K_rope_cache,
+                               uint32_t seq_n, uint32_t t,
+                               const glm_cpu_shape *shape,
+                               float *scratch) {
+    /* One-token MLA decode, mirroring glm52_mla_moe_ref.py.
+     * scratch is unused (kept for API symmetry with the other components); all
+     * intermediate buffers are allocated internally since this is reference/
+     * debug code, not a production hot path. */
+    (void)scratch;
+    const uint32_t H    = shape->hidden;
+    const uint32_t nh   = shape->n_head;
+    const uint32_t ql   = shape->q_lora;
+    const uint32_t kvl  = shape->kv_lora;
+    const uint32_t nope = shape->qk_nope;
+    const uint32_t rope = shape->qk_rope;
+    const uint32_t vd   = shape->v_dim;
+    const uint32_t qhd  = nope + rope;          /* per-head q dim           */
+    const float    kq_scale = 1.0f / sqrtf((float)qhd);
+
+    float *wqa    = xmalloc(ql * sizeof(float));
+    float *wqa_n  = xmalloc(ql * sizeof(float));
+    float *q_flat = xmalloc((size_t)nh * qhd * sizeof(float));
+    float *kva    = xmalloc((size_t)(kvl + rope) * sizeof(float));
+    float *kvln   = xmalloc(kvl * sizeof(float));
+    float *k_nope = xmalloc((size_t)nh * nope * sizeof(float));
+    float *v      = xmalloc((size_t)nh * vd * sizeof(float));
+    float *qrope  = xmalloc((size_t)nh * rope * sizeof(float));
+    float *krope  = xmalloc((size_t)nh * rope * sizeof(float));
+    float *attn_o = xmalloc((size_t)nh * vd * sizeof(float));
+    float *ones_ql = xmalloc(ql * sizeof(float));
+    float *ones_kvl = xmalloc(kvl * sizeof(float));
+    for (uint32_t i = 0; i < ql; i++) ones_ql[i] = 1.0f;
+    for (uint32_t i = 0; i < kvl; i++) ones_kvl[i] = 1.0f;
+
+    /* q path: WqA @ x -> RMSNorm(ones) -> WqB @ -> [nh, qhd]. */
+    glm_matvec_f32(wqa, WqA, x, ql, H);
+    glm_rmsnorm_f32(wqa_n, wqa, ones_ql, ql, shape->rms_eps);
+    glm_matvec_f32(q_flat, WqB, wqa_n, nh * qhd, ql);
+
+    /* kv path: WkvA @ x -> split latent/rope -> RMSNorm(latent only). */
+    glm_matvec_f32(kva, WkvA, x, kvl + rope, H);
+    const float *latent     = kva;
+    const float *k_rope_raw = kva + kvl;
+    glm_rmsnorm_f32(kvln, latent, ones_kvl, kvl, shape->rms_eps);
+    glm_matvec_f32(k_nope, WkB, kvln, nh * nope, kvl);
+    glm_matvec_f32(v, WvB, kvln, nh * vd, kvl);
+
+    /* Place current position's k/v into the (mutable) caches. */
+    for (uint32_t h = 0; h < nh; h++) {
+        memcpy(K_nope_cache + ((size_t)h * seq_n + t) * nope,
+               k_nope + (size_t)h * nope, nope * sizeof(float));
+        memcpy(V_cache + ((size_t)h * seq_n + t) * vd,
+               v + (size_t)h * vd, vd * sizeof(float));
+        memcpy(K_rope_cache + ((size_t)h * seq_n + t) * rope,
+               k_rope_raw, rope * sizeof(float));
+    }
+
+    /* RoPE on q_rope slice (gather per-head rope then rotate) and on the
+     * broadcast k_rope_raw.  Mirrors numpy's rope_interleaved exactly. */
+    for (uint32_t h = 0; h < nh; h++)
+        for (uint32_t j = 0; j < rope; j++)
+            qrope[(size_t)h * rope + j] = q_flat[(size_t)h * qhd + nope + j];
+    glm_rope_interleaved_f32(qrope, qrope, rope, nh, shape->rope_base, t);
+    for (uint32_t h = 0; h < nh; h++)
+        memcpy(krope + (size_t)h * rope, k_rope_raw, rope * sizeof(float));
+    glm_rope_interleaved_f32(krope, krope, rope, nh, shape->rope_base, t);
+    /* Overwrite the current t row of K_rope_cache with rotated k_rope. */
+    for (uint32_t h = 0; h < nh; h++)
+        memcpy(K_rope_cache + ((size_t)h * seq_n + t) * rope,
+               krope + (size_t)h * rope, rope * sizeof(float));
+
+    /* Attention: scores = (q_nope.K_nope + q_rope.K_rope)/sqrt(qhd), causal
+     * mask n<=t, softmax, sum V -> attn_out [nh, vd]. */
+    float *scores = xmalloc((size_t)(t + 1) * sizeof(float));
+    for (uint32_t h = 0; h < nh; h++) {
+        const float *qnh = q_flat + (size_t)h * qhd;     /* [nope] */
+        const float *qrh = qrope + (size_t)h * rope;     /* [rope] */
+        float maxs = -1e30f;
+        for (uint32_t n = 0; n <= t; n++) {
+            const float *kn = K_nope_cache + ((size_t)h * seq_n + n) * nope;
+            const float *kr = K_rope_cache + ((size_t)h * seq_n + n) * rope;
+            float s = 0.0f;
+            for (uint32_t d = 0; d < nope; d++) s += qnh[d] * kn[d];
+            for (uint32_t d = 0; d < rope; d++) s += qrh[d] * kr[d];
+            s *= kq_scale;
+            scores[n] = s;
+            if (s > maxs) maxs = s;
+        }
+        float denom = 0.0f;
+        for (uint32_t n = 0; n <= t; n++) {
+            scores[n] = expf(scores[n] - maxs);
+            denom += scores[n];
+        }
+        float *oh = attn_o + (size_t)h * vd;
+        for (uint32_t d = 0; d < vd; d++) oh[d] = 0.0f;
+        for (uint32_t n = 0; n <= t; n++) {
+            const float wt = scores[n] / denom;
+            const float *vn = V_cache + ((size_t)h * seq_n + n) * vd;
+            for (uint32_t d = 0; d < vd; d++) oh[d] += wt * vn[d];
+        }
+    }
+
+    /* Single attn_output projection: Wo @ attn_out.flatten() -> [H]. */
+    glm_matvec_f32(out, Wo, attn_o, H, nh * vd);
+
+    free(scores);
+    free(wqa); free(wqa_n); free(q_flat); free(kva); free(kvln);
+    free(k_nope); free(v); free(qrope); free(krope); free(attn_o);
+    free(ones_ql); free(ones_kvl);
+}
+
+/* Bind one backbone layer's GLM tensors by name from the loaded split GGUF.
+ * Arch-gated by tensor name: resolves nothing on a DeepSeek model (no
+ * blk.N.attn_* names exist there).  Pointer fields hold RAW quant block data
+ * (Q4_K/Q8_0/IQ2_XXS/...); F32 is materialized at compute time via
+ * ds4_dequant_glm_row.  Dense-FFN fields (ffn_gate/up/down) stay NULL on MoE
+ * layers and vice-versa; the caller checks presence.  Global tensors
+ * (token_embd/output_norm/output) are resolved only on the layer 0 call.
+ * Returns the count of tensors resolved this call.  Real-model binding is
+ * exercised when the 238 GiB split is loaded (Phase 4b+); on a NULL model or
+ * a DeepSeek model it returns 0. */
+uint32_t glm_layer_bind(const void *engine_or_model, uint32_t layer_idx,
+                        glm_layer_weights *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    const ds4_model *m = (const ds4_model *)engine_or_model;
+    if (!m) return 0;
+    uint32_t n = 0;
+
+    /* Resolve a fixed-name global tensor. */
+#define GLM_BIND_FIXED(field, name) do { \
+        ds4_tensor *t_ = model_find_tensor(m, name); \
+        if (t_) { out->field = tensor_data(m, t_); n++; } \
+    } while (0)
+    /* Resolve a per-layer tensor: "blk.<layer_idx>.<suffix>". */
+#define GLM_BIND_LAYER(field, suffix) do { \
+        char nm_[160]; \
+        snprintf(nm_, sizeof(nm_), "blk.%u.%s", layer_idx, suffix); \
+        ds4_tensor *t_ = model_find_tensor(m, nm_); \
+        if (t_) { out->field = tensor_data(m, t_); n++; } \
+    } while (0)
+
+    /* Global tensors (resolved on the layer 0 call; identical across layers). */
+    if (layer_idx == 0) {
+        GLM_BIND_FIXED(token_embd,  "token_embd.weight");
+        GLM_BIND_FIXED(output_norm, "output_norm.weight");
+        GLM_BIND_FIXED(output,      "output.weight");
+    }
+
+    /* Per-layer attention (all 79 backbone blocks blk.0-77). */
+    GLM_BIND_LAYER(attn_norm,      "attn_norm.weight");
+    GLM_BIND_LAYER(attn_q_a,       "attn_q_a.weight");
+    GLM_BIND_LAYER(attn_q_a_norm,  "attn_q_a_norm.weight");
+    GLM_BIND_LAYER(attn_q_b,       "attn_q_b.weight");
+    GLM_BIND_LAYER(attn_kv_a_mqa,  "attn_kv_a_mqa.weight");
+    GLM_BIND_LAYER(attn_kv_a_norm, "attn_kv_a_norm.weight");
+    GLM_BIND_LAYER(attn_k_b,       "attn_k_b.weight");
+    GLM_BIND_LAYER(attn_v_b,       "attn_v_b.weight");
+    GLM_BIND_LAYER(attn_output,    "attn_output.weight");
+
+    /* Dense FFN (blk.0-2 only; stays NULL on MoE layers). */
+    GLM_BIND_LAYER(ffn_gate, "ffn_gate.weight");
+    GLM_BIND_LAYER(ffn_up,   "ffn_up.weight");
+    GLM_BIND_LAYER(ffn_down, "ffn_down.weight");
+
+    /* MoE (blk.3-77 only; stays NULL on dense layers). */
+    GLM_BIND_LAYER(ffn_norm,       "ffn_norm.weight");
+    GLM_BIND_LAYER(exp_probs_b,    "exp_probs_b.bias");
+    GLM_BIND_LAYER(ffn_gate_inp,   "ffn_gate_inp.weight");
+    GLM_BIND_LAYER(ffn_gate_exps,  "ffn_gate_exps.weight");
+    GLM_BIND_LAYER(ffn_up_exps,    "ffn_up_exps.weight");
+    GLM_BIND_LAYER(ffn_down_exps,  "ffn_down_exps.weight");
+    GLM_BIND_LAYER(ffn_gate_shexp, "ffn_gate_shexp.weight");
+    GLM_BIND_LAYER(ffn_up_shexp,   "ffn_up_shexp.weight");
+    GLM_BIND_LAYER(ffn_down_shexp, "ffn_down_shexp.weight");
+
+#undef GLM_BIND_FIXED
+#undef GLM_BIND_LAYER
+    return n;
+}
+
 static void glm_expect_u32(const ds4_model *m, const char *key, uint32_t expected) {
     uint32_t got = 0;
     if (!model_get_u32(m, key, &got)) {
