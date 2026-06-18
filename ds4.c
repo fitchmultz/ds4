@@ -22533,11 +22533,14 @@ static uint64_t glm4_match(const char *s, uint64_t len, uint64_t start) {
     if (c0 == 0x27) {
         uint32_t c1 = glm_cp_at(s, len, n1, &n2);
         uint32_t l1 = glm_ascii_lower(c1);
-        if (l1 == 's' || l1 == 't' || l1 == 'm' || l1 == 'd') return n1;
+        /* Whole contraction: n2 = "'" + 1 char ('s 't 'm 'd),
+         * n3 = "'" + 2 chars ('re 've 'll).  Returning n1/n2 dropped the
+         * trailing letter(s) and let rule 2 split the apostrophe off alone. */
+        if (l1 == 's' || l1 == 't' || l1 == 'm' || l1 == 'd') return n2;
         uint32_t c2 = glm_cp_at(s, len, n2, &n3);
         uint32_t l2 = glm_ascii_lower(c2);
         if ((l1 == 'r' && l2 == 'e') || (l1 == 'v' && l2 == 'e') ||
-            (l1 == 'l' && l2 == 'l')) return n2;
+            (l1 == 'l' && l2 == 'l')) return n3;
         /* fall through: "'x" becomes one piece via rule 2 */
     }
 
@@ -22667,6 +22670,11 @@ static void vocab_load_specials(ds4_vocab *vocab, const ds4_model *model,
                 int32_t ty;
                 if (!cursor_read(&c, &ty, sizeof(ty))) break;
                 if (ty == 3 || ty == 4) {  /* USER_DEFINED or UNUSED (added) */
+                    if (vocab->n_specials >= cap) {  /* grow instead of overflowing */
+                        cap *= 2;
+                        vocab->specials = xrealloc(vocab->specials,
+                                                   (size_t)cap * sizeof(vocab->specials[0]));
+                    }
                     vocab->specials[vocab->n_specials].text = vocab->token[i];
                     vocab->specials[vocab->n_specials].id = i;
                     vocab->n_specials++;
@@ -22911,7 +22919,15 @@ void ds4_encode_chat_prompt(
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
-    bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+    ds4_vocab *vocab = &e->vocab;
+    if (vocab->mode == DS4_TOK_GLM4) {
+        /* GLM template: <|system|>Reasoning Effort: Max tokenized with glm4,
+         * placed after the [gMASK]<sop> header. Mirrors glm_encode_chat_prompt. */
+        if (vocab->system_id >= 0) token_vec_push(tokens, vocab->system_id);
+        glm4_tokenize_text(vocab, "Reasoning Effort: Max", tokens);
+    } else {
+        bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+    }
 }
 
 static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
@@ -22949,10 +22965,14 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
             glm4_tokenize_text(vocab, content, tokens);
         } else if (!strcmp(role, "assistant")) {
             if (vocab->assistant_id >= 0) token_vec_push(tokens, vocab->assistant_id);
-            token_vec_push(tokens, vocab->think_start_id);
-            if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0 &&
-                vocab->think_end_id >= 0) {
-                token_vec_push(tokens, vocab->think_end_id);
+            /* HF emits exactly one <think>...</think>: preserved reasoning
+             * already starts with <think>/</think> and carries its own framing,
+             * so only synthesize the empty <think></think> block before stripped
+             * visible content.  Never prepend think_start_id on top of it. */
+            if (strncmp(content, "<think>", 7) != 0 &&
+                strncmp(content, "</think>", 8) != 0) {
+                token_vec_push(tokens, vocab->think_start_id);
+                if (vocab->think_end_id >= 0) token_vec_push(tokens, vocab->think_end_id);
             }
             glm4_tokenize_text(vocab, content, tokens);
         } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
@@ -25560,6 +25580,37 @@ int ds4_render_chat_prompt(const char *model_path, const char *system,
     token_vec_free(&tokens);
     vocab_free(&vocab);
     model_close(&model);
+    return total;
+}
+
+/* Render a multi-turn transcript through the public append API (chat begin,
+ * optional max-effort prefix, optional system turn, one assistant-history
+ * turn) from a model's tokenizer tables (no inference).  Used by the GLM chat
+ * smoke to exercise ds4_chat_append_message and ds4_chat_append_max_effort_prefix
+ * so the no-double-<think> rule and the glm4 max-effort dispatch are covered. */
+int ds4_render_chat_history(const char *model_path, const char *system,
+                            const char *assistant_content, bool max_effort,
+                            int *out, int max_out) {
+    ds4_engine e;
+    memset(&e, 0, sizeof(e));
+    model_open(&e.model, model_path, false, false);
+    vocab_load(&e.vocab, &e.model);
+
+    token_vec tokens = {0};
+    ds4_chat_begin(&e, &tokens);
+    if (max_effort) ds4_chat_append_max_effort_prefix(&e, &tokens);
+    if (system && system[0]) ds4_chat_append_message(&e, &tokens, "system", system);
+    if (assistant_content) {
+        ds4_chat_append_message(&e, &tokens, "assistant", assistant_content);
+    }
+
+    int total = tokens.len;
+    int n = (max_out > 0 && total < max_out) ? total : max_out;
+    for (int i = 0; i < n; i++) out[i] = tokens.v[i];
+
+    token_vec_free(&tokens);
+    vocab_free(&e.vocab);
+    model_close(&e.model);
     return total;
 }
 

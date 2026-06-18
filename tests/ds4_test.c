@@ -2400,8 +2400,8 @@ static void test_glm_bpe(void) {
     }
 
     fprintf(stderr, "  glm-bpe: %d/%d cases match HF tokenizers oracle\n", n_pass, n_cases);
-    TEST_ASSERT(n_cases == 34);
-    TEST_ASSERT(n_pass >= 32);
+    TEST_ASSERT(n_cases == 43);
+    TEST_ASSERT(n_pass == n_cases);
 
     /* Chat-template smoke: render system+user, confirm [gMASK]<sop> prefix and
      * the role sentinels are present, and that the prefix round-trips. */
@@ -2454,6 +2454,54 @@ static void test_glm_bpe(void) {
     TEST_ASSERT(rt_ok);
     fprintf(stderr, "  glm-bpe: round-trip stable (%d ids, %zu bytes)\n", n_rt, rt_len);
     free(rt_text);
+
+    /* Multi-turn transcript via the public append API.  Assistant history that
+     * already opens with <think> must not get a second <think> prepended (no
+     * "<think><think>"); stripped content gets exactly one empty <think></think>
+     * block.  Also covers the mode-dispatched max-effort prefix (glm4-tokenized
+     * <|system|>Reasoning Effort: Max right after the header). */
+    int hist[512];
+    int n_hist = ds4_render_chat_history(model_path, NULL,
+                                         "<think>plan</think>done", false, hist, 512);
+    TEST_ASSERT(n_hist > 0);
+    char *hist_text = NULL;
+    size_t hist_len = ds4_decode_model_text(model_path, hist, n_hist, &hist_text);
+    TEST_ASSERT(hist_text && hist_len > 0);
+    bool no_double = (strstr(hist_text, "<think><think>") == NULL);
+    bool has_think = (strstr(hist_text, "<think>") != NULL);
+    fprintf(stderr, "  glm-bpe: assistant-history no-double-think=%d has-think=%d\n",
+            (int)no_double, (int)has_think);
+    TEST_ASSERT(no_double && has_think);
+    free(hist_text);
+
+    int stripped[512];
+    int n_stripped = ds4_render_chat_history(model_path, NULL, "Hello there.",
+                                             false, stripped, 512);
+    TEST_ASSERT(n_stripped > 0);
+    char *stripped_text = NULL;
+    (void)ds4_decode_model_text(model_path, stripped, n_stripped, &stripped_text);
+    bool stripped_block = (strstr(stripped_text, "<think></think>") != NULL);
+    fprintf(stderr, "  glm-bpe: stripped assistant <think></think> block=%d\n",
+            (int)stripped_block);
+    TEST_ASSERT(stripped_block);
+    free(stripped_text);
+
+    int eff[512];
+    int n_eff = ds4_render_chat_history(model_path, NULL, "Hi", true, eff, 512);
+    TEST_ASSERT(n_eff > 8);
+    /* max-effort: <|system|>(154826) at header end, then glm4 tokens of
+     * "Reasoning Effort: Max" — proves the prefix is glm4-tokenized on GLM. */
+    TEST_ASSERT(eff[2] == 154826);
+    int exp_eff[32];
+    int n_exp_eff = ds4_tokenize_model_text(model_path, "Reasoning Effort: Max",
+                                            exp_eff, 32);
+    bool eff_ok = (n_exp_eff > 0 && 3 + n_exp_eff <= n_eff);
+    for (int i = 0; eff_ok && i < n_exp_eff; i++) {
+        if (eff[3 + i] != exp_eff[i]) eff_ok = false;
+    }
+    fprintf(stderr, "  glm-bpe: max-effort glm4-tokenized=%d (%d ids after <|system|>)\n",
+            (int)eff_ok, n_exp_eff);
+    TEST_ASSERT(eff_ok);
 
     free(got);
     free(exp);

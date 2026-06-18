@@ -990,6 +990,7 @@ typedef struct {
     ds4_tokens transcript;
     int ctx_size;
     int max_prefix_tokens;
+    int header_len;  /* chat-begin header width: BOS, plus <sop> on GLM */
 } repl_chat;
 
 static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
@@ -1024,15 +1025,20 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
  * API rendering path.  Changing it invalidates the session because every later
  * token position would otherwise refer to the wrong prefix. */
 static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool enable) {
+    /* Insert at the end of the chat-begin header (BOS, plus <sop> on GLM), so
+     * the prefix lands after the header and before any system/developer text,
+     * mirroring the API rendering path.  Changing it invalidates the session
+     * because every later token position would otherwise shift. */
+    const int header_len = chat->header_len > 0 ? chat->header_len : 1;
     if (enable && chat->max_prefix_tokens == 0) {
         ds4_tokens prefix = {0};
         ds4_chat_append_max_effort_prefix(engine, &prefix);
-        tokens_insert(&chat->transcript, 1, &prefix);
+        tokens_insert(&chat->transcript, header_len, &prefix);
         chat->max_prefix_tokens = prefix.len;
         ds4_tokens_free(&prefix);
         if (chat->session) ds4_session_invalidate(chat->session);
     } else if (!enable && chat->max_prefix_tokens > 0) {
-        tokens_remove(&chat->transcript, 1, chat->max_prefix_tokens);
+        tokens_remove(&chat->transcript, header_len, chat->max_prefix_tokens);
         chat->max_prefix_tokens = 0;
         if (chat->session) ds4_session_invalidate(chat->session);
     }
@@ -1053,6 +1059,7 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
 static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
     ds4_chat_begin(engine, &chat->transcript);
+    chat->header_len = chat->transcript.len;  /* BOS (+ <sop> on GLM) */
     repl_chat_apply_max_prefix(engine, chat,
                                cli_effective_think_mode(&cfg->gen) == DS4_THINK_MAX);
     if (cfg->gen.system && cfg->gen.system[0]) {
