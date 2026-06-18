@@ -2525,6 +2525,7 @@ static void test_glm_quant_dequant(void) {
     if (!dir || !dir[0]) dir = "tests/test-vectors/glm52-quant";
     static const struct { const char *name; uint32_t type; uint32_t block_bytes; } types[] = {
         {"Q4_K", 12, 144}, {"Q5_K", 13, 176}, {"Q6_K", 14, 210},
+        {"IQ3_XXS", 18, 98}, {"IQ4_XS", 23, 136}, {"IQ2_S", 22, 82},
     };
     const size_t n_types = sizeof(types) / sizeof(types[0]);
     int n_pass = 0, n_run = 0;
