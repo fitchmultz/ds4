@@ -1,8 +1,10 @@
-// GLM-5.2 (glm-dsa) standalone component kernels — Phase 4c-i.
+// GLM-5.2 (glm-dsa) standalone component kernels — Phase 4c-i + 4c-ii.
 //
 // Small, flat-buffer kernels that mirror the Phase 4a CPU reference
 // (ds4.c: glm_matvec_f32 / glm_rmsnorm_f32 / glm_rope_interleaved_f32 /
-// the attention block of glm_mla_forward_token_f32) line-for-line on simple
+// the attention block of glm_mla_forward_token_f32, plus 4c-ii:
+// glm_moe_route_sigmoid post-logits math and the SwiGLU activation gate)
+// line-for-line on simple
 // contiguous F32 arrays.  They exist ONLY to validate the Metal path against
 // the CPU oracle on the tests/test-vectors/glm52-ref fixtures; the production
 // GLM graph wiring (Phase 4c-iv) will reuse the engine's strided dense/norm
@@ -160,4 +162,84 @@ kernel void kernel_glm_attn_decode_f32(
         device const float * vn = v_base + (uint64_t)n * args.vd;
         for (uint32_t d = 0; d < args.vd; d++) oh[d] += w * vn[d];
     }
+}
+
+// =======================================================================
+// Phase 4c-ii: sigmoid MoE router + dense/shared-expert SwiGLU FFN.
+// The router takes PRECOMPUTED logits (gate@x is done with
+// kernel_glm_matvec_f32 above); the FFN activation gate is one elementwise
+// kernel and its gate/up/down projections likewise reuse the matvec kernel.
+// Same single-thread-F32, mirror-the-CPU-order discipline as 4c-i.
+// =======================================================================
+
+struct ds4_metal_args_glm_moe {
+    uint32_t n_expert;   // E (256 real, 8 fixture)
+    uint32_t top_k;      // K (8 real, 2 fixture); bounded by GLM_MOE_MAX_K
+    float    scale;      // moe_scale (2.5)
+};
+
+#define GLM_MOE_MAX_EXPERT 1024   /* >= n_expert; real model is 256, CPU uses 1024 */
+#define GLM_MOE_MAX_K      8      /* >= top_k (real 8, fixture 2) */
+
+// Sigmoid MoE router on precomputed logits.  Mirrors the post-logits math of
+// glm_moe_route_sigmoid exactly:
+//   prob[i] = sigmoid(logits[i])     (stable: x>=0 -> 1/(1+exp(-x)))
+//   sel[i]  = prob[i] + bias[i]
+//   idx     = stable top-K by sel (strict >, lower index wins ties)
+//   w[k]    = prob[idx[k]] / max(sum prob[idx], 6.1e-5) * scale
+// One thread: E=256 is tiny; insertion sort + reduce is O(E*K).  The thread-
+// local prob array covers the CPU's sel[1024] ceiling; top-K slots are fixed.
+kernel void kernel_glm_moe_route_f32(
+        constant ds4_metal_args_glm_moe & args,
+        device const float * logits,   // [E]
+        device const float * bias,     // [E]
+        device int   * out_idx,        // [K]
+        device float * out_w) {        // [K]
+    const uint32_t E = args.n_expert;
+    const uint32_t K = args.top_k;
+    thread float prob[GLM_MOE_MAX_EXPERT];
+    for (uint32_t i = 0; i < E; i++) {
+        const float li = logits[i];
+        prob[i] = (li >= 0.0f) ? 1.0f / (1.0f + exp(-li))
+                               : exp(li) / (1.0f + exp(li));
+    }
+    /* Insertion sort into a descending-by-sel top-K with stable lower-index
+     * tie-break: identical control flow to the CPU loop (strict >, so equal
+     * sel never displaces an earlier/lower index). */
+    int idx[GLM_MOE_MAX_K];
+    for (uint32_t k = 0; k < K; k++) idx[k] = -1;
+    for (uint32_t i = 0; i < E; i++) {
+        const float sel_i = prob[i] + bias[i];
+        for (uint32_t j = 0; j < K; j++) {
+            if (idx[j] < 0 ||
+                sel_i > (prob[(uint32_t)idx[j]] + bias[(uint32_t)idx[j]])) {
+                for (uint32_t m = K - 1u; m > j; m--) idx[m] = idx[m - 1u];
+                idx[j] = (int)i;
+                break;
+            }
+        }
+    }
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < K; k++) sum += prob[(uint32_t)idx[k]];
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    const float inv = args.scale / sum;
+    for (uint32_t k = 0; k < K; k++) {
+        out_idx[k] = idx[k];
+        out_w[k] = prob[(uint32_t)idx[k]] * inv;
+    }
+}
+
+// Elementwise dense/shared-expert SwiGLU: out[i] = silu(gate_x[i]) * up_x[i].
+// Stable sigmoid mirrors glm_silu_f32; the gate/up/down projections reuse
+// kernel_glm_matvec_f32.  One thread per element.
+kernel void kernel_glm_swiglu_f32(
+        device const float * gate_x,
+        device const float * up_x,
+        device       float * out,
+        uint gid [[thread_position_in_grid]]) {
+    const float g = gate_x[gid];
+    const float u = up_x[gid];
+    const float sig = (g >= 0.0f) ? 1.0f / (1.0f + exp(-g))
+                                  : exp(g) / (1.0f + exp(g));
+    out[gid] = g * sig * u;
 }

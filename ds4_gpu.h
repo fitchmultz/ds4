@@ -1054,6 +1054,20 @@ int ds4_gpu_glm_attn_decode_f32(const float * Q,
                                 uint32_t vd, uint32_t qhd,
                                 uint32_t seq_n, uint32_t t);
 
+/* Sigmoid MoE router on PRECOMPUTED logits (gate@x is done separately via
+ * ds4_gpu_glm_matvec_f32).  prob=sigmoid(logits); sel=prob+bias; stable
+ * top-K by sel (lower index wins ties); w[k]=prob[idx]/sum*scale.
+ * out_idx/out_w are length top_k.  Mirrors ds4.c glm_moe_route_sigmoid. */
+int ds4_gpu_glm_moe_route_f32(const float * logits, const float * bias,
+                              int * out_idx, float * out_w,
+                              uint32_t n_expert, uint32_t top_k, float scale);
+
+/* Elementwise dense/shared-expert SwiGLU: out = silu(gate_x) * up_x.
+ * The gate/up/down projections reuse ds4_gpu_glm_matvec_f32.
+ * Mirrors ds4.c glm_silu_f32 + the gate of glm_swiglu_dense_f32. */
+int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
+                           float * out, uint32_t n);
+
 #ifdef __cplusplus
 }
 #endif

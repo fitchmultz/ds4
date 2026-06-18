@@ -3071,6 +3071,146 @@ static void test_glm_metal_components(void) {
     float *ref_mla_out = glm_ref_load_floats(dir, "mla_out.txt", H);
     if (ref_mla_out) glm_metal_cmp("MLA composite (Metal vs numpy)", mout, ref_mla_out, H, tol_abs, tol_rel);
 
+    /* =============================================================
+     * Phase 4c-ii: sigmoid MoE router + dense/shared-expert SwiGLU FFN.
+     * Same component-then-composite pattern as the MLA block above: each
+     * step runs Metal and the Phase 4a CPU oracle on identical inputs, then
+     * the full Metal chain is compared to the CPU composite + numpy fixture.
+     * ============================================================= */
+    {
+        const uint32_t E = shape.n_expert, K = shape.n_expert_used;
+        const uint32_t ff = shape.ff_inter;
+        const float scale = shape.moe_scale;
+
+        /* ---- MoE router: gate@x -> sigmoid -> +bias -> top-K -> norm*scale ---- */
+        float *gate       = glm_ref_load_floats(dir, "moe_gate.txt",   (size_t)E * H);
+        float *bias       = glm_ref_load_floats(dir, "moe_bias.txt",   E);
+        float *ref_logits = glm_ref_load_floats(dir, "moe_logits.txt", E);
+        float *ref_w      = glm_ref_load_floats(dir, "moe_w.txt",      K);
+        int   *ref_idx    = glm_ref_load_ints(dir,   "moe_idx.txt",    K);
+        if (!gate || !bias || !ref_logits || !ref_w || !ref_idx) {
+            fprintf(stderr, "  glm-metal: SKIP MoE (fixtures missing in %s)\n", dir);
+        } else {
+            float *clogits = malloc(sizeof(float) * E); TEST_ASSERT(clogits);
+            float *mlogits = malloc(sizeof(float) * E); TEST_ASSERT(mlogits);
+            glm_matvec_f32(clogits, gate, x, E, H);               /* CPU oracle logits */
+            TEST_ASSERT(ds4_gpu_glm_matvec_f32(gate, x, mlogits, E, H));
+            glm_metal_cmp("matvec router logits (gate@x)", mlogits, clogits, E, tol_abs, tol_rel);
+            glm_metal_cmp("router logits vs numpy", mlogits, ref_logits, E, tol_abs, tol_rel);
+
+            /* CPU oracle router (derives the same gate@x logits internally). */
+            int   cidx[8]; float cw[8];
+            float *scratch = malloc(sizeof(float) * E); TEST_ASSERT(scratch);
+            glm_moe_route_sigmoid(cidx, cw, gate, x, bias, &shape, scratch);
+            free(scratch);
+
+            /* Metal router fed the SAME (CPU-computed) logits: isolates the
+             * sigmoid+bias+topk+normalize*scale math from matvec drift. */
+            int   midx[8]; float mw[8];
+            TEST_ASSERT(ds4_gpu_glm_moe_route_f32(clogits, bias, midx, mw, E, K, scale));
+            /* MoE indices must be EXACT (indices exact, per spec). */
+            {
+                bool idx_ok = true;
+                for (uint32_t k = 0; k < K; k++) if (midx[k] != cidx[k]) { idx_ok = false; break; }
+                fprintf(stderr, "  glm-metal: %-30s %s (idx=[%d,%d] cpu=[%d,%d])\n",
+                        "MoE route idx (sigmoid+topk)", idx_ok ? "PASS" : "FAIL",
+                        K >= 1 ? midx[0] : -1, K >= 2 ? midx[1] : -1,
+                        K >= 1 ? cidx[0] : -1, K >= 2 ? cidx[1] : -1);
+                g_glm_metal_total++;
+                if (idx_ok) g_glm_metal_pass++;
+                TEST_ASSERT(idx_ok);
+            }
+            glm_metal_cmp("MoE route weights (norm*2.5)", mw, cw, K, tol_abs, tol_rel);
+            /* cross-check the Metal-selected weights/indices vs numpy fixtures. */
+            {
+                bool idx_ok = true;
+                for (uint32_t k = 0; k < K; k++) if (midx[k] != ref_idx[k]) { idx_ok = false; break; }
+                fprintf(stderr, "  glm-metal: %-30s %s (idx=[%d,%d] ref=[%d,%d])\n",
+                        "MoE route idx vs numpy", idx_ok ? "PASS" : "FAIL",
+                        K >= 1 ? midx[0] : -1, K >= 2 ? midx[1] : -1,
+                        K >= 1 ? ref_idx[0] : -1, K >= 2 ? ref_idx[1] : -1);
+                g_glm_metal_total++;
+                if (idx_ok) g_glm_metal_pass++;
+                TEST_ASSERT(idx_ok);
+            }
+            glm_metal_cmp("MoE route weights vs numpy", mw, ref_w, K, tol_abs, tol_rel);
+
+            /* Composite: full Metal chain (matvec logits -> router) vs CPU oracle. */
+            int   midx2[8]; float mw2[8];
+            TEST_ASSERT(ds4_gpu_glm_moe_route_f32(mlogits, bias, midx2, mw2, E, K, scale));
+            {
+                bool idx_ok = true;
+                for (uint32_t k = 0; k < K; k++) if (midx2[k] != cidx[k]) { idx_ok = false; break; }
+                fprintf(stderr, "  glm-metal: %-30s %s (idx=[%d,%d] cpu=[%d,%d])\n",
+                        "MoE route (Metal chain) idx", idx_ok ? "PASS" : "FAIL",
+                        K >= 1 ? midx2[0] : -1, K >= 2 ? midx2[1] : -1,
+                        K >= 1 ? cidx[0] : -1, K >= 2 ? cidx[1] : -1);
+                g_glm_metal_total++;
+                if (idx_ok) g_glm_metal_pass++;
+                TEST_ASSERT(idx_ok);
+            }
+            glm_metal_cmp("MoE route (Metal chain) weights", mw2, cw, K, tol_abs, tol_rel);
+
+            free(clogits); free(mlogits);
+        }
+
+        /* ---- dense/shared-expert SwiGLU FFN ---- */
+        float *ff_gate    = glm_ref_load_floats(dir, "ffn_gate.txt",   (size_t)ff * H);
+        float *ff_up      = glm_ref_load_floats(dir, "ffn_up.txt",     (size_t)ff * H);
+        float *ff_down    = glm_ref_load_floats(dir, "ffn_down.txt",   (size_t)H * ff);
+        float *ref_gh     = glm_ref_load_floats(dir, "ffn_gate_h.txt", ff);
+        float *ref_uh     = glm_ref_load_floats(dir, "ffn_up_h.txt",   ff);
+        float *ref_act    = glm_ref_load_floats(dir, "ffn_act.txt",    ff);
+        float *ref_ff_out = glm_ref_load_floats(dir, "ffn_out.txt",    H);
+        if (!ff_gate || !ff_up || !ff_down || !ref_gh || !ref_uh || !ref_act || !ref_ff_out) {
+            fprintf(stderr, "  glm-metal: SKIP FFN (fixtures missing in %s)\n", dir);
+        } else {
+            float *cgh = malloc(sizeof(float) * ff), *mgh = malloc(sizeof(float) * ff);
+            float *cuh = malloc(sizeof(float) * ff), *muh = malloc(sizeof(float) * ff);
+            float *cact = malloc(sizeof(float) * ff), *mact = malloc(sizeof(float) * ff);
+            TEST_ASSERT(cgh && mgh && cuh && muh && cact && mact);
+
+            /* gate/up projections reuse the 4c-i matvec kernel. */
+            glm_matvec_f32(cgh, ff_gate, x, ff, H);
+            glm_matvec_f32(cuh, ff_up,   x, ff, H);
+            TEST_ASSERT(ds4_gpu_glm_matvec_f32(ff_gate, x, mgh, ff, H));
+            TEST_ASSERT(ds4_gpu_glm_matvec_f32(ff_up,   x, muh, ff, H));
+            glm_metal_cmp("FFN gate@x (matvec)", mgh, cgh, ff, tol_abs, tol_rel);
+            glm_metal_cmp("FFN up@x (matvec)",   muh, cuh, ff, tol_abs, tol_rel);
+            glm_metal_cmp("FFN gate@x vs numpy", mgh, ref_gh, ff, tol_abs, tol_rel);
+            glm_metal_cmp("FFN up@x vs numpy",   muh, ref_uh, ff, tol_abs, tol_rel);
+
+            /* SwiGLU activation gate (the new kernel) vs CPU silu*up. */
+            glm_silu_f32(cact, cgh, ff);
+            for (uint32_t i = 0; i < ff; i++) cact[i] *= cuh[i];
+            TEST_ASSERT(ds4_gpu_glm_swiglu_f32(mgh, muh, mact, ff));
+            glm_metal_cmp("FFN swiglu (silu(g)*u)", mact, cact, ff, tol_abs, tol_rel);
+            glm_metal_cmp("FFN swiglu vs numpy", mact, ref_act, ff, tol_abs, tol_rel);
+
+            /* down projection (matvec) on the Metal activation. */
+            float *cff_out = malloc(sizeof(float) * H), *mff_out = malloc(sizeof(float) * H);
+            TEST_ASSERT(cff_out && mff_out);
+            glm_matvec_f32(cff_out, ff_down, cact, H, ff);
+            TEST_ASSERT(ds4_gpu_glm_matvec_f32(ff_down, mact, mff_out, H, ff));
+            glm_metal_cmp("FFN down@act (matvec)", mff_out, cff_out, H, tol_abs, tol_rel);
+            glm_metal_cmp("FFN down@act vs numpy", mff_out, ref_ff_out, H, tol_abs, tol_rel);
+
+            /* Composite: full Metal FFN chain vs CPU glm_swiglu_dense_f32. */
+            float *cff2 = malloc(sizeof(float) * H);
+            TEST_ASSERT(cff2);
+            glm_swiglu_dense_f32(cff2, x, ff_gate, ff_up, ff_down, &shape, cgh, cuh);
+            glm_metal_cmp("FFN composite (Metal vs CPU)", mff_out, cff2, H, tol_abs, tol_rel);
+            glm_metal_cmp("FFN composite (Metal vs numpy)", mff_out, ref_ff_out, H, tol_abs, tol_rel);
+
+            free(cgh); free(mgh); free(cuh); free(muh); free(cact); free(mact);
+            free(cff_out); free(mff_out); free(cff2);
+        }
+
+        free(gate); free(bias); free(ref_logits); free(ref_w); free(ref_idx);
+        free(ff_gate); free(ff_up); free(ff_down); free(ref_gh); free(ref_uh);
+        free(ref_act); free(ref_ff_out);
+    }
+
     fprintf(stderr, "  glm-metal: %zu/%zu component+composite cases Metal==CPU\n",
             g_glm_metal_pass, g_glm_metal_total);
 

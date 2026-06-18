@@ -27033,3 +27033,106 @@ int ds4_gpu_glm_attn_decode_f32(const float * Q,
         return ok;
     }
 }
+
+/* Host-side mirror of metal/glm.metal ds4_metal_args_glm_moe (same layout). */
+typedef struct { uint32_t n_expert; uint32_t top_k; float scale; } ds4_gpu_glm_moe_args;
+
+/* Sigmoid MoE router on PRECOMPUTED logits (gate@x is the caller's job, done
+ * via ds4_gpu_glm_matvec_f32).  prob=sigmoid(logits); sel=prob+bias; stable
+ * top-K by sel (lower index wins ties); w[k]=prob[idx]/sum*scale.  out_idx /
+ * out_w are length top_k.  Mirrors ds4.c glm_moe_route_sigmoid post-logits math. */
+int ds4_gpu_glm_moe_route_f32(const float * logits, const float * bias,
+                              int * out_idx, float * out_w,
+                              uint32_t n_expert, uint32_t top_k, float scale) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_glm_moe_args args = { n_expert, top_k, scale };
+    @autoreleasepool {
+        const uint64_t lb = (uint64_t)n_expert * sizeof(float);
+        const uint64_t bb = (uint64_t)n_expert * sizeof(float);
+        const uint64_t ib = (uint64_t)top_k * sizeof(int);
+        const uint64_t wb = (uint64_t)top_k * sizeof(float);
+        ds4_gpu_tensor *tl = ds4_gpu_tensor_alloc(lb);
+        ds4_gpu_tensor *tb = ds4_gpu_tensor_alloc(bb);
+        ds4_gpu_tensor *ti = ds4_gpu_tensor_alloc(ib);
+        ds4_gpu_tensor *tw = ds4_gpu_tensor_alloc(wb);
+        if (!tl || !tb || !ti || !tw) {
+            ds4_gpu_tensor_free(tl); ds4_gpu_tensor_free(tb);
+            ds4_gpu_tensor_free(ti); ds4_gpu_tensor_free(tw);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tl, 0, logits, lb);
+        ds4_gpu_tensor_write(tb, 0, bias, bb);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline("kernel_glm_moe_route_f32");
+        int ok = 0;
+        if (pipe) {
+            [enc setComputePipelineState:pipe];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            ds4_gpu_glm_bind(enc, tl, 1);
+            ds4_gpu_glm_bind(enc, tb, 2);
+            ds4_gpu_glm_bind(enc, ti, 3);
+            ds4_gpu_glm_bind(enc, tw, 4);
+            /* Single thread: n_expert is tiny; the kernel scans E sequentially
+             * to mirror the CPU reference's accumulation/sort order exactly. */
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            ok = 1;
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm moe route");
+        if (ok) {
+            ds4_gpu_tensor_read(ti, 0, out_idx, ib);
+            ds4_gpu_tensor_read(tw, 0, out_w, wb);
+        }
+        ds4_gpu_tensor_free(tl); ds4_gpu_tensor_free(tb);
+        ds4_gpu_tensor_free(ti); ds4_gpu_tensor_free(tw);
+        return ok;
+    }
+}
+
+/* Elementwise dense/shared-expert SwiGLU: out = silu(gate_x) * up_x.
+ * The gate/up/down projections reuse ds4_gpu_glm_matvec_f32.  Mirrors
+ * ds4.c glm_silu_f32 + the activation gate of glm_swiglu_dense_f32. */
+int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
+                           float * out, uint32_t n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        const uint64_t nb = (uint64_t)n * sizeof(float);
+        ds4_gpu_tensor *tg = ds4_gpu_tensor_alloc(nb);
+        ds4_gpu_tensor *tu = ds4_gpu_tensor_alloc(nb);
+        ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(nb);
+        if (!tg || !tu || !to) {
+            ds4_gpu_tensor_free(tg); ds4_gpu_tensor_free(tu); ds4_gpu_tensor_free(to);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tg, 0, gate_x, nb);
+        ds4_gpu_tensor_write(tu, 0, up_x, nb);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline("kernel_glm_swiglu_f32");
+        int ok = 0;
+        if (pipe) {
+            [enc setComputePipelineState:pipe];
+            /* No scalar args: buffers bind at 0..2, matching the kernel. */
+            ds4_gpu_glm_bind(enc, tg, 0);
+            ds4_gpu_glm_bind(enc, tu, 1);
+            ds4_gpu_glm_bind(enc, to, 2);
+            NSUInteger ntg = 256;
+            const NSUInteger maxt = pipe.maxTotalThreadsPerThreadgroup;
+            if (maxt && ntg > maxt) ntg = maxt;
+            if (ntg == 0) ntg = 1;
+            const NSUInteger groups = ((NSUInteger)n + ntg - 1u) / ntg;
+            [enc dispatchThreadgroups:MTLSizeMake(groups ? groups : 1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(ntg, 1, 1)];
+            ok = 1;
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm swiglu");
+        if (ok) ds4_gpu_tensor_read(to, 0, out, nb);
+        ds4_gpu_tensor_free(tg); ds4_gpu_tensor_free(tu); ds4_gpu_tensor_free(to);
+        return ok;
+    }
+}
