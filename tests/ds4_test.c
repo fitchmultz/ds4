@@ -2753,6 +2753,7 @@ static void test_glm_cpu_ref_components(void) {
     memcpy(K_rope_c, K_rope_ref, sizeof(float) * (size_t)nh * seq_n * rope);
     float *mla_out = malloc(sizeof(float) * H); TEST_ASSERT(mla_out != NULL);
     glm_mla_forward_token_f32(mla_out, x, WqA, WqB, WkvA, WkB, WvB, Wo,
+                              NULL, NULL,
                               K_nope_c, V_c, K_rope_c, seq_n, t_pos, &shape, NULL);
     glm_ref_cmp("MLA composite (one token)", mla_out, ref_mla_out, H, tol_abs, tol_rel);
 
@@ -2844,6 +2845,22 @@ static void test_glm_cpu_ref_components(void) {
     free(ref_w); free(ref_idx);
     free(ff_gate); free(ff_up); free(ff_down); free(ref_gh); free(ref_uh);
     free(ref_act); free(ref_ff_out);
+}
+
+/* Phase 4a-full: tiny synthetic full CPU forward assembly self-check (no
+ * model on disk needed).  Exercises the full layer loop -- embedding, residual
+ * streams, growing KV cache, MLA decode over real-layout weights (incl. the k_b
+ * reorder), dense SwiGLU for blk.0, sigmoid MoE with on-demand expert dequant
+ * for blk.1-3, output norm, LM head -- and asserts finite non-degenerate
+ * logits + a valid argmax token id. */
+static void test_glm_cpu_forward_synth(void) {
+    int token = -1; float top = 0.0f; bool finite = false;
+    int rc = ds4_glm_cpu_forward_synth(&token, &top, &finite);
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(finite);
+    TEST_ASSERT(token >= 0);
+    fprintf(stderr, "  glm-cpu-forward-synth: PASS (token=%d top=%.6f finite=%s)\n",
+            token, (double)top, finite ? "yes" : "no");
 }
 
 /* GLM-5.2 Metal component kernels (metal/glm.metal via ds4_gpu_glm_* wrappers)
@@ -3064,6 +3081,7 @@ static void test_glm_metal_components(void) {
     memcpy(Vc2,   V_ref,      sizeof(float) * (size_t)nh * seq_n * vd);
     float *cout = malloc(sizeof(float) * H);
     glm_mla_forward_token_f32(cout, x, WqA, WqB, WkvA, WkB, WvB, Wo,
+                              NULL, NULL,
                               Kc2_n, Vc2, Kc2_r, seq_n, t_pos, &shape, NULL);
     glm_metal_cmp("MLA composite (Metal vs CPU)", mout, cout, H, tol_abs, tol_rel);
 
@@ -3244,6 +3262,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-bpe", "glm-bpe", "GLM-5.2 glm4 BPE tokenizer vs HF tokenizers oracle (shard 1)", test_glm_bpe},
     {"--glm-quant-dequant", "glm-quant-dequant", "GLM-5.2 K-quant CPU dequant vs llama.cpp oracle", test_glm_quant_dequant},
     {"--glm-cpu-ref-components", "glm-cpu-ref-components", "GLM-5.2 CPU reference components (RoPE/MLA/dense-FFN/MoE) vs numpy oracle", test_glm_cpu_ref_components},
+    {"--glm-cpu-forward-synth", "glm-cpu-forward-synth", "GLM-5.2 full CPU forward assembly on a tiny synthetic model (no model needed)", test_glm_cpu_forward_synth},
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
 };
 

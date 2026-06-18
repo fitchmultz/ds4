@@ -26948,6 +26948,8 @@ void glm_mla_forward_token_f32(float *out,
                                const float *WqA, const float *WqB,
                                const float *WkvA, const float *WkB,
                                const float *WvB, const float *Wo,
+                               const float *w_q_a_norm,
+                               const float *w_kv_a_norm,
                                float *K_nope_cache, float *V_cache,
                                float *K_rope_cache,
                                uint32_t seq_n, uint32_t t,
@@ -26982,17 +26984,22 @@ void glm_mla_forward_token_f32(float *out,
     float *ones_kvl = xmalloc(kvl * sizeof(float));
     for (uint32_t i = 0; i < ql; i++) ones_ql[i] = 1.0f;
     for (uint32_t i = 0; i < kvl; i++) ones_kvl[i] = 1.0f;
+    /* Learned RMSNorm scale weights fall back to ones for the synthetic fixture
+     * (the --glm-cpu-ref-components 21/21 path passes NULL); the real model
+     * supplies F32 attn_q_a_norm / attn_kv_a_norm here. */
+    const float *wn_qa  = w_q_a_norm  ? w_q_a_norm  : ones_ql;
+    const float *wn_kvl = w_kv_a_norm ? w_kv_a_norm : ones_kvl;
 
     /* q path: WqA @ x -> RMSNorm(ones) -> WqB @ -> [nh, qhd]. */
     glm_matvec_f32(wqa, WqA, x, ql, H);
-    glm_rmsnorm_f32(wqa_n, wqa, ones_ql, ql, shape->rms_eps);
+    glm_rmsnorm_f32(wqa_n, wqa, wn_qa, ql, shape->rms_eps);
     glm_matvec_f32(q_flat, WqB, wqa_n, nh * qhd, ql);
 
     /* kv path: WkvA @ x -> split latent/rope -> RMSNorm(latent only). */
     glm_matvec_f32(kva, WkvA, x, kvl + rope, H);
     const float *latent     = kva;
     const float *k_rope_raw = kva + kvl;
-    glm_rmsnorm_f32(kvln, latent, ones_kvl, kvl, shape->rms_eps);
+    glm_rmsnorm_f32(kvln, latent, wn_kvl, kvl, shape->rms_eps);
     glm_matvec_f32(k_nope, WkB, kvln, nh * nope, kvl);
     glm_matvec_f32(v, WvB, kvln, nh * vd, kvl);
 
@@ -27128,6 +27135,415 @@ uint32_t glm_layer_bind(const void *engine_or_model, uint32_t layer_idx,
 #undef GLM_BIND_FIXED
 #undef GLM_BIND_LAYER
     return n;
+}
+
+/* =======================================================================
+ * Phase 4a-full: full per-token CPU reference forward (Metal graph oracle).
+ *
+ * Assembles the validated Phase 4a component math + Phase 4b dequant into a
+ * runnable forward over the REAL mmap'd split GGUF, producing logits for the
+ * last prompt position.  CPU-only reference/debug (AGENT.md); never the
+ * production Metal graph.  Dequants per-layer/per-selected-expert into bounded
+ * reused scratch; never holds the whole 238 GiB model dequanted.
+ * ======================================================================= */
+
+/* The real GLM attn_k_b is stored [nope, kv_lora, n_head] with the nope axis
+ * contiguous (ne0=nope); attn_v_b is [kv_lora, v_dim, n_head] with kv_lora
+ * contiguous.  The validated MLA composite contracts over kv_lora and expects
+ * both k_b and v_b flattened as [n_head*<out>, kv_lora] row-major (kv_lora
+ * contiguous).  v_b already matches; k_b must be transposed per head.  This is
+ * a pure data rearrangement -- the validated math is unchanged. */
+static void glm_k_b_reorder(float *dst, const float *src,
+                            uint32_t nope, uint32_t kvl, uint32_t nh) {
+    for (uint32_t h = 0; h < nh; h++)
+        for (uint32_t d = 0; d < nope; d++)
+            for (uint32_t c = 0; c < kvl; c++)
+                dst[((size_t)h * nope + d) * kvl + c] =
+                    src[(size_t)h * nope * kvl + d + (size_t)nope * c];
+}
+
+/* Forward decl: glm_layer_tensor is defined further down (GLM SSD section). */
+static const ds4_tensor *glm_layer_tensor(const ds4_model *m,
+                                          uint32_t il, const char *base);
+
+/* Dequant `count` contiguous elements (a multiple of 256 for K-quants) from
+ * byte_offset within tensor t into out.  F32 tensors are copied verbatim.
+ * Returns false for an unsupported type. */
+static bool glm_dequant_count(const ds4_model *m, const ds4_tensor *t,
+                              uint64_t byte_offset, size_t count, float *out) {
+    if (!t) return false;
+    const uint8_t *base = (const uint8_t *)tensor_data(m, t) + byte_offset;
+    if (t->type == DS4_TENSOR_F32) {
+        memcpy(out, base, count * sizeof(float));
+        return true;
+    }
+    return ds4_dequant_glm_row(t->type, base, out, count);
+}
+
+static bool glm_dequant_weight(const ds4_model *m, const ds4_tensor *t,
+                               float *out) {
+    return glm_dequant_count(m, t, 0, (size_t)t->elements, out);
+}
+
+/* Core full forward.  Reuses the validated Phase 4a leaf math (rmsnorm/rope/
+ * matvec/silu) and the MLA composite (fed learned q_a/kv_a norm weights) over
+ * real dequanted weights, with a growing per-layer KV cache.  Dense SwiGLU for
+ * blk.0..n_dense-1; sigmoid MoE (top-8 + shared expert, experts dequanted on
+ * demand) for the rest. */
+static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
+                            uint32_t n_layer, uint32_t n_dense,
+                            const int *tokens, uint32_t n_tokens,
+                            float *logits) {
+    const uint32_t H = shape->hidden, nh = shape->n_head, ql = shape->q_lora;
+    const uint32_t kvl = shape->kv_lora, nope = shape->qk_nope, rope = shape->qk_rope;
+    const uint32_t vd = shape->v_dim, E = shape->n_expert, K = shape->n_expert_used;
+    const float eps = shape->rms_eps;
+
+    const ds4_tensor *t_embd = model_find_tensor(m, "token_embd.weight");
+    const ds4_tensor *t_out  = model_find_tensor(m, "output.weight");
+    const ds4_tensor *t_onorm= model_find_tensor(m, "output_norm.weight");
+    if (!t_embd || !t_out || !t_onorm) ds4_die("glm-cpu-ref: missing global tensor");
+    const uint32_t vocab = (uint32_t)t_out->dim[1];
+    const uint64_t embd_row_bytes = t_embd->bytes / t_embd->dim[1];
+    const uint64_t out_row_bytes  = t_out->bytes  / t_out->dim[1];
+
+    /* MLA weight scratch (dequanted per layer, reused across layers). */
+    float *WqA = xmalloc((size_t)ql * H * sizeof(float));
+    float *WqB = xmalloc((size_t)nh * (nope + rope) * ql * sizeof(float));
+    float *WkvA= xmalloc((size_t)(kvl + rope) * H * sizeof(float));
+    float *WkBn= xmalloc((size_t)nh * nope * kvl * sizeof(float));   /* native k_b  */
+    float *WkB = xmalloc((size_t)nh * nope * kvl * sizeof(float));   /* reordered   */
+    float *WvB = xmalloc((size_t)nh * vd * kvl * sizeof(float));
+    float *Wo  = xmalloc((size_t)H * nh * vd * sizeof(float));
+    /* FFN scratch sized for the dense intermediate (>= expert intermediate). */
+    const uint32_t max_inter = shape->ff_inter;
+    float *fgate = xmalloc((size_t)max_inter * H * sizeof(float));
+    float *fup   = xmalloc((size_t)max_inter * H * sizeof(float));
+    float *fdown = xmalloc((size_t)H * max_inter * sizeof(float));
+    float *sg = xmalloc((size_t)max_inter * sizeof(float));
+    float *su = xmalloc((size_t)max_inter * sizeof(float));
+    float *x = xmalloc((size_t)H * sizeof(float));
+    float *xn= xmalloc((size_t)H * sizeof(float));
+    float *res = xmalloc((size_t)H * sizeof(float));
+    float *mla_out = xmalloc((size_t)H * sizeof(float));
+    float *ffn_out = xmalloc((size_t)H * sizeof(float));
+    float *etmp = xmalloc((size_t)H * sizeof(float));
+    float *router_scratch = xmalloc((size_t)E * sizeof(float));
+    int *idx = xmalloc((size_t)K * sizeof(int));
+    float *w = xmalloc((size_t)K * sizeof(float));
+    float *logits_row = xmalloc((size_t)H * sizeof(float));
+
+    /* Per-layer KV caches: [n_head, seq_n, dim] row-major, one set per layer. */
+    const size_t k_nope_bytes = (size_t)nh * n_tokens * nope * sizeof(float);
+    const size_t v_bytes      = (size_t)nh * n_tokens * vd * sizeof(float);
+    const size_t k_rope_bytes = (size_t)nh * n_tokens * rope * sizeof(float);
+    float **Knope = xmalloc((size_t)n_layer * sizeof(float *));
+    float **Vc    = xmalloc((size_t)n_layer * sizeof(float *));
+    float **Krop  = xmalloc((size_t)n_layer * sizeof(float *));
+    for (uint32_t l = 0; l < n_layer; l++) {
+        Knope[l] = xmalloc(k_nope_bytes);
+        Vc[l]    = xmalloc(v_bytes);
+        Krop[l]  = xmalloc(k_rope_bytes);
+    }
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        /* Embedding lookup: dequant the single token's hidden row. */
+        if (!glm_dequant_count(m, t_embd, (uint64_t)tokens[t] * embd_row_bytes,
+                               H, x))
+            ds4_die("glm-cpu-ref: token embedding dequant failed");
+        const uint32_t prog_every = n_layer > 8 ? n_layer / 8 : 0;
+
+        for (uint32_t il = 0; il < n_layer; il++) {
+            /* ---- attention block ---- */
+            memcpy(res, x, (size_t)H * sizeof(float));
+            const ds4_tensor *anorm_t = glm_layer_tensor(m, il, "attn_norm");
+            glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, anorm_t), H, eps);
+            const ds4_tensor *q_a  = glm_layer_tensor(m, il, "attn_q_a");
+            const ds4_tensor *q_b  = glm_layer_tensor(m, il, "attn_q_b");
+            const ds4_tensor *kv_a = glm_layer_tensor(m, il, "attn_kv_a_mqa");
+            const ds4_tensor *k_b  = glm_layer_tensor(m, il, "attn_k_b");
+            const ds4_tensor *v_b  = glm_layer_tensor(m, il, "attn_v_b");
+            const ds4_tensor *wop  = glm_layer_tensor(m, il, "attn_output");
+            if (!q_a || !q_b || !kv_a || !k_b || !v_b || !wop)
+                ds4_die("glm-cpu-ref: missing attention tensor");
+            glm_dequant_weight(m, q_a, WqA);
+            glm_dequant_weight(m, q_b, WqB);
+            glm_dequant_weight(m, kv_a, WkvA);
+            glm_dequant_weight(m, k_b, WkBn);
+            glm_k_b_reorder(WkB, WkBn, nope, kvl, nh);   /* real k_b is nope-contiguous */
+            glm_dequant_weight(m, v_b, WvB);
+            glm_dequant_weight(m, wop, Wo);
+            const float *qa_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_q_a_norm"));
+            const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
+            glm_mla_forward_token_f32(mla_out, xn, WqA, WqB, WkvA, WkB, WvB, Wo,
+                                      qa_norm, kv_norm,
+                                      Knope[il], Vc[il], Krop[il],
+                                      n_tokens, t, shape, NULL);
+            for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
+
+            /* ---- FFN block ---- */
+            memcpy(res, x, (size_t)H * sizeof(float));
+            const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
+            glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, fnorm_t), H, eps);
+            if (il < n_dense) {
+                /* Dense SwiGLU FFN (blk.0..n_dense-1). */
+                const ds4_tensor *g = glm_layer_tensor(m, il, "ffn_gate");
+                const ds4_tensor *u = glm_layer_tensor(m, il, "ffn_up");
+                const ds4_tensor *d = glm_layer_tensor(m, il, "ffn_down");
+                if (!g || !u || !d) ds4_die("glm-cpu-ref: missing dense FFN tensor");
+                glm_dequant_weight(m, g, fgate);
+                glm_dequant_weight(m, u, fup);
+                glm_dequant_weight(m, d, fdown);
+                glm_swiglu_dense_f32(ffn_out, xn, fgate, fup, fdown, shape, sg, su);
+            } else {
+                /* Sigmoid MoE: route -> top-K -> dequant selected experts on
+                 * demand -> weighted sum + shared expert (weight 1.0). */
+                const ds4_tensor *ge  = glm_layer_tensor(m, il, "ffn_gate_exps");
+                const ds4_tensor *ue  = glm_layer_tensor(m, il, "ffn_up_exps");
+                const ds4_tensor *de  = glm_layer_tensor(m, il, "ffn_down_exps");
+                const ds4_tensor *ginp= glm_layer_tensor(m, il, "ffn_gate_inp");
+                const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
+                const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
+                const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
+                char bias_name[64];
+                snprintf(bias_name, sizeof(bias_name), "blk.%u.exp_probs_b.bias", il);
+                const ds4_tensor *bias_t = model_find_tensor(m, bias_name);
+                if (!ge || !ue || !de || !ginp || !gsh || !ush || !dsh || !bias_t)
+                    ds4_die("glm-cpu-ref: missing MoE tensor");
+                const uint32_t ei = (uint32_t)ge->dim[1];             /* expert inter (2048) */
+                const uint64_t pe_gate = ge->bytes / ge->dim[2];
+                const uint64_t pe_up   = ue->bytes / ue->dim[2];
+                const uint64_t pe_down = de->bytes / de->dim[2];
+                glm_cpu_shape eshape = *shape; eshape.ff_inter = ei;   /* SwiGLU over expert inter */
+                glm_moe_route_sigmoid(idx, w, (const float *)tensor_data(m, ginp),
+                                      xn, (const float *)tensor_data(m, bias_t),
+                                      shape, router_scratch);
+                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] = 0.0f;
+                for (uint32_t k = 0; k < K; k++) {
+                    const uint32_t e = (uint32_t)idx[k];
+                    glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, fgate);
+                    glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, fup);
+                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, fdown);
+                    glm_swiglu_dense_f32(etmp, xn, fgate, fup, fdown, &eshape, sg, su);
+                    const float wk = w[k];
+                    for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
+                }
+                /* shared expert added directly (weight 1.0, DeepSeek/GLM convention) */
+                glm_dequant_weight(m, gsh, fgate);
+                glm_dequant_weight(m, ush, fup);
+                glm_dequant_weight(m, dsh, fdown);
+                glm_swiglu_dense_f32(etmp, xn, fgate, fup, fdown, &eshape, sg, su);
+                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
+            }
+            for (uint32_t d = 0; d < H; d++) x[d] = res[d] + ffn_out[d];
+            if (prog_every && (il + 1) % prog_every == 0)
+                fprintf(stderr, "ds4: glm-cpu-ref: token %u/%u layer %u/%u\r",
+                        t + 1, n_tokens, il + 1, n_layer);
+        }
+
+        /* After the final prompt position: output norm + LM head -> logits. */
+        if (t == n_tokens - 1) {
+            glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, t_onorm), H, eps);
+            for (uint32_t v = 0; v < vocab; v++) {
+                if (!glm_dequant_count(m, t_out, (uint64_t)v * out_row_bytes, H, logits_row))
+                    ds4_die("glm-cpu-ref: output head dequant failed");
+                float s = 0.0f;
+                for (uint32_t d = 0; d < H; d++) s += logits_row[d] * xn[d];
+                logits[v] = s;
+            }
+        }
+    }
+
+    for (uint32_t l = 0; l < n_layer; l++) { free(Knope[l]); free(Vc[l]); free(Krop[l]); }
+    free(Knope); free(Vc); free(Krop);
+    free(WqA); free(WqB); free(WkvA); free(WkBn); free(WkB); free(WvB); free(Wo);
+    free(fgate); free(fup); free(fdown); free(sg); free(su);
+    free(x); free(xn); free(res); free(mla_out); free(ffn_out); free(etmp);
+    free(router_scratch); free(idx); free(w); free(logits_row);
+}
+
+void ds4_glm_cpu_forward_UNUSED(void) {}  /* placeholder removed below */
+
+/* CLI driver: tokenize the prompt with the loaded GLM vocab, run the full CPU
+ * reference forward over all backbone layers, and report the greedy token id +
+ * top logit + finiteness.  Slow (reference path; mmap-faults the 238 GiB split
+ * on first access). */
+int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict) {
+    (void)n_predict;
+    const ds4_model *m = &e->model;
+    const glm_cpu_shape shape = glm_cpu_shape_real();
+
+    uint32_t block_count = 0, nextn = 1, n_dense = 0;
+    model_get_u32(m, "glm-dsa.block_count", &block_count);
+    model_get_u32(m, "glm-dsa.nextn_predict_layers", &nextn);
+    model_get_u32(m, "glm-dsa.leading_dense_block_count", &n_dense);
+    const uint32_t n_layer = block_count >= nextn ? block_count - nextn : block_count;
+    if (n_layer == 0 || n_layer > 256) {
+        fprintf(stderr, "ds4: glm-cpu-ref: bad backbone layer count %u\n", n_layer);
+        return 1;
+    }
+
+    /* Tokenize the raw prompt (no chat template) for a clean forward oracle. */
+    ds4_tokens toks = {0};
+    ds4_tokenize_text(e, prompt ? prompt : "", &toks);
+    if (toks.len <= 0) {
+        fprintf(stderr, "ds4: glm-cpu-ref: prompt tokenized to 0 tokens\n");
+        free(toks.v);
+        return 1;
+    }
+
+    const ds4_tensor *t_out = model_find_tensor(m, "output.weight");
+    const uint32_t vocab = (uint32_t)t_out->dim[1];
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
+
+    const double t0 = now_sec();
+    fprintf(stderr, "ds4: glm-cpu-ref: %u tokens, %u backbone layers (%u dense + %u MoE), vocab %u\n",
+            toks.len, n_layer, n_dense, n_layer - n_dense, vocab);
+    glm_cpu_forward(m, &shape, n_layer, n_dense, toks.v, (uint32_t)toks.len, logits);
+    fprintf(stderr, "ds4: glm-cpu-ref: forward done in %.2fs\n", now_sec() - t0);
+
+    /* Greedy argmax + finiteness over logits. */
+    int argmax = 0;
+    float top = logits[0];
+    bool finite = isfinite(logits[0]);
+    for (uint32_t v = 1; v < vocab; v++) {
+        if (!isfinite(logits[v])) finite = false;
+        if (logits[v] > top) { top = logits[v]; argmax = (int)v; }
+    }
+    printf("glm-cpu-ref: token=%d top_logit=%.6f logits_finite=%s vocab=%u prompt_tokens=%u\n",
+           argmax, (double)top, finite ? "yes" : "no", vocab, toks.len);
+
+    free(logits);
+    free(toks.v);
+    return finite ? 0 : 1;
+}
+
+/* Tiny synthetic self-check of the full layer-loop assembly (no model on
+ * disk needed): builds a few tiny F32 layers in memory and runs the SAME
+ * glm_cpu_forward, also pinning the real-tensor k_b layout reorder.  This
+ * proves the assembly (residual streams, KV cache growth, MLA decode, dense vs
+ * MoE dispatch, on-demand expert dequant, LM head) is runnable and produces
+ * finite non-degenerate logits without the 238 GiB split. */
+int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit, bool *out_finite) {
+    /* k_b reorder micro-check: pre-scatter a sequential identity, reorder, and
+     * expect 0..N-1 in the component's [nh*nope, kvl] layout. */
+    {
+        const uint32_t nope = 3, kvl = 6, nh = 4;
+        const size_t n = (size_t)nope * kvl * nh;
+        float *native = xmalloc(n * sizeof(float));
+        float *reord  = xmalloc(n * sizeof(float));
+        for (uint32_t h = 0; h < nh; h++)
+            for (uint32_t d = 0; d < nope; d++)
+                for (uint32_t c = 0; c < kvl; c++)
+                    native[(size_t)h * nope * kvl + d + (size_t)nope * c] =
+                        (float)(((h * nope + d) * kvl) + (int)c);
+        glm_k_b_reorder(reord, native, nope, kvl, nh);
+        bool ok = true;
+        for (size_t i = 0; i < n; i++) if (reord[i] != (float)i) ok = false;
+        fprintf(stderr, "  glm-cpu-forward-synth: k_b reorder %s\n", ok ? "PASS" : "FAIL");
+        free(native); free(reord);
+        if (!ok) return 1;
+    }
+
+    /* Tiny config: 4 layers (1 dense + 3 MoE), all F32 random.  Same STRUCTURE
+     * as the real model so every code path (dense FFN, sigmoid MoE with on-
+     * demand expert dequant, MLA with learned norms + k_b reorder) is exercised. */
+    const uint32_t H = 16, nh = 4, ql = 8, kvl = 6, nope = 3, rope = 2, vd = 4;
+    const uint32_t dense_inter = 8, expert_inter = 8, n_expert = 8, vocab = 32;
+    const uint32_t n_layer = 4, n_dense = 1;
+    glm_cpu_shape shape = {0};
+    shape.hidden = H; shape.n_head = nh; shape.q_lora = ql; shape.kv_lora = kvl;
+    shape.qk_nope = nope; shape.qk_rope = rope; shape.v_dim = vd;
+    shape.ff_inter = dense_inter; shape.n_expert = n_expert; shape.n_expert_used = 2;
+    shape.rms_eps = 1e-5f; shape.rope_base = 8e6f; shape.moe_scale = 2.5f;
+
+    ds4_model m; memset(&m, 0, sizeof(m));
+    m.part_count = 1;
+    m.parts = xcalloc(1, sizeof(ds4_model_part));
+    m.parts[0].fd = -1;
+    /* Worst-case buffer: sum of all tiny tensor bytes; generous upper bound. */
+    size_t buf_cap = (size_t)64 * 1024 * 1024;
+    uint8_t *buf = xmalloc(buf_cap);
+    m.parts[0].map = buf;
+    m.n_tensors = 0;
+    m.tensors = xcalloc(512, sizeof(ds4_tensor));
+    char **names = xmalloc(512 * sizeof(char *));
+    size_t n_names = 0;
+    size_t used = 0;
+    unsigned seed = 12345u;
+
+#define SYNTH_ADD(name_, ...) do { \
+        const uint64_t dims_[] = { __VA_ARGS__ }; \
+        const uint32_t nd_ = (uint32_t)(sizeof(dims_) / sizeof(dims_[0])); \
+        size_t n_ = 1; for (uint32_t i_ = 0; i_ < nd_; i_++) n_ *= dims_[i_]; \
+        ds4_tensor *t_ = &m.tensors[m.n_tensors++]; \
+        t_->ndim = nd_; for (uint32_t i_ = 0; i_ < nd_; i_++) { t_->dim[i_] = dims_[i_]; } \
+        t_->type = DS4_TENSOR_F32; t_->elements = n_; t_->bytes = n_ * sizeof(float); \
+        t_->part = 0; t_->abs_offset = used; t_->rel_offset = used; \
+        names[n_names++] = ds4_strdup(name_); \
+        t_->name.ptr = names[n_names - 1]; t_->name.len = strlen(names[n_names - 1]); \
+        float *dst_ = (float *)(buf + used); used += n_ * sizeof(float); \
+        for (size_t i_ = 0; i_ < n_; i_++) { \
+            seed = seed * 1103515245u + 12345u; \
+            dst_[i_] = ((float)(seed >> 8) / (float)0x1000000 - 0.5f) * 0.2f; \
+        } \
+    } while (0)
+
+    SYNTH_ADD("token_embd.weight", H, vocab);
+    SYNTH_ADD("output_norm.weight", H);
+    SYNTH_ADD("output.weight", H, vocab);
+    for (uint32_t il = 0; il < n_layer; il++) {
+        char nm[96];
+        snprintf(nm, sizeof(nm), "blk.%u.attn_norm.weight", il);        SYNTH_ADD(nm, H);
+        snprintf(nm, sizeof(nm), "blk.%u.attn_q_a.weight", il);         SYNTH_ADD(nm, H, ql);
+        snprintf(nm, sizeof(nm), "blk.%u.attn_q_a_norm.weight", il);    SYNTH_ADD(nm, ql);
+        snprintf(nm, sizeof(nm), "blk.%u.attn_q_b.weight", il);         SYNTH_ADD(nm, ql, nh * (nope + rope));
+        snprintf(nm, sizeof(nm), "blk.%u.attn_kv_a_mqa.weight", il);    SYNTH_ADD(nm, H, kvl + rope);
+        snprintf(nm, sizeof(nm), "blk.%u.attn_kv_a_norm.weight", il);   SYNTH_ADD(nm, kvl);
+        snprintf(nm, sizeof(nm), "blk.%u.attn_k_b.weight", il);         SYNTH_ADD(nm, nope, kvl, nh);
+        snprintf(nm, sizeof(nm), "blk.%u.attn_v_b.weight", il);         SYNTH_ADD(nm, kvl, vd, nh);
+        snprintf(nm, sizeof(nm), "blk.%u.attn_output.weight", il);      SYNTH_ADD(nm, nh * vd, H);
+        snprintf(nm, sizeof(nm), "blk.%u.ffn_norm.weight", il);         SYNTH_ADD(nm, H);
+        if (il < n_dense) {
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_gate.weight", il);     SYNTH_ADD(nm, H, dense_inter);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_up.weight", il);       SYNTH_ADD(nm, H, dense_inter);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_down.weight", il);     SYNTH_ADD(nm, dense_inter, H);
+        } else {
+            snprintf(nm, sizeof(nm), "blk.%u.exp_probs_b.bias", il);    SYNTH_ADD(nm, n_expert);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_gate_inp.weight", il); SYNTH_ADD(nm, H, n_expert);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_gate_exps.weight", il);SYNTH_ADD(nm, H, expert_inter, n_expert);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_up_exps.weight", il);  SYNTH_ADD(nm, H, expert_inter, n_expert);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_down_exps.weight", il);SYNTH_ADD(nm, expert_inter, H, n_expert);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_gate_shexp.weight", il);SYNTH_ADD(nm, H, expert_inter);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_up_shexp.weight", il); SYNTH_ADD(nm, H, expert_inter);
+            snprintf(nm, sizeof(nm), "blk.%u.ffn_down_shexp.weight", il);SYNTH_ADD(nm, expert_inter, H);
+        }
+    }
+#undef SYNTH_ADD
+
+    int tokens[3] = { 1, 5, 9 };
+    const uint32_t n_tokens = 3;
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
+    glm_cpu_forward(&m, &shape, n_layer, n_dense, tokens, n_tokens, logits);
+
+    int argmax = 0; float top = logits[0]; bool finite = isfinite(logits[0]);
+    for (uint32_t v = 1; v < vocab; v++) {
+        if (!isfinite(logits[v])) finite = false;
+        if (logits[v] > top) { top = logits[v]; argmax = (int)v; }
+    }
+    if (out_token) *out_token = argmax;
+    if (out_top_logit) *out_top_logit = top;
+    if (out_finite) *out_finite = finite;
+    fprintf(stderr, "  glm-cpu-forward-synth: token=%d top_logit=%.6f finite=%s (layers=%u dense=%u MoE=%u)\n",
+            argmax, (double)top, finite ? "yes" : "no", n_layer, n_dense, n_layer - n_dense);
+
+    free(logits);
+    for (size_t i = 0; i < n_names; i++) free(names[i]);
+    free(names);
+    free(m.tensors);
+    free(m.parts);
+    free(buf);
+    return finite ? 0 : 1;
 }
 
 static void glm_expect_u32(const ds4_model *m, const char *key, uint32_t expected) {
@@ -27830,25 +28246,31 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     /* GLM-5.2 (glm-dsa) is fully separated from the DeepSeek path below: it
      * never reads deepseek4.* keys, never calls config_validate_model /
      * weights_bind / the graph backends.  Phase 1 supports metadata + tensor
-     * inventory inspection only. */
+     * inventory inspection only; Phase 4a-full adds the CPU reference forward
+     * (--glm-cpu-ref), which is CPU-only and must not require Metal. */
     if (e->model.arch == DS4_ARCH_GLM_DSA) {
-        if (e->backend != DS4_BACKEND_METAL) {
+        const bool cpu_ref = opt->glm_cpu_ref;
+        if (e->backend != DS4_BACKEND_METAL && !cpu_ref) {
             fprintf(stderr, "ds4: glm-dsa is not supported on this backend yet\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
         glm_validate_metadata(&e->model);
-        glm_open_split(&e->model, opt->model_path, graph_backend);
+        /* CPU reference reads weights via MAP_PRIVATE; Metal inspect maps
+         * MAP_SHARED for the accelerator. */
+        glm_open_split(&e->model, opt->model_path, graph_backend && !cpu_ref);
         glm_inventory_check(&e->model);
-        if (!opt->inspect_only) {
+        if (!opt->inspect_only && !cpu_ref) {
             fprintf(stderr,
-                "ds4: glm-dsa inference is not implemented yet (Phase 4); "
-                "use --inspect for metadata-only inspection.\n");
+                "ds4: glm-dsa Metal inference is not implemented yet (Phase 4); "
+                "use --inspect for metadata-only inspection or --glm-cpu-ref "
+                "for the CPU reference forward.\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+        if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
         *out = e;
         return 0;
     }

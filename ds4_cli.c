@@ -57,6 +57,7 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    bool glm_cpu_ref;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -1605,6 +1606,13 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+        } else if (!strcmp(arg, "--glm-cpu-ref")) {
+            /* Phase 4a-full: GLM CPU reference forward (one token) over the real
+             * mmap'd split GGUF.  CPU-only oracle; forces the CPU backend and
+             * bypasses the Metal-inference-not-implemented gate. */
+            c.glm_cpu_ref = true;
+            c.engine.glm_cpu_ref = true;
+            c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -1691,7 +1699,9 @@ int main(int argc, char **argv) {
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;
-    if (cfg.inspect) {
+    if (cfg.glm_cpu_ref) {
+        rc = ds4_engine_glm_cpu_ref(engine, cfg.gen.prompt, cfg.gen.n_predict);
+    } else if (cfg.inspect) {
         ds4_engine_summary(engine);
     } else if (cfg.gen.imatrix_output_path) {
         rc = ds4_engine_collect_imatrix(engine,

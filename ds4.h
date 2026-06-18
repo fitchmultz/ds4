@@ -117,6 +117,7 @@ typedef struct {
     uint32_t load_layer_start;
     uint32_t load_layer_end;
     bool load_output;
+    bool glm_cpu_ref;            /* Phase 4a-full: GLM CPU reference forward */
     ds4_distributed_options distributed;
 } ds4_engine_options;
 
@@ -278,12 +279,19 @@ void glm_swiglu_dense_f32(float *out, const float *x,
  *   causal mask n<=t, softmax, sum V -> attn_out[h,:] (shape.v_dim per head)
  * K/V/R rope caches are [n_head, seq_n, <dim>] row-major; the current position
  * t row is overwritten by the freshly projected k/v before scoring.
- * out is the post-attention residual contribution: Wo @ attn_out.flatten(). */
+ * out is the post-attention residual contribution: Wo @ attn_out.flatten().
+ *
+ * w_q_a_norm / w_kv_a_norm are the learned RMSNorm scale weights for the q_a
+ * and kv_a latents ([q_lora] / [kv_lora]); pass NULL to use ones, which is the
+ * synthetic-fixture behavior pinned by --glm-cpu-ref-components (21/21).  The
+ * real model supplies learned F32 weights here (Phase 4a-full). */
 void glm_mla_forward_token_f32(float *out,
                                const float *x,
                                const float *WqA, const float *WqB,
                                const float *WkvA, const float *WkB,
                                const float *WvB, const float *Wo,
+                               const float *w_q_a_norm,
+                               const float *w_kv_a_norm,
                                float *K_nope_cache, float *V_cache,
                                float *K_rope_cache,
                                uint32_t seq_n, uint32_t t,
@@ -341,6 +349,28 @@ typedef struct {
  * materializing F32 from quant tensors uses ds4_dequant_glm_row. */
 uint32_t glm_layer_bind(const void *engine_or_model, uint32_t layer_idx,
                         glm_layer_weights *out);
+
+/* === Phase 4a-full: full per-token CPU reference forward (oracle) =======
+ *
+ * Assembles the validated Phase 4a component math + Phase 4b dequant into a
+ * runnable forward over the REAL mmap'd split GGUF (via ds4_engine_glm_cpu_ref)
+ * or a tiny in-memory model (ds4_glm_cpu_forward_synth).  CPU-only reference/
+ * debug (AGENT.md); never the production Metal graph.  The core glm_cpu_forward
+ * is file-local; these are the public entry points. */
+
+/* Tiny synthetic self-check of the full layer-loop assembly (no model needed):
+ * builds a few tiny F32 layers in memory and runs the full forward, also
+ * pinning the real-tensor k_b layout reorder.  Sets *out_token (argmax),
+ * *out_top_logit, *out_finite.  Returns 0 on success.  Used by the
+ * --glm-cpu-forward-synth test so the assembly is provably runnable without
+ * the 238 GiB split. */
+int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit,
+                              bool *out_finite);
+
+/* CLI driver: tokenize `prompt` with the loaded GLM vocab, run the full CPU
+ * reference forward, and print the greedy token id + top logit + finiteness.
+ * Returns 0 on success.  Slow (reference path). */
+int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict);
 int ds4_tokenize_model_text(const char *model_path, const char *text, int *out, int max_out);
 int ds4_render_chat_prompt(const char *model_path, const char *system,
                            const char *prompt, ds4_think_mode think_mode,
