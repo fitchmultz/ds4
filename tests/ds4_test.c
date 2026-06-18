@@ -2846,6 +2846,245 @@ static void test_glm_cpu_ref_components(void) {
     free(ref_act); free(ref_ff_out);
 }
 
+/* GLM-5.2 Metal component kernels (metal/glm.metal via ds4_gpu_glm_* wrappers)
+ * validated against the Phase 4a CPU reference on the SAME synthetic fixtures.
+ * Each component runs the CPU oracle and the Metal kernel on identical inputs;
+ * the full MLA chain is then run end-to-end on Metal and compared to the CPU
+ * composite (glm_mla_forward_token_f32) and the numpy mla_out fixture.
+ * Skips gracefully when built without GPU/Metal or when no Metal device is
+ * present.  Tolerance: 1e-4 abs / 1e-5 rel (Metal is F32 -> expect ~1e-6). */
+static size_t g_glm_metal_total, g_glm_metal_pass;
+static void glm_metal_cmp(const char *label, const float *metal, const float *cpu,
+                          size_t n, float tol_abs, float tol_rel) {
+    float ma = 0.0f, mr = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        float d = fabsf(metal[i] - cpu[i]);
+        if (d > ma) ma = d;
+        if (fabsf(cpu[i]) > 1e-9f) {
+            float r = d / fabsf(cpu[i]);
+            if (r > mr) mr = r;
+        }
+    }
+    bool ok = (ma < tol_abs) || (mr < tol_rel);
+    fprintf(stderr, "  glm-metal: %-30s %s (n=%zu maxabs=%.3g maxrel=%.3g)\n",
+            label, ok ? "PASS" : "FAIL", n, (double)ma, (double)mr);
+    g_glm_metal_total++;
+    if (ok) g_glm_metal_pass++;
+    TEST_ASSERT(ok);
+}
+
+/* CPU reference attention block in isolation (mirrors the per-head loop in
+ * glm_mla_forward_token_f32).  Used to validate the Metal decode-attention
+ * kernel on a pre-assembled Q whose rope slice is already rotated and caches
+ * that already hold the current token at position t. */
+static void glm_cpu_attn_decode(const float *Q,
+                                const float *K_nope_cache,
+                                const float *K_rope_cache,
+                                const float *V_cache, float *attn_out,
+                                uint32_t nh, uint32_t nope, uint32_t rope,
+                                uint32_t vd, uint32_t qhd,
+                                uint32_t seq_n, uint32_t t) {
+    const float kq_scale = 1.0f / sqrtf((float)qhd);
+    float *scores = malloc(sizeof(float) * (size_t)(t + 1));
+    TEST_ASSERT(scores != NULL);
+    for (uint32_t h = 0; h < nh; h++) {
+        const float *qn = Q + (size_t)h * qhd;
+        const float *qr = qn + nope;
+        float maxs = -1e30f;
+        for (uint32_t n = 0; n <= t; n++) {
+            const float *kn = K_nope_cache + ((size_t)h * seq_n + n) * nope;
+            const float *kr = K_rope_cache + ((size_t)h * seq_n + n) * rope;
+            float s = 0.0f;
+            for (uint32_t d = 0; d < nope; d++) s += qn[d] * kn[d];
+            for (uint32_t d = 0; d < rope; d++) s += qr[d] * kr[d];
+            s *= kq_scale;
+            scores[n] = s;
+            if (s > maxs) maxs = s;
+        }
+        float denom = 0.0f;
+        for (uint32_t n = 0; n <= t; n++) {
+            scores[n] = expf(scores[n] - maxs);
+            denom += scores[n];
+        }
+        float *oh = attn_out + (size_t)h * vd;
+        for (uint32_t d = 0; d < vd; d++) oh[d] = 0.0f;
+        for (uint32_t n = 0; n <= t; n++) {
+            const float wt = scores[n] / denom;
+            const float *vn = V_cache + ((size_t)h * seq_n + n) * vd;
+            for (uint32_t d = 0; d < vd; d++) oh[d] += wt * vn[d];
+        }
+    }
+    free(scores);
+}
+
+static void test_glm_metal_components(void) {
+#ifdef DS4_NO_GPU
+    fprintf(stderr, "  glm-metal: SKIP (built without GPU/Metal)\n");
+    return;
+#else
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "  glm-metal: SKIP (no Metal device)\n");
+        return;
+    }
+    const char *dir = getenv("DS4_TEST_GLM52_REF_DIR");
+    if (!dir || !dir[0]) dir = "tests/test-vectors/glm52-ref";
+
+    const glm_cpu_shape shape = glm_cpu_shape_fixture();
+    const uint32_t H = shape.hidden, nh = shape.n_head, ql = shape.q_lora, kvl = shape.kv_lora;
+    const uint32_t nope = shape.qk_nope, rope = shape.qk_rope, vd = shape.v_dim;
+    const uint32_t qhd = nope + rope;
+    const uint32_t seq_n = 4, t_pos = 3;
+    const float tol_abs = 1e-4f, tol_rel = 1e-5f;
+    g_glm_metal_total = g_glm_metal_pass = 0;
+
+    /* inputs (same fixtures the CPU oracle consumes) */
+    float *x    = glm_ref_load_floats(dir, "mla_x.txt", H);
+    float *WqA  = glm_ref_load_floats(dir, "mla_WqA.txt", (size_t)ql * H);
+    float *WqB  = glm_ref_load_floats(dir, "mla_WqB.txt", (size_t)nh * qhd * ql);
+    float *WkvA = glm_ref_load_floats(dir, "mla_WkvA.txt", (size_t)(kvl + rope) * H);
+    float *WkB  = glm_ref_load_floats(dir, "mla_WkB.txt", (size_t)nh * nope * kvl);
+    float *WvB  = glm_ref_load_floats(dir, "mla_WvB.txt", (size_t)nh * vd * kvl);
+    float *Wo   = glm_ref_load_floats(dir, "mla_Wo.txt", (size_t)H * (nh * vd));
+    float *K_nope_ref = glm_ref_load_floats(dir, "mla_K_nope_cache.txt", (size_t)nh * seq_n * nope);
+    float *V_ref      = glm_ref_load_floats(dir, "mla_V_cache.txt",     (size_t)nh * seq_n * vd);
+    float *K_rope_ref = glm_ref_load_floats(dir, "mla_K_rope_cache.txt", (size_t)nh * seq_n * rope);
+    if (!x || !WqA || !WqB || !WkvA || !WkB || !WvB || !Wo ||
+        !K_nope_ref || !V_ref || !K_rope_ref) {
+        fprintf(stderr, "  glm-metal: SKIP (fixtures missing in %s; run dump_fixtures.py)\n", dir);
+        return;
+    }
+
+    float *ones = malloc(sizeof(float) * (ql > kvl ? ql : kvl));
+    for (uint32_t i = 0; i < (ql > kvl ? ql : kvl); i++) ones[i] = 1.0f;
+
+    /* ---- component 1: matvec q_a + RMSNorm (Metal vs live CPU ref) ---- */
+    float *cqa = malloc(sizeof(float) * ql), *mqa = malloc(sizeof(float) * ql);
+    glm_matvec_f32(cqa, WqA, x, ql, H);
+    TEST_ASSERT(ds4_gpu_glm_matvec_f32(WqA, x, mqa, ql, H));
+    glm_metal_cmp("matvec q_a (WqA@x)", mqa, cqa, ql, tol_abs, tol_rel);
+    float *cqa_n = malloc(sizeof(float) * ql), *mqa_n = malloc(sizeof(float) * ql);
+    glm_rmsnorm_f32(cqa_n, cqa, ones, ql, shape.rms_eps);
+    TEST_ASSERT(ds4_gpu_glm_rmsnorm_f32(cqa, ones, mqa_n, ql, shape.rms_eps));
+    glm_metal_cmp("rmsnorm q_a (ones)", mqa_n, cqa_n, ql, tol_abs, tol_rel);
+
+    /* ---- component 2: matvec q_b ---- */
+    float *cq = malloc(sizeof(float) * (size_t)nh * qhd), *mq = malloc(sizeof(float) * (size_t)nh * qhd);
+    glm_matvec_f32(cq, WqB, cqa_n, nh * qhd, ql);
+    TEST_ASSERT(ds4_gpu_glm_matvec_f32(WqB, cqa_n, mq, nh * qhd, ql));
+    glm_metal_cmp("matvec q_b (WqB@qa_n)", mq, cq, (size_t)nh * qhd, tol_abs, tol_rel);
+
+    /* ---- component 3: matvec kv_a + latent-only RMSNorm ---- */
+    float *ckva = malloc(sizeof(float) * (kvl + rope)), *mkva = malloc(sizeof(float) * (kvl + rope));
+    glm_matvec_f32(ckva, WkvA, x, kvl + rope, H);
+    TEST_ASSERT(ds4_gpu_glm_matvec_f32(WkvA, x, mkva, kvl + rope, H));
+    glm_metal_cmp("matvec kv_a (WkvA@x)", mkva, ckva, kvl + rope, tol_abs, tol_rel);
+    float *ckvln = malloc(sizeof(float) * kvl), *mkvln = malloc(sizeof(float) * kvl);
+    glm_rmsnorm_f32(ckvln, ckva, ones, kvl, shape.rms_eps);
+    TEST_ASSERT(ds4_gpu_glm_rmsnorm_f32(ckva, ones, mkvln, kvl, shape.rms_eps));
+    glm_metal_cmp("rmsnorm latent-only", mkvln, ckvln, kvl, tol_abs, tol_rel);
+
+    /* ---- component 4: k_b / v_b projections ---- */
+    float *ck = malloc(sizeof(float) * (size_t)nh * nope), *mk = malloc(sizeof(float) * (size_t)nh * nope);
+    float *cv = malloc(sizeof(float) * (size_t)nh * vd),   *mv = malloc(sizeof(float) * (size_t)nh * vd);
+    glm_matvec_f32(ck, WkB, ckvln, nh * nope, kvl);
+    glm_matvec_f32(cv, WvB, ckvln, nh * vd,   kvl);
+    TEST_ASSERT(ds4_gpu_glm_matvec_f32(WkB, ckvln, mk, nh * nope, kvl));
+    TEST_ASSERT(ds4_gpu_glm_matvec_f32(WvB, ckvln, mv, nh * vd,   kvl));
+    glm_metal_cmp("matvec k_b (WkB@kvln)", mk, ck, (size_t)nh * nope, tol_abs, tol_rel);
+    glm_metal_cmp("matvec v_b (WvB@kvln)", mv, cv, (size_t)nh * vd,   tol_abs, tol_rel);
+
+    /* ---- component 5: interleaved RoPE on the rope slice (Q + K) ---- */
+    float *qr_in = malloc(sizeof(float) * (size_t)nh * rope);
+    for (uint32_t h = 0; h < nh; h++)
+        for (uint32_t j = 0; j < rope; j++)
+            qr_in[(size_t)h * rope + j] = mq[(size_t)h * qhd + nope + j];
+    float *cqr = malloc(sizeof(float) * (size_t)nh * rope), *mqr = malloc(sizeof(float) * (size_t)nh * rope);
+    glm_rope_interleaved_f32(cqr, qr_in, rope, nh, shape.rope_base, t_pos);
+    TEST_ASSERT(ds4_gpu_glm_rope_interleaved_f32(qr_in, mqr, rope, nh, shape.rope_base, t_pos));
+    glm_metal_cmp("rope q (interleaved)", mqr, cqr, (size_t)nh * rope, tol_abs, tol_rel);
+
+    float *kr_in = malloc(sizeof(float) * (size_t)nh * rope);
+    for (uint32_t h = 0; h < nh; h++)
+        memcpy(kr_in + (size_t)h * rope, mkva + kvl, rope * sizeof(float));
+    float *ckr = malloc(sizeof(float) * (size_t)nh * rope), *mkr = malloc(sizeof(float) * (size_t)nh * rope);
+    glm_rope_interleaved_f32(ckr, kr_in, rope, nh, shape.rope_base, t_pos);
+    TEST_ASSERT(ds4_gpu_glm_rope_interleaved_f32(kr_in, mkr, rope, nh, shape.rope_base, t_pos));
+    glm_metal_cmp("rope k (interleaved)", mkr, ckr, (size_t)nh * rope, tol_abs, tol_rel);
+
+    /* ---- component 6: MLA decode attention ----
+     * Q is assembled [nope | rotated-rope]; caches hold the current token at
+     * position t (the fixtures already fill it).  CPU oracle via the isolated
+     * attention block above. */
+    float *Qm = malloc(sizeof(float) * (size_t)nh * qhd), *Qc = malloc(sizeof(float) * (size_t)nh * qhd);
+    for (uint32_t h = 0; h < nh; h++) {
+        memcpy(Qm + (size_t)h * qhd,       mq  + (size_t)h * qhd,        nope * sizeof(float));
+        memcpy(Qm + (size_t)h * qhd + nope, mqr + (size_t)h * rope,       rope * sizeof(float));
+        memcpy(Qc + (size_t)h * qhd,       cq  + (size_t)h * qhd,        nope * sizeof(float));
+        memcpy(Qc + (size_t)h * qhd + nope, cqr + (size_t)h * rope,       rope * sizeof(float));
+    }
+    float *cattn = malloc(sizeof(float) * (size_t)nh * vd), *mattn = malloc(sizeof(float) * (size_t)nh * vd);
+    glm_cpu_attn_decode(Qc, K_nope_ref, K_rope_ref, V_ref, cattn,
+                        nh, nope, rope, vd, qhd, seq_n, t_pos);
+    TEST_ASSERT(ds4_gpu_glm_attn_decode_f32(Qm, K_nope_ref, K_rope_ref, V_ref, mattn,
+                        nh, nope, rope, vd, qhd, seq_n, t_pos));
+    glm_metal_cmp("attn decode (scores+V)", mattn, cattn, (size_t)nh * vd, tol_abs, tol_rel);
+
+    /* ---- component 7: single attn_output projection ---- */
+    float *co = malloc(sizeof(float) * H), *mo = malloc(sizeof(float) * H);
+    glm_matvec_f32(co, Wo, cattn, H, nh * vd);
+    TEST_ASSERT(ds4_gpu_glm_matvec_f32(Wo, mattn, mo, H, nh * vd));
+    glm_metal_cmp("matvec attn_output (Wo)", mo, co, H, tol_abs, tol_rel);
+
+    /* ---- composite: full Metal MLA chain vs CPU glm_mla_forward_token_f32 ----
+     * Run the entire Metal pipeline into mout, writing this token's Metal k/v
+     * into the caches at position t (mirroring the CPU composite). */
+    float *Kc_n = malloc(sizeof(float) * (size_t)nh * seq_n * nope);
+    float *Kc_r = malloc(sizeof(float) * (size_t)nh * seq_n * rope);
+    float *Vc   = malloc(sizeof(float) * (size_t)nh * seq_n * vd);
+    memcpy(Kc_n, K_nope_ref, sizeof(float) * (size_t)nh * seq_n * nope);
+    memcpy(Kc_r, K_rope_ref, sizeof(float) * (size_t)nh * seq_n * rope);
+    memcpy(Vc,   V_ref,      sizeof(float) * (size_t)nh * seq_n * vd);
+    for (uint32_t h = 0; h < nh; h++) {
+        memcpy(Kc_n + ((size_t)h * seq_n + t_pos) * nope, mk + (size_t)h * nope, nope * sizeof(float));
+        memcpy(Vc   + ((size_t)h * seq_n + t_pos) * vd,   mv + (size_t)h * vd,   vd   * sizeof(float));
+        memcpy(Kc_r + ((size_t)h * seq_n + t_pos) * rope, mkr + (size_t)h * rope, rope * sizeof(float));
+    }
+    float *mattn2 = malloc(sizeof(float) * (size_t)nh * vd);
+    TEST_ASSERT(ds4_gpu_glm_attn_decode_f32(Qm, Kc_n, Kc_r, Vc, mattn2,
+                        nh, nope, rope, vd, qhd, seq_n, t_pos));
+    float *mout = malloc(sizeof(float) * H);
+    TEST_ASSERT(ds4_gpu_glm_matvec_f32(Wo, mattn2, mout, H, nh * vd));
+
+    /* CPU composite on freshly reset caches. */
+    float *Kc2_n = malloc(sizeof(float) * (size_t)nh * seq_n * nope);
+    float *Kc2_r = malloc(sizeof(float) * (size_t)nh * seq_n * rope);
+    float *Vc2   = malloc(sizeof(float) * (size_t)nh * seq_n * vd);
+    memcpy(Kc2_n, K_nope_ref, sizeof(float) * (size_t)nh * seq_n * nope);
+    memcpy(Kc2_r, K_rope_ref, sizeof(float) * (size_t)nh * seq_n * rope);
+    memcpy(Vc2,   V_ref,      sizeof(float) * (size_t)nh * seq_n * vd);
+    float *cout = malloc(sizeof(float) * H);
+    glm_mla_forward_token_f32(cout, x, WqA, WqB, WkvA, WkB, WvB, Wo,
+                              Kc2_n, Vc2, Kc2_r, seq_n, t_pos, &shape, NULL);
+    glm_metal_cmp("MLA composite (Metal vs CPU)", mout, cout, H, tol_abs, tol_rel);
+
+    /* cross-check the Metal composite against the numpy mla_out fixture. */
+    float *ref_mla_out = glm_ref_load_floats(dir, "mla_out.txt", H);
+    if (ref_mla_out) glm_metal_cmp("MLA composite (Metal vs numpy)", mout, ref_mla_out, H, tol_abs, tol_rel);
+
+    fprintf(stderr, "  glm-metal: %zu/%zu component+composite cases Metal==CPU\n",
+            g_glm_metal_pass, g_glm_metal_total);
+
+    free(ones); free(cqa); free(mqa); free(cqa_n); free(mqa_n); free(cq); free(mq);
+    free(ckva); free(mkva); free(ckvln); free(mkvln); free(ck); free(mk); free(cv); free(mv);
+    free(qr_in); free(cqr); free(mqr); free(kr_in); free(ckr); free(mkr);
+    free(Qm); free(Qc); free(cattn); free(mattn); free(co); free(mo);
+    free(Kc_n); free(Kc_r); free(Vc); free(mattn2); free(mout);
+    free(Kc2_n); free(Kc2_r); free(Vc2); free(cout); free(ref_mla_out);
+    free(x); free(WqA); free(WqB); free(WkvA); free(WkB); free(WvB); free(Wo);
+    free(K_nope_ref); free(V_ref); free(K_rope_ref);
+#endif
+}
+
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
@@ -2865,6 +3104,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-bpe", "glm-bpe", "GLM-5.2 glm4 BPE tokenizer vs HF tokenizers oracle (shard 1)", test_glm_bpe},
     {"--glm-quant-dequant", "glm-quant-dequant", "GLM-5.2 K-quant CPU dequant vs llama.cpp oracle", test_glm_quant_dequant},
     {"--glm-cpu-ref-components", "glm-cpu-ref-components", "GLM-5.2 CPU reference components (RoPE/MLA/dense-FFN/MoE) vs numpy oracle", test_glm_cpu_ref_components},
+    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
 };
 
 static void test_print_help(const char *prog) {

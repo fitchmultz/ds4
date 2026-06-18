@@ -1017,6 +1017,43 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* =========================================================================
+ * GLM-5.2 (glm-dsa) standalone component kernels — Phase 4c-i.
+ *
+ * Flat F32 wrappers over metal/glm.metal, mirroring the Phase 4a CPU
+ * reference (ds4.c glm_*_f32).  Standalone/test only; NOT wired into the
+ * DeepSeek graph.  Return 1 on success, 0 if Metal is unavailable or the
+ * kernel/pipeline fails.
+ * ========================================================================= */
+
+/* out[r] = sum_c W[r*cols+c] * x[c].  Covers the MLA projections
+ * q_a / q_b / kv_a / k_b / v_b / attn_output (all F32 on the fixtures). */
+int ds4_gpu_glm_matvec_f32(const float * W, const float * x, float * out,
+                           uint32_t rows, uint32_t cols);
+
+/* RMSNorm over n elements with per-channel weight w.  Latent-only norm is
+ * this with n = kv_lora on the latent slice (no masked variant needed). */
+int ds4_gpu_glm_rmsnorm_f32(const float * x, const float * w, float * out,
+                            uint32_t n, float eps);
+
+/* Standard interleaved RoPE on n_head rows of width d (theta base, position t). */
+int ds4_gpu_glm_rope_interleaved_f32(const float * x, float * out,
+                                     uint32_t d, uint32_t n_head,
+                                     float base, uint32_t t);
+
+/* MLA decode attention for one query token over cached tokens n in [0,t].
+ * Q is [nh, qhd] with the rope slice ALREADY rotated; kq_scale = 1/sqrt(qhd).
+ * K_nope_cache [nh,seq_n,nope], K_rope_cache [nh,seq_n,rope],
+ * V_cache [nh,seq_n,vd] -> attn_out [nh,vd]. */
+int ds4_gpu_glm_attn_decode_f32(const float * Q,
+                                const float * K_nope_cache,
+                                const float * K_rope_cache,
+                                const float * V_cache,
+                                float * attn_out,
+                                uint32_t nh, uint32_t nope, uint32_t rope,
+                                uint32_t vd, uint32_t qhd,
+                                uint32_t seq_n, uint32_t t);
+
 #ifdef __cplusplus
 }
 #endif
