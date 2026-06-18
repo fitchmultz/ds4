@@ -137,6 +137,15 @@ typedef enum {
     DS4_VARIANT_PRO   = 1,
 } ds4_variant;
 
+/* Architecture family, dispatched from general.architecture before any
+ * DeepSeek-specific validation.  DeepSeek keeps its Flash/Pro sub-profile in
+ * ds4_variant above; GLM is a separate family and never reuses the DeepSeek
+ * constants.  Phase 1 only routes GLM into metadata/inventory inspection. */
+typedef enum {
+    DS4_ARCH_DEEPSEEK = 0,   /* deepseek4.* metadata, Flash/Pro shapes */
+    DS4_ARCH_GLM_DSA  = 1,   /* glm-dsa.* metadata, GLM-5.2 shape       */
+} ds4_arch;
+
 typedef struct {
     const char *name;
     ds4_variant variant;
@@ -1611,22 +1620,44 @@ typedef struct {
     uint64_t abs_offset;
     uint64_t elements;
     uint64_t bytes;
+    uint32_t part;   /* which split part this tensor lives in (DeepSeek = 0) */
 } ds4_tensor;
 
+/* One mmap'd GGUF file.  Single-file models use one part (part_count == 1);
+ * GLM split GGUFs open every present shard as a separate independently-mapped
+ * part.  Tensors carry the part index they live in, and their abs_offset is
+ * relative to that part's own mmap (never concatenated, never copied). */
 typedef struct {
+    int fd;
+    const uint8_t *map;
+    uint64_t size;
+    uint64_t tensor_data_pos;   /* where tensor bytes start in THIS part */
+    uint64_t alignment;
+    char *path;
+} ds4_model_part;
+
+typedef struct {
+    /* Part-0 aliases.  For single-file DeepSeek (part_count == 1) these ARE the
+     * file, so every existing m->map / m->fd / m->size site is unchanged. */
     int fd;
     const uint8_t *map;
     uint64_t size;
 
     uint32_t version;
     uint64_t n_kv;
-    uint64_t n_tensors;
+    uint64_t n_tensors;          /* total tensors across all present parts */
     uint64_t alignment;
-    uint64_t tensor_data_pos;
+    uint64_t tensor_data_pos;    /* part 0's tensor data start             */
     uint64_t max_tensor_bytes;
 
-    ds4_kv *kv;
+    ds4_kv *kv;                  /* part 0's metadata (authoritative for split) */
     ds4_tensor *tensors;
+
+    /* Split-GGUF plumbing. */
+    ds4_model_part *parts;
+    uint32_t part_count;
+
+    ds4_arch arch;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -1803,6 +1834,25 @@ static bool model_get_bool(const ds4_model *m, const char *key, bool *out) {
     return true;
 }
 
+/* GGUF split metadata uses uint16 (split.no/split.count) and int32
+ * (split.tensors.count); the rest of the loader only needed u32/u64/f32. */
+static bool model_get_u16(const ds4_model *m, const char *key, uint16_t *out) {
+    ds4_kv *kv = model_find_kv(m, key);
+    if (!kv || kv->type != GGUF_VALUE_UINT16) return false;
+    ds4_cursor c = cursor_at(m, kv->value_pos);
+    uint16_t v = 0;
+    if (!cursor_read(&c, &v, sizeof(v))) return false;
+    *out = v;
+    return true;
+}
+
+static bool model_get_i32(const ds4_model *m, const char *key, int32_t *out) {
+    ds4_kv *kv = model_find_kv(m, key);
+    if (!kv || kv->type != GGUF_VALUE_INT32) return false;
+    ds4_cursor c = cursor_at(m, kv->value_pos);
+    return cursor_read(&c, out, sizeof(*out));
+}
+
 typedef struct {
     uint32_t type;
     uint64_t len;
@@ -1824,8 +1874,16 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
-    if (m->fd >= 0) close(m->fd);
+    /* Unmap/free every part once.  parts[0] holds the canonical map/fd, so the
+     * old m->map/m->fd aliases are not released separately. */
+    if (m->parts) {
+        for (uint32_t i = 0; i < m->part_count; i++) {
+            if (m->parts[i].map) munmap((void *)m->parts[i].map, (size_t)m->parts[i].size);
+            if (m->parts[i].fd >= 0) close(m->parts[i].fd);
+            free(m->parts[i].path);
+        }
+        free(m->parts);
+    }
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 }
@@ -1986,6 +2044,20 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+
+    /* Register this file as part 0 of the split-GGUF part array.  Single-file
+     * models (every DeepSeek build) keep part_count == 1 and the m->fd /
+     * m->map / m->size aliases set above ARE parts[0], so behavior is identical
+     * to the old single-map loader. */
+    m->parts = xcalloc(1, sizeof(m->parts[0]));
+    m->parts[0].fd = fd;
+    m->parts[0].map = map;
+    m->parts[0].size = (uint64_t)st.st_size;
+    m->parts[0].tensor_data_pos = m->tensor_data_pos;
+    m->parts[0].alignment = m->alignment;
+    m->parts[0].path = ds4_strdup(path);
+    m->part_count = 1;
+    m->arch = DS4_ARCH_DEEPSEEK;
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -2322,9 +2394,12 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
 #endif
 #endif
 
-/* Return the in-place tensor payload inside the mapped GGUF. */
+/* Return the in-place tensor payload inside the mapped GGUF.  Each tensor
+ * records which split part it lives in; single-file models have part==0 and
+ * parts[0].map == m->map, so this is byte-identical to the old single-map
+ * path for every DeepSeek build. */
 static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
-    return m->map + t->abs_offset;
+    return m->parts[t->part].map + t->abs_offset;
 }
 
 /* Optional startup pass that touches tensor pages before timing generation. */
@@ -4109,6 +4184,7 @@ typedef struct {
     uint64_t off;
     uint64_t end;
     bool isolate;
+    uint32_t part;   /* which mmap part this span lives in; DeepSeek spans = 0 */
 } ds4_model_map_span;
 
 typedef struct {
@@ -4137,7 +4213,7 @@ static void model_map_span_vec_append(ds4_model_map_span_vec *spans, uint64_t lo
         spans->v = xrealloc(spans->v, (size_t)new_cap * sizeof(spans->v[0]));
         spans->cap = new_cap;
     }
-    spans->v[spans->len++] = (ds4_model_map_span){lo, hi, isolate};
+    spans->v[spans->len++] = (ds4_model_map_span){.off = lo, .end = hi, .isolate = isolate};
 }
 
 static uint32_t model_map_q4_pro_group_views(void) {
@@ -25543,7 +25619,483 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 #endif
 }
 
+/* =========================================================================
+ * GLM-5.2 (glm-dsa): architecture dispatch, split-GGUF loading, metadata and
+ * tensor-inventory inspection (Phase 1).
+ * =========================================================================
+ *
+ * The DeepSeek path is untouched: GLM is dispatched purely from
+ * general.architecture and never reads a single deepseek4.* key, never enters
+ * config_validate_model / weights_bind / the graph backends.  Phase 1 only
+ * inspects metadata and the tensor inventory; GLM inference is Phase 4+ and is
+ * rejected here with a clear message.  See docs/GLM52-PORT.md sections 1/3/6. */
+
+static ds4_arch ds4_detect_arch(const ds4_model *m) {
+    ds4_str arch = {0};
+    if (model_get_string(m, "general.architecture", &arch) && arch.ptr) {
+        if (ds4_streq(arch, "glm-dsa")) return DS4_ARCH_GLM_DSA;
+        if (ds4_streq(arch, "deepseek4")) return DS4_ARCH_DEEPSEEK;
+        ds4_die("unsupported general.architecture (expected 'deepseek4' or 'glm-dsa')");
+    }
+    return DS4_ARCH_DEEPSEEK;  /* engine was DeepSeek-only before arch dispatch */
+}
+
+static void glm_expect_u32(const ds4_model *m, const char *key, uint32_t expected) {
+    uint32_t got = 0;
+    if (!model_get_u32(m, key, &got)) {
+        fprintf(stderr, "ds4: glm-dsa missing required metadata key: %s\n", key);
+        exit(1);
+    }
+    if (got != expected) {
+        fprintf(stderr, "ds4: glm-dsa %s: expected %u, got %u\n", key, expected, got);
+        exit(1);
+    }
+}
+
+static void glm_expect_f32(const ds4_model *m, const char *key, float expected, float rel_tol) {
+    float got = 0.0f;
+    if (!model_get_f32_compat(m, key, &got)) {
+        fprintf(stderr, "ds4: glm-dsa missing required metadata key: %s\n", key);
+        exit(1);
+    }
+    if (fabsf(got - expected) > fabsf(expected) * rel_tol) {
+        fprintf(stderr, "ds4: glm-dsa %s: expected %.9g, got %.9g\n",
+                key, (double)expected, (double)got);
+        exit(1);
+    }
+}
+
+static void glm_expect_bool(const ds4_model *m, const char *key, bool expected) {
+    bool got = false;
+    if (!model_get_bool(m, key, &got)) {
+        fprintf(stderr, "ds4: glm-dsa missing required metadata key: %s\n", key);
+        exit(1);
+    }
+    if (got != expected) {
+        fprintf(stderr, "ds4: glm-dsa %s: expected %s, got %s\n",
+                key, expected ? "true" : "false", got ? "true" : "false");
+        exit(1);
+    }
+}
+
+/* Validate the exact glm-dsa.* profile from docs/GLM52-PORT.md section 1/3.
+ * No deepseek4.* key is consulted on this path. */
+static void glm_validate_metadata(const ds4_model *m) {
+    glm_expect_u32(m, "glm-dsa.block_count",                      79);
+    glm_expect_u32(m, "glm-dsa.context_length",                   1048576);
+    glm_expect_u32(m, "glm-dsa.embedding_length",                 6144);
+    glm_expect_u32(m, "glm-dsa.feed_forward_length",              12288);
+    glm_expect_u32(m, "glm-dsa.vocab_size",                       154880);
+    glm_expect_u32(m, "glm-dsa.attention.head_count",             64);
+    glm_expect_u32(m, "glm-dsa.attention.head_count_kv",          1);
+    glm_expect_u32(m, "glm-dsa.attention.q_lora_rank",            2048);
+    glm_expect_u32(m, "glm-dsa.attention.kv_lora_rank",           512);
+    glm_expect_u32(m, "glm-dsa.attention.key_length",             576);
+    glm_expect_u32(m, "glm-dsa.attention.value_length",           512);
+    glm_expect_u32(m, "glm-dsa.attention.key_length_mla",         256);
+    glm_expect_u32(m, "glm-dsa.attention.value_length_mla",       256);
+    glm_expect_f32(m, "glm-dsa.attention.layer_norm_rms_epsilon", 1e-5f, 1e-3f);
+    glm_expect_f32(m, "glm-dsa.rope.freq_base",                   8e6f,  1e-6f);
+    glm_expect_u32(m, "glm-dsa.rope.dimension_count",             64);
+    glm_expect_u32(m, "glm-dsa.leading_dense_block_count",        3);
+    glm_expect_u32(m, "glm-dsa.expert_count",                     256);
+    glm_expect_u32(m, "glm-dsa.expert_used_count",                8);
+    glm_expect_u32(m, "glm-dsa.expert_group_count",               1);
+    glm_expect_u32(m, "glm-dsa.expert_group_used_count",          1);
+    glm_expect_u32(m, "glm-dsa.expert_gating_func",               2);   /* sigmoid */
+    glm_expect_u32(m, "glm-dsa.expert_feed_forward_length",       2048);
+    glm_expect_u32(m, "glm-dsa.expert_shared_count",              1);
+    glm_expect_f32(m, "glm-dsa.expert_weights_scale",             2.5f,  1e-6f);
+    glm_expect_bool(m, "glm-dsa.expert_weights_norm",             true);
+    glm_expect_u32(m, "glm-dsa.attention.indexer.head_count",     32);
+    glm_expect_u32(m, "glm-dsa.attention.indexer.key_length",     128);
+    glm_expect_u32(m, "glm-dsa.attention.indexer.top_k",          2048);
+    glm_expect_u32(m, "glm-dsa.nextn_predict_layers",             1);
+}
+
+/* --- split-shard path derivation for the "-NNNNN-of-MMMMM.gguf" naming. --- */
+
+static bool glm_is_5_digits(const char *s) {
+    for (int i = 0; i < 5; i++)
+        if (s[i] < '0' || s[i] > '9') return false;
+    return true;
+}
+
+/* Locate the 5-digit shard number in a split-shard path and report the total
+ * shard count from the "-of-MMMMM" part.  Returns a pointer to the first digit
+ * of this shard's number (within path), or NULL if path is not a split shard. */
+static const char *glm_split_find(const char *path, uint32_t *total) {
+    const char *of = NULL;
+    for (const char *p = path; (p = strstr(p, "-of-")) != NULL; p += 4) of = p;
+    if (!of || of < path + 6) return NULL;             /* need "-DDDDD-of-" */
+    const char *num1 = of - 5;                          /* shard number digits */
+    if (num1[-1] != '-' || !glm_is_5_digits(num1)) return NULL;
+    const char *num2 = of + 4;                          /* total count digits */
+    if (!glm_is_5_digits(num2)) return NULL;
+    const char *ext = num2 + 5;                         /* must be exactly ".gguf" */
+    if (!(ext[0] == '.' && (ext[1] | 32) == 'g' && (ext[2] | 32) == 'g' &&
+          (ext[3] | 32) == 'u' && (ext[4] | 32) == 'f' && ext[5] == '\0'))
+        return NULL;
+    *total = (uint32_t)strtoul(num2, NULL, 10);
+    return *total >= 1 ? num1 : NULL;
+}
+
+/* Build the path for shard number shard_no (1-based) from a reference shard
+ * path.  num1_pos is the pointer returned by glm_split_find for ref_path. */
+static void glm_split_build_path(const char *ref, const char *num1_pos,
+                                 uint32_t shard_no, char *out, size_t outcap) {
+    const size_t prefix = (size_t)(num1_pos - ref);   /* path up to the digits */
+    snprintf(out, outcap, "%.*s%05u%s", (int)prefix, ref, shard_no, num1_pos + 5);
+}
+
+/* Open one split sibling as model part `part_index`, appending its tensor
+ * directory into m->tensors (each tensor tagged with part_index).  The file is
+ * mmap'd independently and never concatenated with the other parts.  Returns
+ * the number of tensors parsed, or -1 if the file is absent (a missing sibling
+ * is the caller's hint, not a fatal parse error).  Any other error dies. */
+static int64_t glm_open_part(ds4_model *m, const char *path, uint32_t part_index,
+                             bool metal_mapping) {
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) return -1;
+    struct stat st;
+    if (fstat(fd, &st) == -1) { close(fd); ds4_die_errno("cannot stat model", path); }
+
+    const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
+    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
+    if (map == MAP_FAILED) { close(fd); ds4_die_errno("cannot mmap model", path); }
+
+    ds4_cursor c = {.base = (const uint8_t *)map, .size = (uint64_t)st.st_size,
+                    .pos = 0, .error = {0}};
+    uint32_t magic = 0, version = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
+    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
+    if (!cursor_u32(&c, &version)) ds4_die(c.error);
+    if (!cursor_u64(&c, &n_tensors)) ds4_die(c.error);
+    if (!cursor_u64(&c, &n_kv)) ds4_die(c.error);
+    if (version != 3) ds4_die("only GGUF v3 is supported");
+
+    /* Siblings carry only split.* kv; we still honor general.alignment if set. */
+    uint64_t alignment = 32;
+    for (uint64_t i = 0; i < n_kv; i++) {
+        ds4_str key = {0};
+        if (!cursor_string(&c, &key)) ds4_die(c.error);
+        uint32_t type = 0;
+        if (!cursor_u32(&c, &type)) ds4_die(c.error);
+        if (ds4_streq(key, "general.alignment") && type == GGUF_VALUE_UINT32) {
+            uint32_t a = 0;
+            if (cursor_u32(&c, &a) && a != 0) alignment = a;   /* value consumed */
+        } else {
+            if (!skip_value(&c, type, 0)) ds4_die(c.error);
+        }
+    }
+
+    if (n_tensors != 0) {
+        const size_t old = (size_t)m->n_tensors;
+        m->tensors = xrealloc(m->tensors, (old + (size_t)n_tensors) * sizeof(m->tensors[0]));
+        memset(m->tensors + old, 0, (size_t)n_tensors * sizeof(m->tensors[0]));
+    }
+    const uint64_t write_start = m->n_tensors;
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        ds4_tensor *t = &m->tensors[write_start + i];
+        if (!cursor_string(&c, &t->name)) ds4_die(c.error);
+        if (!cursor_u32(&c, &t->ndim)) ds4_die(c.error);
+        if (t->ndim == 0 || t->ndim > DS4_MAX_DIMS)
+            ds4_die("tensor has an unsupported number of dimensions");
+        t->elements = 1;
+        for (uint32_t d = 0; d < t->ndim; d++) {
+            if (!cursor_u64(&c, &t->dim[d])) ds4_die(c.error);
+            if (t->dim[d] != 0 && t->elements > UINT64_MAX / t->dim[d])
+                ds4_die("tensor element count overflow");
+            t->elements *= t->dim[d];
+        }
+        if (!cursor_u32(&c, &t->type)) ds4_die(c.error);
+        if (!cursor_u64(&c, &t->rel_offset)) ds4_die(c.error);
+        if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
+            ds4_log(stderr, DS4_LOG_WARNING,
+                "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
+                (int)t->name.len, t->name.ptr, t->type);
+        }
+        t->part = part_index;
+    }
+
+    const uint64_t tensor_data_pos = align_up(c.pos, alignment);
+    const uint64_t part_size = (uint64_t)st.st_size;
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        ds4_tensor *t = &m->tensors[write_start + i];
+        if (t->rel_offset > UINT64_MAX - tensor_data_pos) ds4_die("tensor offset overflow");
+        t->abs_offset = tensor_data_pos + t->rel_offset;
+        if (t->bytes != 0 &&
+            (t->abs_offset > part_size || t->bytes > part_size - t->abs_offset))
+            ds4_die("tensor points outside GGUF file");
+        if (t->bytes > m->max_tensor_bytes) m->max_tensor_bytes = t->bytes;
+    }
+    m->n_tensors += n_tensors;
+
+    /* Register the part (indexed by shard order: part 0 == shard 1). */
+    if (part_index >= m->part_count) {
+        const uint32_t newcap = part_index + 1;
+        m->parts = xrealloc(m->parts, (size_t)newcap * sizeof(m->parts[0]));
+        for (uint32_t k = m->part_count; k < newcap; k++) {
+            memset(&m->parts[k], 0, sizeof(m->parts[k]));
+            m->parts[k].fd = -1;   /* gap (missing sibling) stays unmapped */
+        }
+        m->part_count = newcap;
+    }
+    m->parts[part_index].fd = fd;
+    m->parts[part_index].map = (const uint8_t *)map;
+    m->parts[part_index].size = part_size;
+    m->parts[part_index].tensor_data_pos = tensor_data_pos;
+    m->parts[part_index].alignment = alignment;
+    m->parts[part_index].path = ds4_strdup(path);
+    return (int64_t)n_tensors;
+}
+
+/* Open every present sibling shard.  Part 0 is the shard the user pointed -m at
+ * (by convention shard 1, which holds the full glm-dsa.* metadata).  Returns
+ * the number of missing siblings and prints a download hint when any are
+ * missing, so metadata-only inspect from shard 1 alone still succeeds. */
+static uint32_t glm_open_split(ds4_model *m, const char *ref_path, bool metal_mapping) {
+    uint32_t total = 0;
+    const char *num1 = glm_split_find(ref_path, &total);
+    if (!num1 || total <= 1) return 0;   /* not a split shard, or single shard */
+
+    uint32_t missing = 0;
+    for (uint32_t s = 1; s <= total; s++) {
+        const uint32_t part_index = s - 1;
+        if (part_index < m->part_count && m->parts[part_index].map != NULL)
+            continue;   /* already open: part 0 is the shard -m pointed at */
+        char path[4096];
+        glm_split_build_path(ref_path, num1, s, path, sizeof(path));
+        if (glm_open_part(m, path, part_index, metal_mapping) < 0) {
+            missing++;
+            fprintf(stderr, "ds4: glm-dsa split shard %u/%u not found: %s\n", s, total, path);
+        }
+    }
+    if (missing != 0) {
+        fprintf(stderr,
+            "ds4: glm-dsa: %u of %u split shards missing; download the remaining "
+            "shards for the full tensor inventory (metadata-only inspect still works).\n",
+            missing, total);
+    }
+    return missing;
+}
+
+/* Count tensors whose name is blk.{lo..hi}.<suffix> (inclusive layer range). */
+static uint32_t glm_count_blk(const ds4_model *m, const char *suffix,
+                              uint32_t lo, uint32_t hi) {
+    char buf[160];
+    uint32_t cnt = 0;
+    for (uint32_t il = lo; il <= hi; il++) {
+        snprintf(buf, sizeof(buf), "blk.%u.%s", il, suffix);
+        if (model_find_tensor(m, buf)) cnt++;
+    }
+    return cnt;
+}
+
+static uint32_t glm_count_one(const ds4_model *m, const char *name) {
+    return model_find_tensor(m, name) ? 1u : 0u;
+}
+
+static bool glm_str_contains(const char *hay, uint64_t haylen, const char *needle) {
+    const size_t nl = strlen(needle);
+    if (nl == 0 || nl > haylen) return false;
+    for (uint64_t i = 0; i + nl <= haylen; i++)
+        if (memcmp(hay + i, needle, nl) == 0) return true;
+    return false;
+}
+
+/* If all declared shards are present, enforce the GGUF split invariant that the
+ * merged tensor count equals the declared total.  Pattern-name counts are only
+ * reported (in glm_model_summary), not hard-asserted, because the exact per-key
+ * names come from the full 238 GiB split which is not on disk in Phase 1. */
+static void glm_inventory_check(const ds4_model *m) {
+    uint16_t split_count_u16 = 0;
+    int32_t declared_i32 = 0;
+    const bool has_count = model_get_u16(m, "split.count", &split_count_u16);
+    const bool has_decl = model_get_i32(m, "split.tensors.count", &declared_i32);
+    if (!has_count || !has_decl || split_count_u16 <= 1) return;
+
+    uint32_t mapped = 0;
+    for (uint32_t i = 0; i < m->part_count; i++)
+        if (m->parts[i].map != NULL) mapped++;
+    if (mapped < split_count_u16) return;   /* incomplete split: cannot enforce */
+
+    const uint64_t declared = (uint64_t)declared_i32;
+    if (m->n_tensors != declared) {
+        fprintf(stderr,
+            "ds4: glm-dsa tensor inventory mismatch: all %u shards present but "
+            "%" PRIu64 " tensors merged vs %" PRIu64 " declared\n",
+            split_count_u16, m->n_tensors, declared);
+        exit(1);
+    }
+}
+
+static uint32_t glm_mapped_shards(const ds4_model *m) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < m->part_count; i++)
+        if (m->parts[i].map != NULL) n++;
+    return n;
+}
+
+/* Pretty-print the GLM-5.2 inspect report (metadata + split inventory + pattern
+ * counts + routed/non-routed byte summary).  Called for --inspect only. */
+static void glm_model_summary(const ds4_model *m) {
+    ds4_str name = {0}, arch = {0};
+    model_get_string(m, "general.name", &name);
+    model_get_string(m, "general.architecture", &arch);
+
+    uint32_t block_count = 0, nextn = 0, n_dense = 0;
+    uint32_t embd = 0, vocab = 0, ff_dense = 0, ff_exp = 0;
+    uint32_t heads = 0, heads_kv = 0, q_lora = 0, kv_lora = 0;
+    uint32_t key_len = 0, val_len = 0, key_mla = 0, val_mla = 0;
+    uint32_t n_expert = 0, n_used = 0, n_shared = 0, rope_dim = 0;
+    uint32_t idx_head = 0, idx_keylen = 0, idx_topk = 0;
+    float rope_base = 0, rms_eps = 0, exp_scale = 0;
+    bool exp_norm = false;
+    model_get_u32(m, "glm-dsa.block_count", &block_count);
+    model_get_u32(m, "glm-dsa.nextn_predict_layers", &nextn);
+    model_get_u32(m, "glm-dsa.leading_dense_block_count", &n_dense);
+    model_get_u32(m, "glm-dsa.embedding_length", &embd);
+    model_get_u32(m, "glm-dsa.vocab_size", &vocab);
+    model_get_u32(m, "glm-dsa.feed_forward_length", &ff_dense);
+    model_get_u32(m, "glm-dsa.expert_feed_forward_length", &ff_exp);
+    model_get_u32(m, "glm-dsa.attention.head_count", &heads);
+    model_get_u32(m, "glm-dsa.attention.head_count_kv", &heads_kv);
+    model_get_u32(m, "glm-dsa.attention.q_lora_rank", &q_lora);
+    model_get_u32(m, "glm-dsa.attention.kv_lora_rank", &kv_lora);
+    model_get_u32(m, "glm-dsa.attention.key_length", &key_len);
+    model_get_u32(m, "glm-dsa.attention.value_length", &val_len);
+    model_get_u32(m, "glm-dsa.attention.key_length_mla", &key_mla);
+    model_get_u32(m, "glm-dsa.attention.value_length_mla", &val_mla);
+    model_get_u32(m, "glm-dsa.expert_count", &n_expert);
+    model_get_u32(m, "glm-dsa.expert_used_count", &n_used);
+    model_get_u32(m, "glm-dsa.expert_shared_count", &n_shared);
+    model_get_u32(m, "glm-dsa.rope.dimension_count", &rope_dim);
+    model_get_u32(m, "glm-dsa.attention.indexer.head_count", &idx_head);
+    model_get_u32(m, "glm-dsa.attention.indexer.key_length", &idx_keylen);
+    model_get_u32(m, "glm-dsa.attention.indexer.top_k", &idx_topk);
+    model_get_f32_compat(m, "glm-dsa.rope.freq_base", &rope_base);
+    model_get_f32_compat(m, "glm-dsa.attention.layer_norm_rms_epsilon", &rms_eps);
+    model_get_f32_compat(m, "glm-dsa.expert_weights_scale", &exp_scale);
+    model_get_bool(m, "glm-dsa.expert_weights_norm", &exp_norm);
+
+    const uint32_t backbone = block_count > nextn ? block_count - nextn : 0;
+
+    uint16_t split_count = 0;
+    int32_t declared = 0;
+    model_get_u16(m, "split.count", &split_count);
+    model_get_i32(m, "split.tensors.count", &declared);
+    const uint32_t mapped = glm_mapped_shards(m);
+
+    printf("model: %.*s\n", (int)name.len, name.ptr);
+    printf("arch:  %.*s\n", (int)arch.len, arch.ptr);
+    printf("gguf:  v%u, %" PRIu64 " metadata keys, %" PRIu64 " tensors\n",
+           m->version, m->n_kv, m->n_tensors);
+    if (split_count > 1) {
+        printf("split: %u shards, %d tensors declared, %" PRIu64 " present (%s)\n",
+               split_count, declared, m->n_tensors,
+               mapped >= split_count ? "full split" : "shard 1 only / partial");
+    }
+    printf("block_count: %u (backbone %u + nextn %u), leading dense %u\n",
+           block_count, backbone, nextn, n_dense);
+    printf("shape: hidden=%u vocab=%u dense_ff=%u expert_ff=%u\n",
+           embd, vocab, ff_dense, ff_exp);
+    printf("attn: heads=%u kv_heads=%u q_lora=%u kv_lora=%u key=%u val=%u (mla %u/%u)\n",
+           heads, heads_kv, q_lora, kv_lora, key_len, val_len, key_mla, val_mla);
+    printf("indexer: heads=%u head_dim=%u top_k=%u\n", idx_head, idx_keylen, idx_topk);
+    printf("experts: count=%u used=%u (top-%u) shared=%u scale=%g norm=%s\n",
+           n_expert, n_used, n_used, n_shared, (double)exp_scale, exp_norm ? "true" : "false");
+    printf("rope: freq_base=%g dim=%u  rms_eps=%g\n",
+           (double)rope_base, rope_dim, (double)rms_eps);
+    printf("parts: %u mapped / %u declared\n", mapped, split_count ? split_count : 1);
+
+    /* Pattern-count table (present / expected-full).  With only shard 1 present
+     * every present count is 0; the expected-full column documents the contract
+     * from docs/GLM52-PORT.md section 3 (79 / 3 / 76 pattern counts). */
+    const uint32_t all_lo = 0, all_hi = block_count ? block_count - 1 : 0;   /* blk.0..78 */
+    const uint32_t dense_lo = 0, dense_hi = n_dense ? n_dense - 1 : 0;       /* blk.0..2  */
+    const uint32_t moe_lo = n_dense, moe_hi = all_hi;                        /* blk.3..78 */
+    const uint32_t e_all = block_count;        /* expected per all-block pattern */
+    const uint32_t e_dense = n_dense;          /* 3 */
+    const uint32_t e_moe = (moe_hi >= moe_lo) ? (moe_hi - moe_lo + 1) : 0;  /* 76 */
+
+    printf("tensor inventory (present / expected-full):\n");
+    printf("  global token_embd / output_norm / output : %u / 3\n",
+           glm_count_one(m, "token_embd.weight") + glm_count_one(m, "output_norm.weight")
+           + glm_count_one(m, "output.weight"));
+    static const char *const all_pats[] = {
+        "attn_norm", "attn_q_a", "attn_q_a_norm", "attn_q_b", "attn_kv_a_mqa",
+        "attn_kv_a_norm", "attn_k_b", "attn_v_b", "attn_output",
+        "indexer.attn_k", "indexer.attn_q_b", "indexer.k_norm.weight",
+        "indexer.k_norm.bias", "indexer.proj", "ffn_norm"};
+    for (size_t i = 0; i < sizeof(all_pats) / sizeof(all_pats[0]); i++)
+        printf("  blk.0-%u %-22s : %u / %u\n",
+               all_hi, all_pats[i], glm_count_blk(m, all_pats[i], all_lo, all_hi), e_all);
+    static const char *const dense_pats[] = {"ffn_gate", "ffn_up", "ffn_down"};
+    for (size_t i = 0; i < sizeof(dense_pats) / sizeof(dense_pats[0]); i++)
+        printf("  blk.%u-%u %-22s : %u / %u\n",
+               dense_lo, dense_hi, dense_pats[i],
+               glm_count_blk(m, dense_pats[i], dense_lo, dense_hi), e_dense);
+    static const char *const moe_pats[] = {
+        "exp_probs_b.bias", "ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps",
+        "ffn_down_exps", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"};
+    for (size_t i = 0; i < sizeof(moe_pats) / sizeof(moe_pats[0]); i++)
+        printf("  blk.%u-%u %-22s : %u / %u\n",
+               moe_lo, moe_hi, moe_pats[i],
+               glm_count_blk(m, moe_pats[i], moe_lo, moe_hi), e_moe);
+    printf("  blk.%u.nextn.* (eh_proj/enorm/hnorm/shared_head_norm) : %u / 4\n",
+           all_hi,
+           glm_count_blk(m, "nextn.eh_proj", all_hi, all_hi)
+           + glm_count_blk(m, "nextn.enorm", all_hi, all_hi)
+           + glm_count_blk(m, "nextn.hnorm", all_hi, all_hi)
+           + glm_count_blk(m, "nextn.shared_head_norm", all_hi, all_hi));
+
+    /* Routed (per-expert ffn_*_exps stack) vs non-routed byte summary, as in
+     * docs/GLM52-PORT.md section 5.  Shard-1-only has 0 tensors, so both are 0. */
+    uint64_t routed_bytes = 0, nonrouted_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        const bool routed = glm_str_contains(t->name.ptr, t->name.len, "_exps") &&
+                            !glm_str_contains(t->name.ptr, t->name.len, "_shexp");
+        if (routed) routed_bytes += t->bytes;
+        else nonrouted_bytes += t->bytes;
+    }
+    printf("routed expert bytes: ");
+    print_size(routed_bytes);
+    printf("\nnon-routed bytes:    ");
+    print_size(nonrouted_bytes);
+    printf("\nshard 1 file size:  ");
+    print_size(m->parts[0].size);
+    printf("\n");
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    /* If the user pointed -m at a split-shard path that is not on disk but the
+     * split's first shard is, give the GLM-aware download hint instead of a raw
+     * open() failure.  Scoped to the "-NNNNN-of-MMMMM.gguf" naming so the
+     * single-file DeepSeek/MTP paths are unaffected. */
+    {
+        struct stat _probe;
+        if (opt->model_path && stat(opt->model_path, &_probe) != 0) {
+            uint32_t total = 0;
+            const char *num1 = glm_split_find(opt->model_path, &total);
+            if (num1 && total > 1) {
+                char shard1[4096];
+                glm_split_build_path(opt->model_path, num1, 1, shard1, sizeof(shard1));
+                if (stat(shard1, &_probe) == 0) {
+                    fprintf(stderr,
+                        "ds4: split shard '%s' is not present; the model is split "
+                        "into %u shards.\nds4: download the remaining shards, or "
+                        "point -m at shard 1 ('%s'), and retry.\n",
+                        opt->model_path, total, shard1);
+                    *out = NULL;
+                    return 1;
+                }
+            }
+        }
+    }
+
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -25604,6 +26156,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    e->model.arch = ds4_detect_arch(&e->model);
+
+    /* GLM-5.2 (glm-dsa) is fully separated from the DeepSeek path below: it
+     * never reads deepseek4.* keys, never calls config_validate_model /
+     * weights_bind / the graph backends.  Phase 1 supports metadata + tensor
+     * inventory inspection only. */
+    if (e->model.arch == DS4_ARCH_GLM_DSA) {
+        if (e->backend != DS4_BACKEND_METAL) {
+            fprintf(stderr, "ds4: glm-dsa is not supported on this backend yet\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        glm_validate_metadata(&e->model);
+        glm_open_split(&e->model, opt->model_path, graph_backend);
+        glm_inventory_check(&e->model);
+        if (!opt->inspect_only) {
+            fprintf(stderr,
+                "ds4: glm-dsa inference is not implemented yet (Phase 4); "
+                "use --inspect for metadata-only inspection.\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        *out = e;
+        return 0;
+    }
+
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
@@ -25975,7 +26555,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 }
 
 void ds4_engine_summary(ds4_engine *e) {
-    model_summary(&e->model);
+    if (e->model.arch == DS4_ARCH_GLM_DSA) {
+        glm_model_summary(&e->model);
+    } else {
+        model_summary(&e->model);
+    }
 }
 
 int ds4_engine_vocab_size(ds4_engine *e) {
