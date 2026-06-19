@@ -27269,201 +27269,265 @@ static void glm_dequant_weight(const ds4_model *m, const ds4_tensor *t,
  * real dequanted weights, with a growing per-layer KV cache.  Dense SwiGLU for
  * blk.0..n_dense-1; sigmoid MoE (top-8 + shared expert, experts dequanted on
  * demand) for the rest. */
+/* Per-layer progress is verbose on the reference forwards; the Phase 4e chat
+ * driver silences it for a clean stdout/text stream.  Defined here (before the
+ * step functions) so both CPU and Metal steps can read it. */
+static bool glm_fwd_progress = true;
+
+/* Phase 4e: persistent forward context.  Holds all per-layer weight scratch,
+ * activation buffers, and per-layer KV caches sized to `seq_n` (the cache
+ * capacity / stride).  Processing one token at position `pos` appends its K/V
+ * to the GROWING caches; the caches persist across steps so prefill +
+ * autoregressive decode reuse all prior KV (incremental, ~constant per-token
+ * cost rather than an O(n^2) full re-run).  The per-step body mirrors the
+ * original monolithic glm_cpu_forward token loop exactly -- only the control
+ * flow (loop split into per-token steps + a persistent cache) changed. */
+typedef struct {
+    const ds4_model    *m;
+    const glm_cpu_shape *shape;
+    uint32_t  n_layer, n_dense, seq_n;          /* seq_n = KV capacity/stride   */
+    uint32_t  H, nh, kvl, nope, rope, vd, E, K;
+    float     eps;
+    /* MLA weight scratch (dequanted per layer, reused). */
+    float *WqA, *WqB, *WkvA, *WkBn, *WkB, *WvB, *Wo;
+    /* FFN scratch (sized for the dense intermediate, >= expert intermediate). */
+    float *fgate, *fup, *fdown, *sg, *su;
+    /* Activation + residual stream. */
+    float *x, *xn, *res, *mla_out, *ffn_out, *etmp;
+    float *router_scratch; int *idx; float *w, *logits_row;
+    /* Per-layer KV caches: [n_layer] of [nh, seq_n, dim] row-major. */
+    float **Knope, **Vc, **Krop;
+    /* Cached global tensors (resolved once at init). */
+    const ds4_tensor *t_embd, *t_out, *t_onorm;
+    uint64_t embd_row_bytes, out_row_bytes;
+    uint32_t vocab;
+} glm_cpu_fwd_ctx;
+
+static void glm_cpu_fwd_init(glm_cpu_fwd_ctx *c, const ds4_model *m,
+                             const glm_cpu_shape *shape,
+                             uint32_t n_layer, uint32_t n_dense,
+                             uint32_t seq_n) {
+    memset(c, 0, sizeof(*c));
+    c->m = m; c->shape = shape; c->n_layer = n_layer; c->n_dense = n_dense;
+    c->seq_n = seq_n;
+    const uint32_t H = shape->hidden, nh = shape->n_head, ql = shape->q_lora;
+    const uint32_t kvl = shape->kv_lora, nope = shape->qk_nope, rope = shape->qk_rope;
+    const uint32_t vd = shape->v_dim, E = shape->n_expert, K = shape->n_expert_used;
+    c->H=H; c->nh=nh; c->kvl=kvl; c->nope=nope; c->rope=rope; c->vd=vd; c->E=E; c->K=K;
+    c->eps = shape->rms_eps;
+
+    c->t_embd = model_find_tensor(m, "token_embd.weight");
+    c->t_out  = model_find_tensor(m, "output.weight");
+    c->t_onorm= model_find_tensor(m, "output_norm.weight");
+    if (!c->t_embd || !c->t_out || !c->t_onorm) ds4_die("glm-cpu-ref: missing global tensor");
+    c->vocab = (uint32_t)c->t_out->dim[1];
+    c->embd_row_bytes = c->t_embd->bytes / c->t_embd->dim[1];
+    c->out_row_bytes  = c->t_out->bytes  / c->vocab;
+
+    c->WqA = xmalloc((size_t)ql * H * sizeof(float));
+    c->WqB = xmalloc((size_t)nh * (nope + rope) * ql * sizeof(float));
+    c->WkvA= xmalloc((size_t)(kvl + rope) * H * sizeof(float));
+    c->WkBn= xmalloc((size_t)nh * nope * kvl * sizeof(float));   /* native k_b  */
+    c->WkB = xmalloc((size_t)nh * nope * kvl * sizeof(float));   /* reordered   */
+    c->WvB = xmalloc((size_t)nh * vd * kvl * sizeof(float));
+    c->Wo  = xmalloc((size_t)H * nh * vd * sizeof(float));
+    const uint32_t max_inter = shape->ff_inter;
+    c->fgate = xmalloc((size_t)max_inter * H * sizeof(float));
+    c->fup   = xmalloc((size_t)max_inter * H * sizeof(float));
+    c->fdown = xmalloc((size_t)H * max_inter * sizeof(float));
+    c->sg = xmalloc((size_t)max_inter * sizeof(float));
+    c->su = xmalloc((size_t)max_inter * sizeof(float));
+    c->x = xmalloc((size_t)H * sizeof(float));
+    c->xn= xmalloc((size_t)H * sizeof(float));
+    c->res = xmalloc((size_t)H * sizeof(float));
+    c->mla_out = xmalloc((size_t)H * sizeof(float));
+    c->ffn_out = xmalloc((size_t)H * sizeof(float));
+    c->etmp = xmalloc((size_t)H * sizeof(float));
+    c->router_scratch = xmalloc((size_t)E * sizeof(float));
+    c->idx = xmalloc((size_t)K * sizeof(int));
+    c->w = xmalloc((size_t)K * sizeof(float));
+    c->logits_row = xmalloc((size_t)H * sizeof(float));
+
+    const size_t k_nope_bytes = (size_t)nh * seq_n * nope * sizeof(float);
+    const size_t v_bytes      = (size_t)nh * seq_n * vd * sizeof(float);
+    const size_t k_rope_bytes = (size_t)nh * seq_n * rope * sizeof(float);
+    c->Knope = xmalloc((size_t)n_layer * sizeof(float *));
+    c->Vc    = xmalloc((size_t)n_layer * sizeof(float *));
+    c->Krop  = xmalloc((size_t)n_layer * sizeof(float *));
+    for (uint32_t l = 0; l < n_layer; l++) {
+        c->Knope[l] = xmalloc(k_nope_bytes);
+        c->Vc[l]    = xmalloc(v_bytes);
+        c->Krop[l]  = xmalloc(k_rope_bytes);
+    }
+}
+
+static void glm_cpu_fwd_free(glm_cpu_fwd_ctx *c) {
+    for (uint32_t l = 0; l < c->n_layer; l++) { free(c->Knope[l]); free(c->Vc[l]); free(c->Krop[l]); }
+    free(c->Knope); free(c->Vc); free(c->Krop);
+    free(c->WqA); free(c->WqB); free(c->WkvA); free(c->WkBn); free(c->WkB); free(c->WvB); free(c->Wo);
+    free(c->fgate); free(c->fup); free(c->fdown); free(c->sg); free(c->su);
+    free(c->x); free(c->xn); free(c->res); free(c->mla_out); free(c->ffn_out); free(c->etmp);
+    free(c->router_scratch); free(c->idx); free(c->w); free(c->logits_row);
+}
+
+/* Process ONE token at sequence position `pos`, appending its K/V to the
+ * persistent caches.  When want_logits, write the vocab-sized logits for this
+ * position (output_norm + LM head).  Math mirrors the original monolithic
+ * glm_cpu_forward per-token body exactly; only the cache stride is seq_n
+ * (capacity) instead of the prompt length, so the cache persists + grows. */
+static void glm_cpu_fwd_step(glm_cpu_fwd_ctx *c, int token, uint32_t pos,
+                             bool want_logits, float *logits) {
+    const ds4_model *m = c->m;
+    const glm_cpu_shape *shape = c->shape;
+    const uint32_t H=c->H, nh=c->nh, kvl=c->kvl, nope=c->nope;
+    const uint32_t n_layer=c->n_layer, n_dense=c->n_dense, K=c->K;
+    const float eps = c->eps;
+    float *x=c->x, *xn=c->xn, *res=c->res, *mla_out=c->mla_out;
+    float *ffn_out=c->ffn_out, *etmp=c->etmp;
+
+    /* Embedding lookup: dequant the single token's hidden row. */
+    glm_dequant_count(m, c->t_embd, (uint64_t)token * c->embd_row_bytes, H, x);
+    const uint32_t prog_every = n_layer > 8 ? n_layer / 8 : 0;
+
+    for (uint32_t il = 0; il < n_layer; il++) {
+        /* ---- attention block ---- */
+        memcpy(res, x, (size_t)H * sizeof(float));
+        const ds4_tensor *anorm_t = glm_layer_tensor(m, il, "attn_norm");
+        glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, anorm_t), H, eps);
+        const ds4_tensor *q_a  = glm_layer_tensor(m, il, "attn_q_a");
+        const ds4_tensor *q_b  = glm_layer_tensor(m, il, "attn_q_b");
+        const ds4_tensor *kv_a = glm_layer_tensor(m, il, "attn_kv_a_mqa");
+        const ds4_tensor *k_b  = glm_layer_tensor(m, il, "attn_k_b");
+        const ds4_tensor *v_b  = glm_layer_tensor(m, il, "attn_v_b");
+        const ds4_tensor *wop  = glm_layer_tensor(m, il, "attn_output");
+        if (!q_a || !q_b || !kv_a || !k_b || !v_b || !wop)
+            ds4_die("glm-cpu-ref: missing attention tensor");
+        glm_dequant_weight(m, q_a, c->WqA);
+        glm_dequant_weight(m, q_b, c->WqB);
+        glm_dequant_weight(m, kv_a, c->WkvA);
+        glm_dequant_weight(m, k_b, c->WkBn);
+        glm_k_b_reorder(c->WkB, c->WkBn, nope, kvl, nh);   /* real k_b is nope-contiguous */
+        glm_dequant_weight(m, v_b, c->WvB);
+        glm_dequant_weight(m, wop, c->Wo);
+        const float *qa_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_q_a_norm"));
+        const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
+        glm_mla_forward_token_f32(mla_out, xn, c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, c->Wo,
+                                  qa_norm, kv_norm,
+                                  c->Knope[il], c->Vc[il], c->Krop[il],
+                                  c->seq_n, pos, shape, NULL);
+        for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
+
+        /* ---- FFN block ---- */
+        memcpy(res, x, (size_t)H * sizeof(float));
+        const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
+        glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, fnorm_t), H, eps);
+        if (il == 3 && pos == 0 && getenv("DS4_GLM_XN3_OUT")) {
+            FILE *xf = fopen(getenv("DS4_GLM_XN3_OUT"), "wb");
+            if (xf) { fwrite(xn, sizeof(float), H, xf); fclose(xf); }
+        }
+        if (il < n_dense) {
+            /* Dense SwiGLU FFN (blk.0..n_dense-1). */
+            const ds4_tensor *g = glm_layer_tensor(m, il, "ffn_gate");
+            const ds4_tensor *u = glm_layer_tensor(m, il, "ffn_up");
+            const ds4_tensor *d = glm_layer_tensor(m, il, "ffn_down");
+            if (!g || !u || !d) ds4_die("glm-cpu-ref: missing dense FFN tensor");
+            glm_dequant_weight(m, g, c->fgate);
+            glm_dequant_weight(m, u, c->fup);
+            glm_dequant_weight(m, d, c->fdown);
+            glm_swiglu_dense_f32(ffn_out, xn, c->fgate, c->fup, c->fdown, shape, c->sg, c->su);
+        } else {
+            /* Sigmoid MoE: route -> top-K -> dequant selected experts on
+             * demand -> weighted sum + shared expert (weight 1.0). */
+            const ds4_tensor *ge  = glm_layer_tensor(m, il, "ffn_gate_exps");
+            const ds4_tensor *ue  = glm_layer_tensor(m, il, "ffn_up_exps");
+            const ds4_tensor *de  = glm_layer_tensor(m, il, "ffn_down_exps");
+            const ds4_tensor *ginp= glm_layer_tensor(m, il, "ffn_gate_inp");
+            const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
+            const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
+            const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
+            char bias_name[64];
+            snprintf(bias_name, sizeof(bias_name), "blk.%u.exp_probs_b.bias", il);
+            const ds4_tensor *bias_t = model_find_tensor(m, bias_name);
+            if (!ge || !ue || !de || !ginp || !gsh || !ush || !dsh || !bias_t)
+                ds4_die("glm-cpu-ref: missing MoE tensor");
+            const uint32_t ei = (uint32_t)ge->dim[1];             /* expert inter (2048) */
+            const uint64_t pe_gate = ge->bytes / ge->dim[2];
+            const uint64_t pe_up   = ue->bytes / ue->dim[2];
+            const uint64_t pe_down = de->bytes / de->dim[2];
+            glm_cpu_shape eshape = *shape; eshape.ff_inter = ei;   /* SwiGLU over expert inter */
+            glm_moe_route_sigmoid(c->idx, c->w, (const float *)tensor_data(m, ginp),
+                                  xn, (const float *)tensor_data(m, bias_t),
+                                  shape, c->router_scratch);
+            for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] = 0.0f;
+            for (uint32_t k = 0; k < K; k++) {
+                const uint32_t e = (uint32_t)c->idx[k];
+                glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
+                glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
+                glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
+                glm_swiglu_dense_f32(etmp, xn, c->fgate, c->fup, c->fdown, &eshape, c->sg, c->su);
+                if (il == 3 && pos == 0 && getenv("DS4_GLM_EXP_PEREXP")) {
+                    double er = 0; for (uint32_t d = 0; d < H; d++) er += (double)etmp[d]*etmp[d];
+                    fprintf(stderr, "  exp k=%u e=%u w=%.5f outrms=%.6f\n", k, e, c->w[k], sqrt(er/H));
+                }
+                const float wk = c->w[k];
+                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
+            }
+            if (il == 3 && pos == 0 && getenv("DS4_GLM_ROUTED3_OUT")) {
+                FILE *rf = fopen(getenv("DS4_GLM_ROUTED3_OUT"), "wb");
+                if (rf) { fwrite(ffn_out, sizeof(float), H, rf); fclose(rf); }
+            }
+            /* shared expert added directly (weight 1.0, DeepSeek/GLM convention) */
+            glm_dequant_weight(m, gsh, c->fgate);
+            glm_dequant_weight(m, ush, c->fup);
+            glm_dequant_weight(m, dsh, c->fdown);
+            glm_swiglu_dense_f32(etmp, xn, c->fgate, c->fup, c->fdown, &eshape, c->sg, c->su);
+            for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
+        }
+        if (il == 3 && pos == 0 && getenv("DS4_GLM_FFN3_OUT")) {
+            FILE *ff = fopen(getenv("DS4_GLM_FFN3_OUT"), "wb");
+            if (ff) { fwrite(ffn_out, sizeof(float), H, ff); fclose(ff); }
+        }
+        if (il == 3 && pos == 0 && getenv("DS4_GLM_ATTN3_OUT")) {
+            FILE *af = fopen(getenv("DS4_GLM_ATTN3_OUT"), "wb");
+            if (af) { fwrite(mla_out, sizeof(float), H, af); fclose(af); }
+        }
+        for (uint32_t d = 0; d < H; d++) x[d] = res[d] + ffn_out[d];
+        if (want_logits && getenv("DS4_GLM_LAYER_DIR")) {
+            char lp[512];
+            snprintf(lp, sizeof(lp), "%s/ds4_layer_%u.bin", getenv("DS4_GLM_LAYER_DIR"), il);
+            FILE *lf = fopen(lp, "wb");
+            if (lf) { fwrite(x, sizeof(float), H, lf); fclose(lf); }
+        }
+        if (glm_fwd_progress && prog_every && (il + 1) % prog_every == 0)
+            fprintf(stderr, "ds4: glm-cpu-ref: token %u/%u layer %u/%u\r",
+                    pos + 1, c->seq_n, il + 1, n_layer);
+    }
+
+    /* Output norm + LM head -> logits (only when requested for this pos). */
+    if (want_logits) {
+        glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, c->t_onorm), H, eps);
+        for (uint32_t v = 0; v < c->vocab; v++) {
+            glm_dequant_count(m, c->t_out, (uint64_t)v * c->out_row_bytes, H, c->logits_row);
+            float s = 0.0f;
+            for (uint32_t d = 0; d < H; d++) s += c->logits_row[d] * xn[d];
+            logits[v] = s;
+        }
+    }
+}
+
+/* One-shot forward over a fixed prompt: prefill [0..n_tokens-1], compute logits
+ * at the last position.  Thin wrapper over the persistent ctx so the validated
+ * single-shot oracle (ds4_engine_glm_cpu_ref / --glm-cpu-ref-components) shares
+ * the EXACT same per-token step as the incremental generation path. */
 static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
                             uint32_t n_layer, uint32_t n_dense,
                             const int *tokens, uint32_t n_tokens,
                             float *logits) {
-    const uint32_t H = shape->hidden, nh = shape->n_head, ql = shape->q_lora;
-    const uint32_t kvl = shape->kv_lora, nope = shape->qk_nope, rope = shape->qk_rope;
-    const uint32_t vd = shape->v_dim, E = shape->n_expert, K = shape->n_expert_used;
-    const float eps = shape->rms_eps;
-
-    const ds4_tensor *t_embd = model_find_tensor(m, "token_embd.weight");
-    const ds4_tensor *t_out  = model_find_tensor(m, "output.weight");
-    const ds4_tensor *t_onorm= model_find_tensor(m, "output_norm.weight");
-    if (!t_embd || !t_out || !t_onorm) ds4_die("glm-cpu-ref: missing global tensor");
-    const uint32_t vocab = (uint32_t)t_out->dim[1];
-    const uint64_t embd_row_bytes = t_embd->bytes / t_embd->dim[1];
-    const uint64_t out_row_bytes  = t_out->bytes  / t_out->dim[1];
-
-    /* MLA weight scratch (dequanted per layer, reused across layers). */
-    float *WqA = xmalloc((size_t)ql * H * sizeof(float));
-    float *WqB = xmalloc((size_t)nh * (nope + rope) * ql * sizeof(float));
-    float *WkvA= xmalloc((size_t)(kvl + rope) * H * sizeof(float));
-    float *WkBn= xmalloc((size_t)nh * nope * kvl * sizeof(float));   /* native k_b  */
-    float *WkB = xmalloc((size_t)nh * nope * kvl * sizeof(float));   /* reordered   */
-    float *WvB = xmalloc((size_t)nh * vd * kvl * sizeof(float));
-    float *Wo  = xmalloc((size_t)H * nh * vd * sizeof(float));
-    /* FFN scratch sized for the dense intermediate (>= expert intermediate). */
-    const uint32_t max_inter = shape->ff_inter;
-    float *fgate = xmalloc((size_t)max_inter * H * sizeof(float));
-    float *fup   = xmalloc((size_t)max_inter * H * sizeof(float));
-    float *fdown = xmalloc((size_t)H * max_inter * sizeof(float));
-    float *sg = xmalloc((size_t)max_inter * sizeof(float));
-    float *su = xmalloc((size_t)max_inter * sizeof(float));
-    float *x = xmalloc((size_t)H * sizeof(float));
-    float *xn= xmalloc((size_t)H * sizeof(float));
-    float *res = xmalloc((size_t)H * sizeof(float));
-    float *mla_out = xmalloc((size_t)H * sizeof(float));
-    float *ffn_out = xmalloc((size_t)H * sizeof(float));
-    float *etmp = xmalloc((size_t)H * sizeof(float));
-    float *router_scratch = xmalloc((size_t)E * sizeof(float));
-    int *idx = xmalloc((size_t)K * sizeof(int));
-    float *w = xmalloc((size_t)K * sizeof(float));
-    float *logits_row = xmalloc((size_t)H * sizeof(float));
-
-    /* Per-layer KV caches: [n_head, seq_n, dim] row-major, one set per layer. */
-    const size_t k_nope_bytes = (size_t)nh * n_tokens * nope * sizeof(float);
-    const size_t v_bytes      = (size_t)nh * n_tokens * vd * sizeof(float);
-    const size_t k_rope_bytes = (size_t)nh * n_tokens * rope * sizeof(float);
-    float **Knope = xmalloc((size_t)n_layer * sizeof(float *));
-    float **Vc    = xmalloc((size_t)n_layer * sizeof(float *));
-    float **Krop  = xmalloc((size_t)n_layer * sizeof(float *));
-    for (uint32_t l = 0; l < n_layer; l++) {
-        Knope[l] = xmalloc(k_nope_bytes);
-        Vc[l]    = xmalloc(v_bytes);
-        Krop[l]  = xmalloc(k_rope_bytes);
-    }
-
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        /* Embedding lookup: dequant the single token's hidden row. */
-        /* Embedding lookup: dequant the single token's hidden row. */
-        glm_dequant_count(m, t_embd, (uint64_t)tokens[t] * embd_row_bytes,
-                          H, x);
-        const uint32_t prog_every = n_layer > 8 ? n_layer / 8 : 0;
-
-        for (uint32_t il = 0; il < n_layer; il++) {
-            /* ---- attention block ---- */
-            memcpy(res, x, (size_t)H * sizeof(float));
-            const ds4_tensor *anorm_t = glm_layer_tensor(m, il, "attn_norm");
-            glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, anorm_t), H, eps);
-            const ds4_tensor *q_a  = glm_layer_tensor(m, il, "attn_q_a");
-            const ds4_tensor *q_b  = glm_layer_tensor(m, il, "attn_q_b");
-            const ds4_tensor *kv_a = glm_layer_tensor(m, il, "attn_kv_a_mqa");
-            const ds4_tensor *k_b  = glm_layer_tensor(m, il, "attn_k_b");
-            const ds4_tensor *v_b  = glm_layer_tensor(m, il, "attn_v_b");
-            const ds4_tensor *wop  = glm_layer_tensor(m, il, "attn_output");
-            if (!q_a || !q_b || !kv_a || !k_b || !v_b || !wop)
-                ds4_die("glm-cpu-ref: missing attention tensor");
-            glm_dequant_weight(m, q_a, WqA);
-            glm_dequant_weight(m, q_b, WqB);
-            glm_dequant_weight(m, kv_a, WkvA);
-            glm_dequant_weight(m, k_b, WkBn);
-            glm_k_b_reorder(WkB, WkBn, nope, kvl, nh);   /* real k_b is nope-contiguous */
-            glm_dequant_weight(m, v_b, WvB);
-            glm_dequant_weight(m, wop, Wo);
-            const float *qa_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_q_a_norm"));
-            const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
-            glm_mla_forward_token_f32(mla_out, xn, WqA, WqB, WkvA, WkB, WvB, Wo,
-                                      qa_norm, kv_norm,
-                                      Knope[il], Vc[il], Krop[il],
-                                      n_tokens, t, shape, NULL);
-            for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
-
-            /* ---- FFN block ---- */
-            memcpy(res, x, (size_t)H * sizeof(float));
-            const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
-            glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, fnorm_t), H, eps);
-            if (il == 3 && t == 0 && getenv("DS4_GLM_XN3_OUT")) {
-                FILE *xf = fopen(getenv("DS4_GLM_XN3_OUT"), "wb");
-                if (xf) { fwrite(xn, sizeof(float), H, xf); fclose(xf); }
-            }
-            if (il < n_dense) {
-                /* Dense SwiGLU FFN (blk.0..n_dense-1). */
-                const ds4_tensor *g = glm_layer_tensor(m, il, "ffn_gate");
-                const ds4_tensor *u = glm_layer_tensor(m, il, "ffn_up");
-                const ds4_tensor *d = glm_layer_tensor(m, il, "ffn_down");
-                if (!g || !u || !d) ds4_die("glm-cpu-ref: missing dense FFN tensor");
-                glm_dequant_weight(m, g, fgate);
-                glm_dequant_weight(m, u, fup);
-                glm_dequant_weight(m, d, fdown);
-                glm_swiglu_dense_f32(ffn_out, xn, fgate, fup, fdown, shape, sg, su);
-            } else {
-                /* Sigmoid MoE: route -> top-K -> dequant selected experts on
-                 * demand -> weighted sum + shared expert (weight 1.0). */
-                const ds4_tensor *ge  = glm_layer_tensor(m, il, "ffn_gate_exps");
-                const ds4_tensor *ue  = glm_layer_tensor(m, il, "ffn_up_exps");
-                const ds4_tensor *de  = glm_layer_tensor(m, il, "ffn_down_exps");
-                const ds4_tensor *ginp= glm_layer_tensor(m, il, "ffn_gate_inp");
-                const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
-                const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
-                const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
-                char bias_name[64];
-                snprintf(bias_name, sizeof(bias_name), "blk.%u.exp_probs_b.bias", il);
-                const ds4_tensor *bias_t = model_find_tensor(m, bias_name);
-                if (!ge || !ue || !de || !ginp || !gsh || !ush || !dsh || !bias_t)
-                    ds4_die("glm-cpu-ref: missing MoE tensor");
-                const uint32_t ei = (uint32_t)ge->dim[1];             /* expert inter (2048) */
-                const uint64_t pe_gate = ge->bytes / ge->dim[2];
-                const uint64_t pe_up   = ue->bytes / ue->dim[2];
-                const uint64_t pe_down = de->bytes / de->dim[2];
-                glm_cpu_shape eshape = *shape; eshape.ff_inter = ei;   /* SwiGLU over expert inter */
-                glm_moe_route_sigmoid(idx, w, (const float *)tensor_data(m, ginp),
-                                      xn, (const float *)tensor_data(m, bias_t),
-                                      shape, router_scratch);
-                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] = 0.0f;
-                for (uint32_t k = 0; k < K; k++) {
-                    const uint32_t e = (uint32_t)idx[k];
-                    glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, fgate);
-                    glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, fup);
-                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, fdown);
-                    glm_swiglu_dense_f32(etmp, xn, fgate, fup, fdown, &eshape, sg, su);
-                    if (il == 3 && t == 0 && getenv("DS4_GLM_EXP_PEREXP")) {
-                        double er = 0; for (uint32_t d = 0; d < H; d++) er += (double)etmp[d]*etmp[d];
-                        fprintf(stderr, "  exp k=%u e=%u w=%.5f outrms=%.6f\n", k, e, w[k], sqrt(er/H));
-                    }
-                    const float wk = w[k];
-                    for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
-                }
-                if (il == 3 && t == 0 && getenv("DS4_GLM_ROUTED3_OUT")) {
-                    FILE *rf = fopen(getenv("DS4_GLM_ROUTED3_OUT"), "wb");
-                    if (rf) { fwrite(ffn_out, sizeof(float), H, rf); fclose(rf); }
-                }
-                /* shared expert added directly (weight 1.0, DeepSeek/GLM convention) */
-                glm_dequant_weight(m, gsh, fgate);
-                glm_dequant_weight(m, ush, fup);
-                glm_dequant_weight(m, dsh, fdown);
-                glm_swiglu_dense_f32(etmp, xn, fgate, fup, fdown, &eshape, sg, su);
-                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
-            }
-            if (il == 3 && t == 0 && getenv("DS4_GLM_FFN3_OUT")) {
-                FILE *ff = fopen(getenv("DS4_GLM_FFN3_OUT"), "wb");
-                if (ff) { fwrite(ffn_out, sizeof(float), H, ff); fclose(ff); }
-            }
-            if (il == 3 && t == 0 && getenv("DS4_GLM_ATTN3_OUT")) {
-                FILE *af = fopen(getenv("DS4_GLM_ATTN3_OUT"), "wb");
-                if (af) { fwrite(mla_out, sizeof(float), H, af); fclose(af); }
-            }
-            for (uint32_t d = 0; d < H; d++) x[d] = res[d] + ffn_out[d];
-            if (t == n_tokens - 1 && getenv("DS4_GLM_LAYER_DIR")) {
-                char lp[512];
-                snprintf(lp, sizeof(lp), "%s/ds4_layer_%u.bin", getenv("DS4_GLM_LAYER_DIR"), il);
-                FILE *lf = fopen(lp, "wb");
-                if (lf) { fwrite(x, sizeof(float), H, lf); fclose(lf); }
-            }
-            if (prog_every && (il + 1) % prog_every == 0)
-                fprintf(stderr, "ds4: glm-cpu-ref: token %u/%u layer %u/%u\r",
-                        t + 1, n_tokens, il + 1, n_layer);
-        }
-
-        /* After the final prompt position: output norm + LM head -> logits. */
-        if (t == n_tokens - 1) {
-            glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, t_onorm), H, eps);
-            for (uint32_t v = 0; v < vocab; v++) {
-                glm_dequant_count(m, t_out, (uint64_t)v * out_row_bytes, H, logits_row);
-                float s = 0.0f;
-                for (uint32_t d = 0; d < H; d++) s += logits_row[d] * xn[d];
-                logits[v] = s;
-            }
-        }
-    }
-
-    for (uint32_t l = 0; l < n_layer; l++) { free(Knope[l]); free(Vc[l]); free(Krop[l]); }
-    free(Knope); free(Vc); free(Krop);
-    free(WqA); free(WqB); free(WkvA); free(WkBn); free(WkB); free(WvB); free(Wo);
-    free(fgate); free(fup); free(fdown); free(sg); free(su);
-    free(x); free(xn); free(res); free(mla_out); free(ffn_out); free(etmp);
-    free(router_scratch); free(idx); free(w); free(logits_row);
+    glm_cpu_fwd_ctx c;
+    glm_cpu_fwd_init(&c, m, shape, n_layer, n_dense, n_tokens);
+    for (uint32_t t = 0; t < n_tokens; t++)
+        glm_cpu_fwd_step(&c, tokens[t], t, t + 1 == n_tokens, logits);
+    glm_cpu_fwd_free(&c);
 }
 
 void ds4_glm_cpu_forward_UNUSED(void) {}  /* placeholder removed below */
@@ -27679,202 +27743,263 @@ static bool glm_lm_head_metal(const ds4_model *m,
 /* Core Metal forward.  Same tensor binding/dequant/KV-cache growth as
  * glm_cpu_forward; the validated kernels replace the leaf math.  Returns true
  * on success.  seq_n = n_tokens (the caches are sized to the prompt length). */
-static bool glm_metal_forward(const ds4_model *m, const glm_cpu_shape *shape,
-                              uint32_t n_layer, uint32_t n_dense,
-                              const int *tokens, uint32_t n_tokens,
-                              float *logits) {
+/* Phase 4e: persistent Metal forward context (mirrors glm_cpu_fwd_ctx).
+ * Holds all dequant weight scratch + Metal MLA decode scratch + MoE router
+ * scratch + LM-head chunk scratch + per-layer host-side KV caches sized to
+ * `seq_n` (capacity/stride).  One step per token appends to the growing caches;
+ * the caches persist across steps so prefill + decode reuse prior KV
+ * (incremental).  The per-step body mirrors the original monolithic
+ * glm_metal_forward token loop exactly; only the cache stride is seq_n
+ * (capacity) so it persists + grows. */
+typedef struct {
+    const ds4_model    *m;
+    const glm_cpu_shape *shape;
+    uint32_t  n_layer, n_dense, seq_n;
+    uint32_t  H, nh, kvl, nope, rope, vd, qhd, E, K;
+    /* MLA weight scratch (dequanted per layer, reused). */
+    float *WqA, *WqB, *WkvA, *WkBn, *WkB, *WvB, *Wo;
+    /* FFN scratch. */
+    float *fgate, *fup, *fdown, *sg, *su;
+    /* Activation + residual stream. */
+    float *x, *xn, *res, *mla_out, *ffn_out, *etmp;
+    /* MLA decode scratch (reused across layers/tokens). */
+    float *wqa, *wqa_n, *q_flat, *kva, *kvln, *k_nope, *vv, *qrope, *krope;
+    float *attn_o, *Q_comb;
+    /* MoE router scratch. */
+    float *router_gate;   /* [E,H] F32 */
+    float *moe_logits;
+    int *idx; float *w;
+    /* LM head chunked scratch. */
+    float *chunk_w, *chunk_logits;
+    uint32_t chunk_rows;
+    /* Per-layer host-side KV caches: [n_layer] of [nh, seq_n, dim] row-major. */
+    float **Knope, **Vc, **Krop;
+    /* Cached global tensors. */
+    const ds4_tensor *t_embd, *t_out, *t_onorm;
+    uint64_t embd_row_bytes;
+    uint32_t vocab;
+} glm_metal_fwd_ctx;
+
+static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
+                               const glm_cpu_shape *shape,
+                               uint32_t n_layer, uint32_t n_dense,
+                               uint32_t seq_n) {
+    memset(c, 0, sizeof(*c));
+    c->m = m; c->shape = shape; c->n_layer = n_layer; c->n_dense = n_dense;
+    c->seq_n = seq_n;
     const uint32_t H = shape->hidden, nh = shape->n_head, ql = shape->q_lora;
     const uint32_t kvl = shape->kv_lora, nope = shape->qk_nope, rope = shape->qk_rope;
     const uint32_t vd = shape->v_dim, qhd = nope + rope;
     const uint32_t E = shape->n_expert, K = shape->n_expert_used;
-    const uint32_t seq_n = n_tokens;
+    c->H=H; c->nh=nh; c->kvl=kvl; c->nope=nope; c->rope=rope; c->vd=vd; c->qhd=qhd;
+    c->E=E; c->K=K;
 
-    const ds4_tensor *t_embd = model_find_tensor(m, "token_embd.weight");
-    const ds4_tensor *t_out  = model_find_tensor(m, "output.weight");
-    const ds4_tensor *t_onorm= model_find_tensor(m, "output_norm.weight");
-    if (!t_embd || !t_out || !t_onorm) ds4_die("glm-metal-ref: missing global tensor");
-    const uint32_t vocab = (uint32_t)t_out->dim[1];
-    const uint64_t embd_row_bytes = t_embd->bytes / t_embd->dim[1];
+    c->t_embd = model_find_tensor(m, "token_embd.weight");
+    c->t_out  = model_find_tensor(m, "output.weight");
+    c->t_onorm= model_find_tensor(m, "output_norm.weight");
+    if (!c->t_embd || !c->t_out || !c->t_onorm) ds4_die("glm-metal-ref: missing global tensor");
+    c->vocab = (uint32_t)c->t_out->dim[1];
+    c->embd_row_bytes = c->t_embd->bytes / c->t_embd->dim[1];
 
-    /* MLA weight scratch (dequanted per layer, reused). */
-    float *WqA = xmalloc((size_t)ql * H * sizeof(float));
-    float *WqB = xmalloc((size_t)nh * qhd * ql * sizeof(float));
-    float *WkvA= xmalloc((size_t)(kvl + rope) * H * sizeof(float));
-    float *WkBn= xmalloc((size_t)nh * nope * kvl * sizeof(float));   /* native k_b */
-    float *WkB = xmalloc((size_t)nh * nope * kvl * sizeof(float));   /* reordered */
-    float *WvB = xmalloc((size_t)nh * vd * kvl * sizeof(float));
-    float *Wo  = xmalloc((size_t)H * nh * vd * sizeof(float));
-    /* FFN scratch sized for the dense intermediate (>= expert intermediate). */
+    c->WqA = xmalloc((size_t)ql * H * sizeof(float));
+    c->WqB = xmalloc((size_t)nh * qhd * ql * sizeof(float));
+    c->WkvA= xmalloc((size_t)(kvl + rope) * H * sizeof(float));
+    c->WkBn= xmalloc((size_t)nh * nope * kvl * sizeof(float));
+    c->WkB = xmalloc((size_t)nh * nope * kvl * sizeof(float));
+    c->WvB = xmalloc((size_t)nh * vd * kvl * sizeof(float));
+    c->Wo  = xmalloc((size_t)H * nh * vd * sizeof(float));
     const uint32_t max_inter = shape->ff_inter;
-    float *fgate = xmalloc((size_t)max_inter * H * sizeof(float));
-    float *fup   = xmalloc((size_t)max_inter * H * sizeof(float));
-    float *fdown = xmalloc((size_t)H * max_inter * sizeof(float));
-    float *sg = xmalloc((size_t)max_inter * sizeof(float));
-    float *su = xmalloc((size_t)max_inter * sizeof(float));
-    /* Activation buffers + residual stream. */
-    float *x = xmalloc((size_t)H * sizeof(float));
-    float *xn= xmalloc((size_t)H * sizeof(float));
-    float *res = xmalloc((size_t)H * sizeof(float));
-    float *mla_out = xmalloc((size_t)H * sizeof(float));
-    float *ffn_out = xmalloc((size_t)H * sizeof(float));
-    float *etmp = xmalloc((size_t)H * sizeof(float));
-    /* MLA decode scratch (reused across layers/tokens). */
-    float *wqa = xmalloc((size_t)ql * sizeof(float));
-    float *wqa_n = xmalloc((size_t)ql * sizeof(float));
-    float *q_flat = xmalloc((size_t)nh * qhd * sizeof(float));
-    float *kva = xmalloc((size_t)(kvl + rope) * sizeof(float));
-    float *kvln = xmalloc((size_t)kvl * sizeof(float));
-    float *k_nope = xmalloc((size_t)nh * nope * sizeof(float));
-    float *vv = xmalloc((size_t)nh * vd * sizeof(float));
-    float *qrope = xmalloc((size_t)nh * rope * sizeof(float));
-    float *krope = xmalloc((size_t)nh * rope * sizeof(float));
-    float *attn_o = xmalloc((size_t)nh * vd * sizeof(float));
-    float *Q_comb = xmalloc((size_t)nh * qhd * sizeof(float));
-    /* MoE router scratch. */
-    float *router_gate = xmalloc((size_t)E * H * sizeof(float));   /* [E,H] F32 */
-    float *moe_logits = xmalloc((size_t)E * sizeof(float));
-    int *idx = xmalloc((size_t)K * sizeof(int));
-    float *w = xmalloc((size_t)K * sizeof(float));
-    /* LM head chunked scratch. */
-    const uint32_t chunk_rows = 8192;
-    float *chunk_w = xmalloc((size_t)chunk_rows * H * sizeof(float));
-    float *chunk_logits = xmalloc((size_t)chunk_rows * sizeof(float));
+    c->fgate = xmalloc((size_t)max_inter * H * sizeof(float));
+    c->fup   = xmalloc((size_t)max_inter * H * sizeof(float));
+    c->fdown = xmalloc((size_t)H * max_inter * sizeof(float));
+    c->sg = xmalloc((size_t)max_inter * sizeof(float));
+    c->su = xmalloc((size_t)max_inter * sizeof(float));
+    c->x = xmalloc((size_t)H * sizeof(float));
+    c->xn= xmalloc((size_t)H * sizeof(float));
+    c->res = xmalloc((size_t)H * sizeof(float));
+    c->mla_out = xmalloc((size_t)H * sizeof(float));
+    c->ffn_out = xmalloc((size_t)H * sizeof(float));
+    c->etmp = xmalloc((size_t)H * sizeof(float));
+    c->wqa = xmalloc((size_t)ql * sizeof(float));
+    c->wqa_n = xmalloc((size_t)ql * sizeof(float));
+    c->q_flat = xmalloc((size_t)nh * qhd * sizeof(float));
+    c->kva = xmalloc((size_t)(kvl + rope) * sizeof(float));
+    c->kvln = xmalloc((size_t)kvl * sizeof(float));
+    c->k_nope = xmalloc((size_t)nh * nope * sizeof(float));
+    c->vv = xmalloc((size_t)nh * vd * sizeof(float));
+    c->qrope = xmalloc((size_t)nh * rope * sizeof(float));
+    c->krope = xmalloc((size_t)nh * rope * sizeof(float));
+    c->attn_o = xmalloc((size_t)nh * vd * sizeof(float));
+    c->Q_comb = xmalloc((size_t)nh * qhd * sizeof(float));
+    c->router_gate = xmalloc((size_t)E * H * sizeof(float));
+    c->moe_logits = xmalloc((size_t)E * sizeof(float));
+    c->idx = xmalloc((size_t)K * sizeof(int));
+    c->w = xmalloc((size_t)K * sizeof(float));
+    c->chunk_rows = 8192;
+    c->chunk_w = xmalloc((size_t)c->chunk_rows * H * sizeof(float));
+    c->chunk_logits = xmalloc((size_t)c->chunk_rows * sizeof(float));
 
-    /* Per-layer host-side KV caches: [nh, seq_n, dim] row-major. */
     const size_t k_nope_bytes = (size_t)nh * seq_n * nope * sizeof(float);
     const size_t v_bytes      = (size_t)nh * seq_n * vd * sizeof(float);
     const size_t k_rope_bytes = (size_t)nh * seq_n * rope * sizeof(float);
-    float **Knope = xmalloc((size_t)n_layer * sizeof(float *));
-    float **Vc    = xmalloc((size_t)n_layer * sizeof(float *));
-    float **Krop  = xmalloc((size_t)n_layer * sizeof(float *));
+    c->Knope = xmalloc((size_t)n_layer * sizeof(float *));
+    c->Vc    = xmalloc((size_t)n_layer * sizeof(float *));
+    c->Krop  = xmalloc((size_t)n_layer * sizeof(float *));
     for (uint32_t l = 0; l < n_layer; l++) {
-        Knope[l] = xmalloc(k_nope_bytes);
-        Vc[l]    = xmalloc(v_bytes);
-        Krop[l]  = xmalloc(k_rope_bytes);
+        c->Knope[l] = xmalloc(k_nope_bytes);
+        c->Vc[l]    = xmalloc(v_bytes);
+        c->Krop[l]  = xmalloc(k_rope_bytes);
     }
+    return true;
+}
 
-    bool ok = true;
+static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
+    for (uint32_t l = 0; l < c->n_layer; l++) { free(c->Knope[l]); free(c->Vc[l]); free(c->Krop[l]); }
+    free(c->Knope); free(c->Vc); free(c->Krop);
+    free(c->WqA); free(c->WqB); free(c->WkvA); free(c->WkBn); free(c->WkB); free(c->WvB); free(c->Wo);
+    free(c->fgate); free(c->fup); free(c->fdown); free(c->sg); free(c->su);
+    free(c->x); free(c->xn); free(c->res); free(c->mla_out); free(c->ffn_out); free(c->etmp);
+    free(c->wqa); free(c->wqa_n); free(c->q_flat); free(c->kva); free(c->kvln);
+    free(c->k_nope); free(c->vv); free(c->qrope); free(c->krope); free(c->attn_o); free(c->Q_comb);
+    free(c->router_gate); free(c->moe_logits); free(c->idx); free(c->w);
+    free(c->chunk_w); free(c->chunk_logits);
+}
+
+/* Process ONE token at sequence position `pos` on Metal, appending its K/V to
+ * the persistent caches.  When want_logits, run output_norm + LM head.  Mirrors
+ * the original monolithic glm_metal_forward per-token body exactly; returns
+ * false on any kernel failure. */
+static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
+                               bool want_logits, float *logits) {
+    const ds4_model *m = c->m;
+    const glm_cpu_shape *shape = c->shape;
+    const uint32_t H=c->H, nh=c->nh, kvl=c->kvl, nope=c->nope;
+    const uint32_t n_layer=c->n_layer, n_dense=c->n_dense, K=c->K;
+    float *x=c->x, *xn=c->xn, *res=c->res, *mla_out=c->mla_out;
+    float *ffn_out=c->ffn_out, *etmp=c->etmp;
+
+    glm_dequant_count(m, c->t_embd, (uint64_t)token * c->embd_row_bytes, H, x);
+
     const uint32_t prog_every = n_layer > 8 ? n_layer / 8 : 0;
-    for (uint32_t t = 0; t < n_tokens && ok; t++) {
-        glm_dequant_count(m, t_embd, (uint64_t)tokens[t] * embd_row_bytes, H, x);
+    for (uint32_t il = 0; il < n_layer; il++) {
+        /* ---- attention block ---- */
+        memcpy(res, x, (size_t)H * sizeof(float));
+        const ds4_tensor *anorm_t = glm_layer_tensor(m, il, "attn_norm");
+        if (!ds4_gpu_glm_rmsnorm_f32(x, (const float *)tensor_data(m, anorm_t), xn, H, shape->rms_eps))
+            return false;
+        const ds4_tensor *q_a  = glm_layer_tensor(m, il, "attn_q_a");
+        const ds4_tensor *q_b  = glm_layer_tensor(m, il, "attn_q_b");
+        const ds4_tensor *kv_a = glm_layer_tensor(m, il, "attn_kv_a_mqa");
+        const ds4_tensor *k_b  = glm_layer_tensor(m, il, "attn_k_b");
+        const ds4_tensor *v_b  = glm_layer_tensor(m, il, "attn_v_b");
+        const ds4_tensor *wop  = glm_layer_tensor(m, il, "attn_output");
+        if (!q_a || !q_b || !kv_a || !k_b || !v_b || !wop)
+            ds4_die("glm-metal-ref: missing attention tensor");
+        glm_dequant_weight(m, q_a, c->WqA);
+        glm_dequant_weight(m, q_b, c->WqB);
+        glm_dequant_weight(m, kv_a, c->WkvA);
+        glm_dequant_weight(m, k_b, c->WkBn);
+        glm_k_b_reorder(c->WkB, c->WkBn, nope, kvl, nh);   /* real k_b is nope-contiguous */
+        glm_dequant_weight(m, v_b, c->WvB);
+        glm_dequant_weight(m, wop, c->Wo);
+        const float *qa_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_q_a_norm"));
+        const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
+        if (!glm_mla_forward_token_metal(xn, c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, c->Wo,
+                                         qa_norm, kv_norm,
+                                         c->Knope[il], c->Vc[il], c->Krop[il],
+                                         c->seq_n, pos, shape, mla_out,
+                                         c->wqa, c->wqa_n, c->q_flat, c->kva, c->kvln,
+                                         c->k_nope, c->vv, c->qrope, c->krope, c->attn_o, c->Q_comb))
+            return false;
+        for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
 
-        for (uint32_t il = 0; il < n_layer && ok; il++) {
-            /* ---- attention block ---- */
-            memcpy(res, x, (size_t)H * sizeof(float));
-            const ds4_tensor *anorm_t = glm_layer_tensor(m, il, "attn_norm");
-            if (!ds4_gpu_glm_rmsnorm_f32(x, (const float *)tensor_data(m, anorm_t), xn, H, shape->rms_eps)) {
-                ok = false; break;
+        /* ---- FFN block ---- */
+        memcpy(res, x, (size_t)H * sizeof(float));
+        const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
+        if (!ds4_gpu_glm_rmsnorm_f32(x, (const float *)tensor_data(m, fnorm_t), xn, H, shape->rms_eps))
+            return false;
+        if (il < n_dense) {
+            const ds4_tensor *g = glm_layer_tensor(m, il, "ffn_gate");
+            const ds4_tensor *u = glm_layer_tensor(m, il, "ffn_up");
+            const ds4_tensor *d = glm_layer_tensor(m, il, "ffn_down");
+            if (!g || !u || !d) ds4_die("glm-metal-ref: missing dense FFN tensor");
+            glm_dequant_weight(m, g, c->fgate);
+            glm_dequant_weight(m, u, c->fup);
+            glm_dequant_weight(m, d, c->fdown);
+            if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, shape->ff_inter, ffn_out, c->sg, c->su))
+                return false;
+        } else {
+            /* Sigmoid MoE: route -> top-K -> dequant selected experts on
+             * demand -> weighted sum + shared expert (weight 1.0). */
+            const ds4_tensor *ge  = glm_layer_tensor(m, il, "ffn_gate_exps");
+            const ds4_tensor *ue  = glm_layer_tensor(m, il, "ffn_up_exps");
+            const ds4_tensor *de  = glm_layer_tensor(m, il, "ffn_down_exps");
+            const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
+            const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
+            const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
+            char bias_name[64];
+            snprintf(bias_name, sizeof(bias_name), "blk.%u.exp_probs_b.bias", il);
+            const ds4_tensor *bias_t = model_find_tensor(m, bias_name);
+            if (!ge || !ue || !de || !gsh || !ush || !dsh || !bias_t)
+                ds4_die("glm-metal-ref: missing MoE tensor");
+            const uint32_t ei = (uint32_t)ge->dim[1];             /* expert inter (2048) */
+            const uint64_t pe_gate = ge->bytes / ge->dim[2];
+            const uint64_t pe_up   = ue->bytes / ue->dim[2];
+            const uint64_t pe_down = de->bytes / de->dim[2];
+            const ds4_tensor *ginp = glm_layer_tensor(m, il, "ffn_gate_inp");
+            if (!ginp) ds4_die("glm-metal-ref: missing ffn_gate_inp");
+            glm_dequant_weight(m, ginp, c->router_gate);              /* [E,H] F32 */
+            if (!ds4_gpu_glm_matvec_f32(c->router_gate, xn, c->moe_logits, c->E, H)) return false;
+            if (!ds4_gpu_glm_moe_route_f32(c->moe_logits, (const float *)tensor_data(m, bias_t),
+                                           c->idx, c->w, c->E, K, shape->moe_scale)) return false;
+            for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] = 0.0f;
+            for (uint32_t k = 0; k < K; k++) {
+                const uint32_t e = (uint32_t)c->idx[k];
+                glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
+                glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
+                glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
+                if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
+                    return false;
+                const float wk = c->w[k];
+                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
             }
-            const ds4_tensor *q_a  = glm_layer_tensor(m, il, "attn_q_a");
-            const ds4_tensor *q_b  = glm_layer_tensor(m, il, "attn_q_b");
-            const ds4_tensor *kv_a = glm_layer_tensor(m, il, "attn_kv_a_mqa");
-            const ds4_tensor *k_b  = glm_layer_tensor(m, il, "attn_k_b");
-            const ds4_tensor *v_b  = glm_layer_tensor(m, il, "attn_v_b");
-            const ds4_tensor *wop  = glm_layer_tensor(m, il, "attn_output");
-            if (!q_a || !q_b || !kv_a || !k_b || !v_b || !wop)
-                ds4_die("glm-metal-ref: missing attention tensor");
-            glm_dequant_weight(m, q_a, WqA);
-            glm_dequant_weight(m, q_b, WqB);
-            glm_dequant_weight(m, kv_a, WkvA);
-            glm_dequant_weight(m, k_b, WkBn);
-            glm_k_b_reorder(WkB, WkBn, nope, kvl, nh);   /* real k_b is nope-contiguous */
-            glm_dequant_weight(m, v_b, WvB);
-            glm_dequant_weight(m, wop, Wo);
-            const float *qa_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_q_a_norm"));
-            const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
-            if (!glm_mla_forward_token_metal(xn, WqA, WqB, WkvA, WkB, WvB, Wo,
-                                             qa_norm, kv_norm,
-                                             Knope[il], Vc[il], Krop[il],
-                                             seq_n, t, shape, mla_out,
-                                             wqa, wqa_n, q_flat, kva, kvln,
-                                             k_nope, vv, qrope, krope, attn_o, Q_comb)) {
-                ok = false; break;
-            }
-            for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
-
-            /* ---- FFN block ---- */
-            memcpy(res, x, (size_t)H * sizeof(float));
-            const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
-            if (!ds4_gpu_glm_rmsnorm_f32(x, (const float *)tensor_data(m, fnorm_t), xn, H, shape->rms_eps)) {
-                ok = false; break;
-            }
-            if (il < n_dense) {
-                const ds4_tensor *g = glm_layer_tensor(m, il, "ffn_gate");
-                const ds4_tensor *u = glm_layer_tensor(m, il, "ffn_up");
-                const ds4_tensor *d = glm_layer_tensor(m, il, "ffn_down");
-                if (!g || !u || !d) ds4_die("glm-metal-ref: missing dense FFN tensor");
-                glm_dequant_weight(m, g, fgate);
-                glm_dequant_weight(m, u, fup);
-                glm_dequant_weight(m, d, fdown);
-                if (!glm_swiglu_metal(xn, fgate, fup, fdown, H, shape->ff_inter, ffn_out, sg, su)) {
-                    ok = false; break;
-                }
-            } else {
-                /* Sigmoid MoE: route -> top-K -> dequant selected experts on
-                 * demand -> weighted sum + shared expert (weight 1.0). */
-                const ds4_tensor *ge  = glm_layer_tensor(m, il, "ffn_gate_exps");
-                const ds4_tensor *ue  = glm_layer_tensor(m, il, "ffn_up_exps");
-                const ds4_tensor *de  = glm_layer_tensor(m, il, "ffn_down_exps");
-                const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
-                const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
-                const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
-                char bias_name[64];
-                snprintf(bias_name, sizeof(bias_name), "blk.%u.exp_probs_b.bias", il);
-                const ds4_tensor *bias_t = model_find_tensor(m, bias_name);
-                if (!ge || !ue || !de || !gsh || !ush || !dsh || !bias_t)
-                    ds4_die("glm-metal-ref: missing MoE tensor");
-                const uint32_t ei = (uint32_t)ge->dim[1];             /* expert inter (2048) */
-                const uint64_t pe_gate = ge->bytes / ge->dim[2];
-                const uint64_t pe_up   = ue->bytes / ue->dim[2];
-                const uint64_t pe_down = de->bytes / de->dim[2];
-                const ds4_tensor *ginp = glm_layer_tensor(m, il, "ffn_gate_inp");
-                if (!ginp) ds4_die("glm-metal-ref: missing ffn_gate_inp");
-                glm_dequant_weight(m, ginp, router_gate);              /* [E,H] F32 */
-                if (!ds4_gpu_glm_matvec_f32(router_gate, xn, moe_logits, E, H)) { ok = false; break; }
-                if (!ds4_gpu_glm_moe_route_f32(moe_logits, (const float *)tensor_data(m, bias_t),
-                                               idx, w, E, K, shape->moe_scale)) { ok = false; break; }
-                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] = 0.0f;
-                for (uint32_t k = 0; k < K && ok; k++) {
-                    const uint32_t e = (uint32_t)idx[k];
-                    glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, fgate);
-                    glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, fup);
-                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, fdown);
-                    if (!glm_swiglu_metal(xn, fgate, fup, fdown, H, ei, etmp, sg, su)) { ok = false; break; }
-                    const float wk = w[k];
-                    for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
-                }
-                if (!ok) break;
-                /* shared expert added directly (weight 1.0, DeepSeek/GLM convention). */
-                glm_dequant_weight(m, gsh, fgate);
-                glm_dequant_weight(m, ush, fup);
-                glm_dequant_weight(m, dsh, fdown);
-                if (!glm_swiglu_metal(xn, fgate, fup, fdown, H, ei, etmp, sg, su)) { ok = false; break; }
-                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
-            }
-            for (uint32_t d = 0; d < H; d++) x[d] = res[d] + ffn_out[d];
-            if (prog_every && (il + 1) % prog_every == 0)
-                fprintf(stderr, "ds4: glm-metal-ref: token %u/%u layer %u/%u\r",
-                        t + 1, n_tokens, il + 1, n_layer);
+            /* shared expert added directly (weight 1.0, DeepSeek/GLM convention). */
+            glm_dequant_weight(m, gsh, c->fgate);
+            glm_dequant_weight(m, ush, c->fup);
+            glm_dequant_weight(m, dsh, c->fdown);
+            if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
+                return false;
+            for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
         }
-
-        /* Final prompt position: output norm + LM head -> logits. */
-        if (ok && t == n_tokens - 1) {
-            if (!glm_lm_head_metal(m, x, (const float *)tensor_data(m, t_onorm),
-                                   t_out, vocab, shape, logits, xn,
-                                   chunk_w, chunk_logits, chunk_rows))
-                ok = false;
-        }
+        for (uint32_t d = 0; d < H; d++) x[d] = res[d] + ffn_out[d];
+        if (glm_fwd_progress && prog_every && (il + 1) % prog_every == 0)
+            fprintf(stderr, "ds4: glm-metal-ref: token %u/%u layer %u/%u\r",
+                    pos + 1, c->seq_n, il + 1, n_layer);
     }
 
-    for (uint32_t l = 0; l < n_layer; l++) { free(Knope[l]); free(Vc[l]); free(Krop[l]); }
-    free(Knope); free(Vc); free(Krop);
-    free(WqA); free(WqB); free(WkvA); free(WkBn); free(WkB); free(WvB); free(Wo);
-    free(fgate); free(fup); free(fdown); free(sg); free(su);
-    free(x); free(xn); free(res); free(mla_out); free(ffn_out); free(etmp);
-    free(wqa); free(wqa_n); free(q_flat); free(kva); free(kvln);
-    free(k_nope); free(vv); free(qrope); free(krope); free(attn_o); free(Q_comb);
-    free(router_gate); free(moe_logits); free(idx); free(w);
-    free(chunk_w); free(chunk_logits);
+    if (want_logits) {
+        if (!glm_lm_head_metal(m, x, (const float *)tensor_data(m, c->t_onorm),
+                               c->t_out, c->vocab, shape, logits, xn,
+                               c->chunk_w, c->chunk_logits, c->chunk_rows))
+            return false;
+    }
+    return true;
+}
+
+/* One-shot Metal forward over a fixed prompt: prefill [0..n_tokens-1], compute
+ * logits at the last position.  Thin wrapper over the persistent ctx so the
+ * validated single-shot Metal oracle (ds4_glm_metal_forward_synth) shares the
+ * EXACT same per-token step as the incremental generation path. */
+static bool glm_metal_forward(const ds4_model *m, const glm_cpu_shape *shape,
+                              uint32_t n_layer, uint32_t n_dense,
+                              const int *tokens, uint32_t n_tokens,
+                              float *logits) {
+    glm_metal_fwd_ctx c;
+    if (!glm_metal_fwd_init(&c, m, shape, n_layer, n_dense, n_tokens)) return false;
+    bool ok = true;
+    for (uint32_t t = 0; t < n_tokens && ok; t++)
+        ok = glm_metal_fwd_step(&c, tokens[t], t, t + 1 == n_tokens, logits);
+    glm_metal_fwd_free(&c);
     return ok;
 }
 
@@ -28122,6 +28247,269 @@ int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit, bool *out_fi
     return finite ? 0 : 1;
 }
 
+
+/* =======================================================================
+ * Phase 4e: incremental GLM-5.2 multi-token generation (--glm-chat).
+ *
+ * Builds the GLM chat template ([gMASK]<sop> + user + <|assistant|> + nothink
+ * <think></think>), prefills it, then greedily decodes n_predict tokens with the
+ * INCREMENTAL KV cache: each decode step appends ONE token's K/V at position
+ * `pos` and reuses all prior entries (constant per-token cost, not O(n^2)).
+ * The prefill + decode share the EXACT same per-token step as the validated
+ * single-shot forwards (glm_cpu_fwd_step / glm_metal_fwd_step), so the math is
+ * unchanged; only the cache now persists + grows.  Both backends must yield the
+ * identical greedy sequence.  Greedy output matches llama.cpp token-for-token.
+ * ======================================================================= */
+
+typedef bool (*glm_gen_step_fn)(void *ctx, int token, uint32_t pos,
+                                bool want_logits, float *logits);
+
+static bool glm_gen_cpu_step(void *ctx, int token, uint32_t pos,
+                             bool want_logits, float *logits) {
+    glm_cpu_fwd_step((glm_cpu_fwd_ctx *)ctx, token, pos, want_logits, logits);
+    return true;
+}
+#ifndef DS4_NO_GPU
+static bool glm_gen_metal_step(void *ctx, int token, uint32_t pos,
+                               bool want_logits, float *logits) {
+    return glm_metal_fwd_step((glm_metal_fwd_ctx *)ctx, token, pos, want_logits, logits);
+}
+#endif
+
+/* Shared greedy generation loop over a persistent ctx.  Prefills the prompt
+ * (logits at the last position), then autoregressively decodes: emit the
+ * argmax, stop at EOS / n_predict, feed it back at the next position.  The cache
+ * grows by one entry per decode step (incremental).  Prints generated text to
+ * `out` and reports prefill/decode timing + tok/s to stderr.  Returns 0 on
+ * success, 1 on a kernel/step failure. */
+static int glm_generate_loop(glm_gen_step_fn step, void *ctx,
+                             const int *prompt, uint32_t prompt_len,
+                             int n_predict, float *logits, uint32_t vocab,
+                             ds4_engine *e, int eos_id, FILE *out,
+                             int *out_generated, int *gen_ids_out,
+                             double *out_decode_s) {
+    const double pf0 = now_sec();
+    for (uint32_t t = 0; t < prompt_len; t++)
+        if (!step(ctx, prompt[t], t, t + 1 == prompt_len, logits)) return 1;
+    const double prefill_s = now_sec() - pf0;
+
+    int next = sample_argmax(logits, vocab);
+    uint32_t pos = prompt_len;
+    int generated = 0;
+    const double dec0 = now_sec();
+    for (int i = 0; i < n_predict; i++) {
+        if (next == eos_id) break;
+        if (gen_ids_out) gen_ids_out[generated] = next;
+        size_t plen = 0;
+        char *piece = ds4_token_text(e, next, &plen);
+        if (out) { fwrite(piece, 1, plen, out); fflush(out); }
+        free(piece);
+        generated++;
+        if (!step(ctx, next, pos, true, logits)) {
+            if (out_decode_s) *out_decode_s = now_sec() - dec0;
+            if (out_generated) *out_generated = generated;
+            return 1;
+        }
+        pos++;
+        next = sample_argmax(logits, vocab);
+    }
+    const double decode_s = now_sec() - dec0;
+    if (out_generated) *out_generated = generated;
+    if (out_decode_s) *out_decode_s = decode_s;
+    fprintf(stderr, "ds4: glm-chat: prefill %.2fs (%u tok), decode %d tok in %.2fs (%.2f tok/s)\n",
+            prefill_s, prompt_len, generated, decode_s,
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    return 0;
+}
+
+/* --glm-chat driver.  GLM-5.2 only; rejects non-glm-dsa models.  use_metal
+ * selects the backend; both reuse the validated per-token step so the greedy
+ * sequence is identical across backends. */
+int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
+                        int n_predict, bool use_metal) {
+    const ds4_model *m = &e->model;
+    const glm_cpu_shape shape = glm_cpu_shape_real();
+    uint32_t block_count = 0, nextn = 1, n_dense = 0;
+    if (!model_get_u32(m, "glm-dsa.block_count", &block_count) ||
+        !model_get_u32(m, "glm-dsa.nextn_predict_layers", &nextn) ||
+        !model_get_u32(m, "glm-dsa.leading_dense_block_count", &n_dense)) {
+        fprintf(stderr, "ds4: --glm-chat requires a GLM-5.2 (glm-dsa) model\n");
+        return 1;
+    }
+    const uint32_t n_layer = block_count >= nextn ? block_count - nextn : block_count;
+    if (n_layer == 0 || n_layer > 256) {
+        fprintf(stderr, "ds4: glm-chat: bad backbone layer count %u\n", n_layer);
+        return 1;
+    }
+    if (n_predict <= 0) n_predict = 64;
+
+    /* GLM chat template: [gMASK]<sop> + user prompt + <|assistant|> + nothink
+     * <think></think> so the model answers directly (no reasoning trace). */
+    token_vec chat = {0};
+    glm_encode_chat_prompt(&e->vocab, system ? system : "",
+                           prompt ? prompt : "", DS4_THINK_NONE, &chat);
+    if (chat.len <= 0) {
+        fprintf(stderr, "ds4: glm-chat: prompt tokenized to 0 tokens\n");
+        free(chat.v);
+        return 1;
+    }
+    const uint32_t prompt_len = (uint32_t)chat.len;
+
+    const ds4_tensor *t_out = model_find_tensor(m, "output.weight");
+    const uint32_t vocab = (uint32_t)t_out->dim[1];
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
+    /* KV capacity = prompt + generation + slack (one K/V per layer per slot). */
+    const uint32_t cap = prompt_len + (uint32_t)n_predict + 8;
+    const int eos_id = e->vocab.eos_id;
+
+    fprintf(stderr, "ds4: glm-chat: %u prompt tokens, decoding up to %d tokens "
+            "(cap %u), %u backbone layers (%s)\n",
+            prompt_len, n_predict, cap, n_layer, use_metal ? "metal" : "cpu");
+
+    /* Optional: dump the exact chat-templated prompt token ids so the
+     * llama.cpp greedy oracle can consume the IDENTICAL input sequence
+     * (DS4_GLM_CHAT_PROMPT_IDS_OUT=<path>). */
+    const char *ids_path = getenv("DS4_GLM_CHAT_PROMPT_IDS_OUT");
+    if (ids_path && ids_path[0]) {
+        FILE *f = fopen(ids_path, "w");
+        if (f) {
+            for (uint32_t i = 0; i < prompt_len; i++) fprintf(f, "%d\n", chat.v[i]);
+            fclose(f);
+            fprintf(stderr, "ds4: glm-chat: wrote %u prompt ids to %s\n", prompt_len, ids_path);
+        }
+    }
+
+    int generated = 0, rc = 1;
+    double decode_s = 0.0;
+    int *gen_ids = xmalloc((size_t)n_predict * sizeof(int));
+    glm_fwd_progress = false;   /* quiet the per-layer progress for chat output */
+    if (use_metal) {
+#ifndef DS4_NO_GPU
+        glm_metal_fwd_ctx mc;
+        if (glm_metal_fwd_init(&mc, m, &shape, n_layer, n_dense, cap)) {
+            rc = glm_generate_loop(glm_gen_metal_step, &mc, chat.v, prompt_len,
+                                   n_predict, logits, vocab, e, eos_id, stdout,
+                                   &generated, gen_ids, &decode_s);
+            glm_metal_fwd_free(&mc);
+        } else {
+            fprintf(stderr, "ds4: glm-chat: Metal context init failed\n");
+        }
+#else
+        fprintf(stderr, "ds4: glm-chat: Metal backend not built (CPU-only build); use --glm-chat-cpu\n");
+#endif
+    } else {
+        glm_cpu_fwd_ctx cc;
+        glm_cpu_fwd_init(&cc, m, &shape, n_layer, n_dense, cap);
+        rc = glm_generate_loop(glm_gen_cpu_step, &cc, chat.v, prompt_len,
+                               n_predict, logits, vocab, e, eos_id, stdout,
+                               &generated, gen_ids, &decode_s);
+        glm_cpu_fwd_free(&cc);
+    }
+    if (rc == 0) {
+        fprintf(stderr, "\nds4: glm-chat: generated %d tokens (%s)\n",
+                generated, use_metal ? "metal" : "cpu");
+        const char *gids = getenv("DS4_GLM_CHAT_GEN_IDS_OUT");
+        if (gids && gids[0]) {
+            FILE *gf = fopen(gids, "w");
+            if (gf) {
+                for (int i = 0; i < generated; i++) fprintf(gf, "%d\n", gen_ids[i]);
+                fclose(gf);
+                fprintf(stderr, "ds4: glm-chat: wrote %d generated ids to %s\n", generated, gids);
+            }
+        }
+    }
+
+    free(gen_ids);
+    free(logits);
+    free(chat.v);
+    return rc;
+}
+
+/* Phase 4e synth self-check: incremental generation must produce the SAME
+ * greedy argmax at every decode step as a fresh NAIVE full forward
+ * (glm_cpu_forward) over the growing prefix.  Pins that the incremental KV
+ * refactor (persistent ctx, growing pos over a capacity-sized cache) did not
+ * change the result vs the validated single-shot forward.  Returns 0 if all
+ * n_steps argmaxes match; *out_match = number that matched. */
+int ds4_glm_cpu_generate_synth(int n_steps, int *out_match) {
+    glm_synth_ctx sc;
+    glm_synth_build(&sc);
+    int prompt[3] = { 1, 5, 9 };
+    const uint32_t plen = 3;
+    const uint32_t cap = plen + (uint32_t)n_steps + 4;
+    glm_cpu_fwd_ctx c;
+    glm_cpu_fwd_init(&c, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap);
+    float *li = xmalloc((size_t)sc.vocab * sizeof(float));   /* incremental */
+    float *ln = xmalloc((size_t)sc.vocab * sizeof(float));   /* naive       */
+    int *prefix = xmalloc((size_t)cap * sizeof(int));
+    memcpy(prefix, prompt, plen * sizeof(int));
+    uint32_t preflen = plen;
+    for (uint32_t t = 0; t < plen; t++)
+        glm_cpu_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
+    int match = 0;
+    for (int s = 0; s < n_steps; s++) {
+        glm_cpu_forward(&sc.model, &sc.shape, sc.n_layer, sc.n_dense, prefix, preflen, ln);
+        int ai = sample_argmax(li, sc.vocab);
+        int an = sample_argmax(ln, sc.vocab);
+        if (ai != an) break;
+        match++;
+        prefix[preflen] = ai;
+        glm_cpu_fwd_step(&c, ai, preflen, true, li);
+        preflen++;
+    }
+    if (out_match) *out_match = match;
+    free(li); free(ln); free(prefix);
+    glm_cpu_fwd_free(&c);
+    glm_synth_free(&sc);
+    return match == n_steps ? 0 : 1;
+}
+
+/* Metal incremental generation synth self-check: the Metal incremental decode
+ * must match the CPU naive forward at every step (so Metal == CPU greedy
+ * sequence).  Returns 0 if all n_steps match. */
+int ds4_glm_metal_generate_synth(int n_steps, int *out_match) {
+#ifdef DS4_NO_GPU
+    (void)n_steps;
+    if (out_match) *out_match = 0;
+    return 1;
+#else
+    glm_synth_ctx sc;
+    glm_synth_build(&sc);
+    int prompt[3] = { 1, 5, 9 };
+    const uint32_t plen = 3;
+    const uint32_t cap = plen + (uint32_t)n_steps + 4;
+    glm_metal_fwd_ctx c;
+    if (!glm_metal_fwd_init(&c, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap)) {
+        glm_synth_free(&sc);
+        if (out_match) *out_match = 0;
+        return 1;
+    }
+    float *li = xmalloc((size_t)sc.vocab * sizeof(float));
+    float *ln = xmalloc((size_t)sc.vocab * sizeof(float));
+    int *prefix = xmalloc((size_t)cap * sizeof(int));
+    memcpy(prefix, prompt, plen * sizeof(int));
+    uint32_t preflen = plen;
+    bool ok = true;
+    for (uint32_t t = 0; t < plen && ok; t++)
+        ok = glm_metal_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
+    int match = 0;
+    for (int s = 0; ok && s < n_steps; s++) {
+        glm_cpu_forward(&sc.model, &sc.shape, sc.n_layer, sc.n_dense, prefix, preflen, ln);
+        int ai = sample_argmax(li, sc.vocab);
+        int an = sample_argmax(ln, sc.vocab);
+        if (ai != an) break;
+        match++;
+        prefix[preflen] = ai;
+        ok = glm_metal_fwd_step(&c, ai, preflen, true, li);
+        preflen++;
+    }
+    if (out_match) *out_match = match;
+    free(li); free(ln); free(prefix);
+    glm_metal_fwd_free(&c);
+    glm_synth_free(&sc);
+    return (ok && match == n_steps) ? 0 : 1;
+#endif
+}
 
 static void glm_expect_u32(const ds4_model *m, const char *key, uint32_t expected) {
     uint32_t got = 0;
@@ -28828,7 +29216,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (e->model.arch == DS4_ARCH_GLM_DSA) {
         const bool cpu_ref = opt->glm_cpu_ref;
         const bool metal_ref = opt->glm_metal_ref;
-        if (e->backend != DS4_BACKEND_METAL && !cpu_ref) {
+        const bool glm_chat = opt->glm_chat;
+        if (e->backend != DS4_BACKEND_METAL && !cpu_ref && !glm_chat) {
             fprintf(stderr, "ds4: glm-dsa is not supported on this backend yet\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -28836,16 +29225,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         glm_validate_metadata(&e->model);
         /* CPU reference reads weights via MAP_PRIVATE; Metal inspect and the
-         * Phase 4c-iv --glm-metal-ref path map MAP_SHARED for the accelerator
-         * (read-only weight access via tensor_data in both cases). */
+         * Phase 4c-iv --glm-metal-ref / Phase 4e --glm-chat (metal) paths map
+         * MAP_SHARED for the accelerator (read-only weight access via
+         * tensor_data in both cases). */
         glm_open_split(&e->model, opt->model_path, graph_backend && !cpu_ref);
         glm_inventory_check(&e->model);
-        if (!opt->inspect_only && !cpu_ref && !metal_ref) {
+        if (!opt->inspect_only && !cpu_ref && !metal_ref && !glm_chat) {
             fprintf(stderr,
                 "ds4: glm-dsa Metal inference is not implemented yet (Phase 4); "
                 "use --inspect for metadata-only inspection, --glm-cpu-ref "
-                "for the CPU reference forward, or --glm-metal-ref for the "
-                "Phase 4c-iv Metal forward.\n");
+                "for the CPU reference forward, --glm-metal-ref for the "
+                "Phase 4c-iv Metal forward, or --glm-chat for generation.\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;

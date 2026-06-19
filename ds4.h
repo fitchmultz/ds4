@@ -119,6 +119,7 @@ typedef struct {
     bool load_output;
     bool glm_cpu_ref;            /* Phase 4a-full: GLM CPU reference forward */
     bool glm_metal_ref;          /* Phase 4c-iv: GLM Metal forward (F32 kernels) */
+    bool glm_chat;               /* Phase 4e: GLM incremental chat generation    */
     ds4_distributed_options distributed;
 } ds4_engine_options;
 
@@ -380,6 +381,25 @@ int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict);
  * leaf math runs on the validated Metal kernels.  Prints greedy token id +
  * top logit + finiteness, and optional DS4_GLM_LOGITS_OUT dump. */
 int ds4_engine_glm_metal_ref(ds4_engine *e, const char *prompt, int n_predict);
+
+/* Phase 4e: incremental GLM-5.2 multi-token generation (--glm-chat).  Applies
+ * the GLM chat template ([gMASK]<sop> + user + <|assistant|> + nothink
+ * <think></think>), prefills, then greedily decodes n_predict tokens with an
+ * INCREMENTAL KV cache (one new K/V per step, reusing prior entries — constant
+ * per-token cost, not O(n^2)).  use_metal selects the backend; both share the
+ * validated per-token step so the greedy sequence is identical and matches
+ * llama.cpp token-for-token.  GLM-5.2 only (rejects non-glm-dsa models). */
+int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
+                        int n_predict, bool use_metal);
+
+/* Phase 4e synth self-checks (no model on disk): incremental generation must
+ * produce the SAME greedy argmax at every decode step as a fresh naive full
+ * forward over the growing prefix.  ds4_glm_cpu_generate_synth pins the
+ * incremental KV refactor vs the validated CPU forward; ds4_glm_metal_generate_synth
+ * additionally pins Metal incremental == CPU naive (so Metal == CPU sequence).
+ * *out_match receives the number of matching steps; return 0 if all n_steps match. */
+int ds4_glm_cpu_generate_synth(int n_steps, int *out_match);
+int ds4_glm_metal_generate_synth(int n_steps, int *out_match);
 
 /* Phase 4c-iv: tiny synthetic Metal forward self-check (no model needed).
  * Builds the same in-memory F32 layers as ds4_glm_cpu_forward_synth and runs

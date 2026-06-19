@@ -245,6 +245,8 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     title(fp, c, "Diagnostics And Data Collection");
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
     opt(fp, c, "--glm-cpu-ref", "GLM-5.2 (glm-dsa) only: run the full per-token CPU reference forward (one token) over the mmap'd split GGUF and print the greedy token id + top logit. CPU-only oracle; slow (reference path).");
+    opt(fp, c, "--glm-chat", "GLM-5.2 only: apply the GLM chat template, prefill, and greedy-decode (-n tokens, default 64) with an incremental KV cache on Metal. Prints generated text + tok/s.");
+    opt(fp, c, "--glm-chat-cpu", "GLM-5.2 only: same as --glm-chat on the CPU reference backend (identical greedy sequence).");
     opt(fp, c, "--dump-tokens", "Tokenize the prompt exactly as written, then exit.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");

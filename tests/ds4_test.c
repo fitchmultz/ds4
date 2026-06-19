@@ -2960,6 +2960,24 @@ static void glm_cpu_attn_decode(const float *Q,
     free(scores);
 }
 
+static void test_glm_generate_synth(void) {
+    /* Phase 4e: incremental generation must match a fresh naive full forward at
+     * every decode step (CPU), and Metal incremental must match CPU naive (so
+     * the Metal greedy sequence == CPU greedy sequence). */
+    const int n_steps = 8;
+    int cpu_match = 0, metal_match = 0;
+    int crc = ds4_glm_cpu_generate_synth(n_steps, &cpu_match);
+    fprintf(stderr, "  glm-generate-synth (cpu): incremental-vs-naive %d/%d steps match\n",
+            cpu_match, n_steps);
+    TEST_ASSERT(crc == 0);
+    TEST_ASSERT(cpu_match == n_steps);
+    int mrc = ds4_glm_metal_generate_synth(n_steps, &metal_match);
+    fprintf(stderr, "  glm-generate-synth (metal): incremental-vs-cpu-naive %d/%d steps match\n",
+            metal_match, n_steps);
+    TEST_ASSERT(mrc == 0);
+    TEST_ASSERT(metal_match == n_steps);
+}
+
 static void test_glm_metal_components(void) {
 #ifdef DS4_NO_GPU
     fprintf(stderr, "  glm-metal: SKIP (built without GPU/Metal)\n");
@@ -3291,6 +3309,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-cpu-forward-synth", "glm-cpu-forward-synth", "GLM-5.2 full CPU forward assembly on a tiny synthetic model (no model needed)", test_glm_cpu_forward_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
+    {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
 };
 
 static void test_print_help(const char *prog) {

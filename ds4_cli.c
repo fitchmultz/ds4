@@ -59,6 +59,8 @@ typedef struct {
     bool inspect;
     bool glm_cpu_ref;
     bool glm_metal_ref;
+    bool glm_chat;          /* Phase 4e: --glm-chat / --glm-chat-cpu */
+    bool glm_chat_metal;    /* true = metal backend, false = cpu */
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -1621,6 +1623,20 @@ static cli_config parse_options(int argc, char **argv) {
             c.glm_metal_ref = true;
             c.engine.glm_metal_ref = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--glm-chat")) {
+            /* Phase 4e: incremental GLM-5.2 chat generation on Metal (default
+             * backend if available).  Applies the GLM chat template, prefills,
+             * then greedily decodes with the incremental KV cache. */
+            c.glm_chat = true;
+            c.glm_chat_metal = true;
+            c.engine.glm_chat = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--glm-chat-cpu")) {
+            /* Phase 4e: same as --glm-chat but on the CPU reference backend. */
+            c.glm_chat = true;
+            c.glm_chat_metal = false;
+            c.engine.glm_chat = true;
+            c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -1711,6 +1727,9 @@ int main(int argc, char **argv) {
         rc = ds4_engine_glm_cpu_ref(engine, cfg.gen.prompt, cfg.gen.n_predict);
     } else if (cfg.glm_metal_ref) {
         rc = ds4_engine_glm_metal_ref(engine, cfg.gen.prompt, cfg.gen.n_predict);
+    } else if (cfg.glm_chat) {
+        rc = ds4_engine_glm_chat(engine, cfg.gen.system, cfg.gen.prompt,
+                                 cfg.gen.n_predict, cfg.glm_chat_metal);
     } else if (cfg.inspect) {
         ds4_engine_summary(engine);
     } else if (cfg.gen.imatrix_output_path) {
