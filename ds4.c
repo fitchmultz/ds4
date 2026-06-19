@@ -27695,6 +27695,17 @@ static bool glm_moe_gate_up_iq2xxs_eligible(const ds4_model *m, uint32_t il) {
            ge->dim[2] == ue->dim[2];
 }
 
+/* Step 5: the SHARED-expert fast path.  The shared expert (Q5_K gate/up +
+ * Q6_K down in GLM UD-IQ2_M) runs on every MoE layer of every token, so its
+ * pages are resident after the first touch (unlike the SSD-evicted routed
+ * experts).  The F32 fallback re-dequants the K-quants to F32 PER TOKEN -- the
+ * dominant shared-expert cost (~2 s/token of CPU dequant + F32 weight copy).
+ * The fast path pre-dequants each MoE layer's shexp gate/up/down to F32 ONCE at
+ * init into resident buffers (sh_g/sh_u/sh_d), then reuses the SAME
+ * glm_swiglu_metal -> ds4_gpu_glm_matvec_f32 path as the oracle -- byte-identical
+ * math, no new kernel, just no per-token dequant.  Eligible when the layer's
+ * pre-dequanted buffers are present (set at init when fast is on). */
+
 /* One fused Q8_0 decode matvec: out[out_dim] = W_q8_0[out_dim,in_dim] @ x[in_dim]
  * via ds4_gpu_matmul_q8_0_tensor, where W stays quantized in the mmap'd GGUF
  * range (GPU-addressable through the registered model view). Only the small F32
@@ -27910,6 +27921,25 @@ typedef struct {
      * (gate/up fused dispatch, down fallback, shared expert). */
     double moe_gu_total, moe_down_total, moe_sh_total;
     uint64_t moe_calls;
+    /* DS4_GLM_DECODE_TIME (Step 5 profile): per-token DECODE breakdown into
+     * MLA block / MoE gate-up / MoE down / MoE shared / LM head, accumulated
+     * ONLY for steps with pos >= profile_after_pos (the chat driver sets it to
+     * prompt_len so prefill is excluded and each entry is one decode token).
+     * Gives an exact single-token cost decomposition (SSD/other = decode wall
+     * minus these). */
+    double dec_mla_s, dec_gu_s, dec_down_s, dec_sh_s, dec_lm_s;
+    uint64_t dec_steps;
+    uint32_t profile_after_pos;   /* UINT32_MAX = decode profiling disabled */
+    /* Step 5 diagnostic: count MoE layers that took the fused shared-expert
+     * path (for verifying eligibility + A/B attribution). */
+    uint64_t shexp_fast_calls, shexp_fallback_calls;
+    /* Step 5 fast path: resident PRE-DEQUANTED shared-expert F32 weights, one
+     * gate/up/down pair per backbone layer (NULL for dense layers and when the
+     * fast path is off).  Pre-dequanted ONCE at init so the per-token MoE step
+     * skips the K-quant (Q5_K/Q6_K) re-dequant -- the dominant shared-expert
+     * cost.  Reused via the unchanged glm_swiglu_metal (same F32 kernel as the
+     * oracle), so the result is byte-identical to the F32 path. */
+    float **sh_g, **sh_u, **sh_d;
 } glm_metal_fwd_ctx;
 
 static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
@@ -27971,6 +28001,7 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
     c->chunk_rows = 8192;
     c->chunk_w = xmalloc((size_t)c->chunk_rows * H * sizeof(float));
     c->chunk_logits = xmalloc((size_t)c->chunk_rows * sizeof(float));
+    c->profile_after_pos = UINT32_MAX;   /* decode profiling off until set */
 
     const size_t k_nope_bytes = (size_t)nh * seq_n * nope * sizeof(float);
     const size_t v_bytes      = (size_t)nh * seq_n * vd * sizeof(float);
@@ -28006,9 +28037,55 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
             }
         }
         c->fast = ok;
-        if (ok) fprintf(stderr, "ds4: glm-fast: fused Q8_0 MLA + IQ2_XXS MoE gate/up "
-                                "paths enabled (DS4_GLM_FAST=1; attn_k_b, down experts "
-                                "IQ3_XXS/IQ4_XS, shared expert stay F32 oracle)\n");
+        if (ok) {
+            const bool shexp_resident = getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
+            if (shexp_resident) {
+                /* Step 5: pre-dequant every MoE layer's shared-expert gate/up/down
+                 * to resident F32 ONCE, so the per-token decode skips the K-quant
+                 * re-dequant (the dominant shared-expert cost).  Dense layers
+                 * (0..n_dense-1) have no shexp and stay NULL.  ~10.5 GiB resident
+                 * for GLM (75 MoE layers x 3 x [2048,6144] F32), fits the 128 GiB
+                 * Mac; the F32 oracle path never builds these (additive, fast-only).
+                 * Reuses glm_dequant_weight (Phase 4b bit-exact dequant). */
+                c->sh_g = xcalloc(n_layer, sizeof(float *));
+                c->sh_u = xcalloc(n_layer, sizeof(float *));
+                c->sh_d = xcalloc(n_layer, sizeof(float *));
+                /* Shared expert uses the EXPERT inter (2048), not the dense ff_inter
+                 * (12288) -- read it from the real shexp tensor dim (GGUF stores
+                 * weights as [ne0=H, ne1=inter], so dim[1] is the output/row count)
+                 * so the resident buffers are sized exactly (not oversized). */
+                const ds4_tensor *gsh0 = glm_layer_tensor(m, n_dense, "ffn_gate_shexp");
+                const uint32_t sh_ei = gsh0 && gsh0->ndim >= 2 ? (uint32_t)gsh0->dim[1] : shape->ff_inter;
+                const size_t sh_gate_bytes = (size_t)sh_ei * H * sizeof(float);
+                const size_t sh_down_bytes = (size_t)H * sh_ei * sizeof(float);
+                uint64_t sh_total_bytes = 0;
+                const double shp_t0 = now_sec();
+                for (uint32_t il = n_dense; il < n_layer; il++) {
+                    const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
+                    const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
+                    const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
+                    if (!gsh || !ush || !dsh) { ok = false; break; }
+                    c->sh_g[il] = xmalloc(sh_gate_bytes);
+                    c->sh_u[il] = xmalloc(sh_gate_bytes);
+                    c->sh_d[il] = xmalloc(sh_down_bytes);
+                    glm_dequant_weight(m, gsh, c->sh_g[il]);
+                    glm_dequant_weight(m, ush, c->sh_u[il]);
+                    glm_dequant_weight(m, dsh, c->sh_d[il]);
+                    sh_total_bytes += 2 * sh_gate_bytes + sh_down_bytes;
+                }
+                if (!ok)
+                    fprintf(stderr, "ds4: glm-fast: shared-expert pre-dequant failed\n");
+                else
+                    fprintf(stderr, "ds4: glm-fast: pre-dequanted shared expert to "
+                                    "%.2f GiB resident in %.1fs\n",
+                            (double)sh_total_bytes / (1024.0*1024.0*1024.0),
+                            now_sec() - shp_t0);
+            }
+            fprintf(stderr, "ds4: glm-fast: fused Q8_0 MLA + IQ2_XXS MoE gate/up%s "
+                                "paths enabled (DS4_GLM_FAST=1; attn_k_b, "
+                                "down experts IQ3_XXS/IQ4_XS stay F32 oracle)\n",
+                    shexp_resident ? " + resident shared-expert" : "");
+        }
     }
     return true;
 }
@@ -28023,6 +28100,9 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
     free(c->k_nope); free(c->vv); free(c->qrope); free(c->krope); free(c->attn_o); free(c->Q_comb);
     free(c->router_gate); free(c->moe_logits); free(c->idx); free(c->w);
     free(c->moe_mid);
+    if (c->sh_g) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_g[l]); free(c->sh_g); }
+    if (c->sh_u) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_u[l]); free(c->sh_u); }
+    if (c->sh_d) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_d[l]); free(c->sh_d); }
     free(c->chunk_w); free(c->chunk_logits);
     if (c->mla_calls && getenv("DS4_GLM_MLA_TIME"))
         fprintf(stderr, "ds4: glm-metal MLA-block: %.3fs total, %.6fs avg/call "
@@ -28036,6 +28116,21 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
                 c->moe_gu_total, c->moe_down_total, c->moe_sh_total,
                 (unsigned long long)c->moe_calls,
                 c->moe_gu_total / (double)c->moe_calls);
+    if (c->dec_steps && getenv("DS4_GLM_DECODE_TIME")) {
+        const double n = (double)c->dec_steps;
+        fprintf(stderr, "ds4: glm-metal decode profile (%llu steps, avg/token): "
+                        "MLA=%.3fs gate/up=%.3fs down=%.3fs shared=%.3fs lm-head=%.3fs "
+                        "sum=%.3fs\n",
+                (unsigned long long)c->dec_steps,
+                c->dec_mla_s / n, c->dec_gu_s / n, c->dec_down_s / n,
+                c->dec_sh_s / n, c->dec_lm_s / n,
+                (c->dec_mla_s + c->dec_gu_s + c->dec_down_s + c->dec_sh_s + c->dec_lm_s) / n);
+        fprintf(stderr, "ds4: glm-metal shared-expert: %llu fused / %llu fallback "
+                        "(%s)\n",
+                (unsigned long long)c->shexp_fast_calls,
+                (unsigned long long)c->shexp_fallback_calls,
+                getenv("DS4_GLM_NO_SHEXP_FAST") ? "A/B: forced F32" : "fast=on");
+    }
 }
 
 /* Process ONE token at sequence position `pos` on Metal, appending its K/V to
@@ -28050,6 +28145,10 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
     const uint32_t n_layer=c->n_layer, n_dense=c->n_dense, K=c->K;
     float *x=c->x, *xn=c->xn, *res=c->res, *mla_out=c->mla_out;
     float *ffn_out=c->ffn_out, *etmp=c->etmp;
+    /* Decode-only profiling gate: true only for decode steps (pos past the
+     * prefill).  Hoisted so the LM-head tail + per-layer timers share it. */
+    const bool dec_prof = getenv("DS4_GLM_DECODE_TIME") != NULL &&
+                          pos >= c->profile_after_pos;
 
     glm_dequant_count(m, c->t_embd, (uint64_t)token * c->embd_row_bytes, H, x);
 
@@ -28085,7 +28184,7 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
         const float *qa_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_q_a_norm"));
         const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
         const bool mla_time = getenv("DS4_GLM_MLA_TIME") != NULL;
-        const double mla_t0 = mla_time ? now_sec() : 0.0;
+        const double mla_t0 = (mla_time || dec_prof) ? now_sec() : 0.0;
         if (!glm_mla_forward_token_metal(xn, m, il, fast_l,
                                          c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, c->Wo,
                                          qa_norm, kv_norm,
@@ -28094,7 +28193,11 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
                                          c->wqa, c->wqa_n, c->q_flat, c->kva, c->kvln,
                                          c->k_nope, c->vv, c->qrope, c->krope, c->attn_o, c->Q_comb))
             return false;
-        if (mla_time) { c->mla_total_s += now_sec() - mla_t0; c->mla_calls++; }
+        if (mla_time || dec_prof) {
+            const double dt = now_sec() - mla_t0;
+            if (mla_time) { c->mla_total_s += dt; c->mla_calls++; }
+            if (dec_prof) c->dec_mla_s += dt;
+        }
         if (il == 3 && pos == 0 && getenv("DS4_GLM_ATTN3_OUT")) {
             FILE *af = fopen(getenv("DS4_GLM_ATTN3_OUT"), "wb");
             if (af) { fwrite(mla_out, sizeof(float), H, af); fclose(af); }
@@ -28147,7 +28250,7 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
              * IQ3_XXS/IQ4_XS kernel) stay on the F32 fallback below. */
             const bool moe_fast =
                 c->fast && glm_moe_gate_up_iq2xxs_eligible(m, il);
-            const bool moe_prof = getenv("DS4_GLM_MOE_TIME") != NULL;
+            const bool moe_prof = (getenv("DS4_GLM_MOE_TIME") != NULL) || dec_prof;
             double gu_t = 0.0, down_t = 0.0, sh_t = 0.0;
             if (moe_fast) {
                 const double gu0 = moe_prof ? now_sec() : 0.0;
@@ -28184,21 +28287,46 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
                     for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
                 }
             }
-            /* shared expert added directly (weight 1.0, DeepSeek/GLM convention). */
+            /* shared expert added directly (weight 1.0, DeepSeek/GLM convention).
+             * Step 5 fast path: when the shared expert was pre-dequanted to a
+             * resident F32 buffer at init (sh_g/sh_u/sh_d), reuse the SAME
+             * glm_swiglu_metal -> ds4_gpu_glm_matvec_f32 path as the oracle on
+             * those buffers -- byte-identical math, no per-token K-quant
+             * (Q5_K/Q6_K) re-dequant (the dominant shared-expert cost).
+             * DS4_GLM_NO_SHEXP_FAST forces the F32 re-dequant path for A/B
+             * attribution (same binary, identical SSD warmth). */
             if (moe_prof) down_t = now_sec() - down0;
             const double sh0 = moe_prof ? now_sec() : 0.0;
-            glm_dequant_weight(m, gsh, c->fgate);
-            glm_dequant_weight(m, ush, c->fup);
-            glm_dequant_weight(m, dsh, c->fdown);
-            if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
-                return false;
+            const bool shexp_fast = c->fast && c->sh_g && c->sh_u && c->sh_d &&
+                                    c->sh_g[il] != NULL &&
+                                    getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
+            if (shexp_fast) {
+                c->shexp_fast_calls++;
+                if (!glm_swiglu_metal(xn, c->sh_g[il], c->sh_u[il], c->sh_d[il],
+                                      H, ei, etmp, c->sg, c->su))
+                    return false;
+            } else {
+                c->shexp_fallback_calls++;
+                glm_dequant_weight(m, gsh, c->fgate);
+                glm_dequant_weight(m, ush, c->fup);
+                glm_dequant_weight(m, dsh, c->fdown);
+                if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
+                    return false;
+            }
             for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
             if (moe_prof) {
                 sh_t = now_sec() - sh0;
-                c->moe_gu_total += gu_t;
-                c->moe_down_total += down_t;
-                c->moe_sh_total += sh_t;
-                c->moe_calls++;
+                if (getenv("DS4_GLM_MOE_TIME")) {
+                    c->moe_gu_total += gu_t;
+                    c->moe_down_total += down_t;
+                    c->moe_sh_total += sh_t;
+                    c->moe_calls++;
+                }
+                if (dec_prof) {
+                    c->dec_gu_s += gu_t;
+                    c->dec_down_s += down_t;
+                    c->dec_sh_s += sh_t;
+                }
             }
         }
         for (uint32_t d = 0; d < H; d++) x[d] = res[d] + ffn_out[d];
@@ -28208,11 +28336,15 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
     }
 
     if (want_logits) {
-        if (!glm_lm_head_metal(m, x, (const float *)tensor_data(m, c->t_onorm),
+        const bool lm_prof = dec_prof && pos >= c->profile_after_pos;
+        const double lm_t0 = lm_prof ? now_sec() : 0.0;
+        const bool ok = glm_lm_head_metal(m, x, (const float *)tensor_data(m, c->t_onorm),
                                c->t_out, c->vocab, shape, logits, xn,
-                               c->chunk_w, c->chunk_logits, c->chunk_rows))
-            return false;
+                               c->chunk_w, c->chunk_logits, c->chunk_rows);
+        if (lm_prof) c->dec_lm_s += now_sec() - lm_t0;
+        if (!ok) return false;
     }
+    if (dec_prof && pos >= c->profile_after_pos) c->dec_steps++;
     return true;
 }
 
@@ -28617,6 +28749,10 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
 #ifndef DS4_NO_GPU
         glm_metal_fwd_ctx mc;
         if (glm_metal_fwd_init(&mc, m, &shape, n_layer, n_dense, cap)) {
+            /* Decode-only profiling: accumulate per-token component timers
+             * (MLA / MoE gu/down/shared / LM head) only for pos >= prompt_len,
+             * so prefill is excluded and each entry is exactly one decode token. */
+            if (getenv("DS4_GLM_DECODE_TIME")) mc.profile_after_pos = prompt_len;
             rc = glm_generate_loop(glm_gen_metal_step, &mc, chat.v, prompt_len,
                                    n_predict, logits, vocab, e, eos_id, stdout,
                                    &generated, gen_ids, &decode_s);
