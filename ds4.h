@@ -118,6 +118,7 @@ typedef struct {
     uint32_t load_layer_end;
     bool load_output;
     bool glm_cpu_ref;            /* Phase 4a-full: GLM CPU reference forward */
+    bool glm_metal_ref;          /* Phase 4c-iv: GLM Metal forward (F32 kernels) */
     ds4_distributed_options distributed;
 } ds4_engine_options;
 
@@ -371,6 +372,22 @@ int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit,
  * reference forward, and print the greedy token id + top logit + finiteness.
  * Returns 0 on success.  Slow (reference path). */
 int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict);
+
+/* Phase 4c-iv: full GLM forward on Metal, reusing the validated Phase 4c-i/ii
+ * ds4_gpu_glm_* kernels.  Per-layer dequant -> GPU F32 buffers -> GPU KV cache
+ * -> logits.  Correctness oracle = the CPU reference (ds4_engine_glm_cpu_ref).
+ * Same tokenizer/embedding/LM-head/dequant policy as the CPU path; only the
+ * leaf math runs on the validated Metal kernels.  Prints greedy token id +
+ * top logit + finiteness, and optional DS4_GLM_LOGITS_OUT dump. */
+int ds4_engine_glm_metal_ref(ds4_engine *e, const char *prompt, int n_predict);
+
+/* Phase 4c-iv: tiny synthetic Metal forward self-check (no model needed).
+ * Builds the same in-memory F32 layers as ds4_glm_cpu_forward_synth and runs
+ * them through ds4_engine_glm_metal_ref's Metal orchestration.  Proves the
+ * end-to-end Metal assembly (layer loop, GPU KV cache, MLA, dense + MoE
+ * dispatch, LM head) is runnable + finite without the 238 GiB split, and that
+ * Metal argmax == CPU synth argmax.  Returns 0 on success. */
+int ds4_glm_metal_forward_synth(int *out_token, float *out_top_logit, bool *out_finite);
 int ds4_tokenize_model_text(const char *model_path, const char *text, int *out, int max_out);
 int ds4_render_chat_prompt(const char *model_path, const char *system,
                            const char *prompt, ds4_think_mode think_mode,

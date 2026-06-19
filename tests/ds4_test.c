@@ -2870,6 +2870,25 @@ static void test_glm_cpu_forward_synth(void) {
             token, (double)top, finite ? "yes" : "no");
 }
 
+/* Phase 4c-iv: the full Metal forward assembly (glm_metal_forward) on the same
+ * tiny synthetic model as the CPU synth.  Proves the end-to-end Metal path
+ * (per-layer dequant -> GPU kernels -> GPU KV cache -> MLA/dense/MoE dispatch
+ * -> LM head) is runnable + finite without the 238 GiB split, and that Metal
+ * argmax == CPU synth argmax (same deterministic weights). */
+static void test_glm_metal_forward_synth(void) {
+    int mtoken = -1; float mtop = 0.0f; bool mfinite = false;
+    int ctoken = -1; float ctop = 0.0f; bool cfinite = false;
+    int mrc = ds4_glm_metal_forward_synth(&mtoken, &mtop, &mfinite);
+    TEST_ASSERT(mrc == 0);
+    TEST_ASSERT(mfinite);
+    /* CPU synth reference on the identical model. */
+    int crc = ds4_glm_cpu_forward_synth(&ctoken, &ctop, &cfinite);
+    TEST_ASSERT(crc == 0);
+    fprintf(stderr, "  glm-metal-forward-synth: metal=%d cpu=%d (top m=%.6f c=%.6f)\n",
+            mtoken, ctoken, (double)mtop, (double)ctop);
+    TEST_ASSERT(mtoken == ctoken);
+}
+
 /* GLM-5.2 Metal component kernels (metal/glm.metal via ds4_gpu_glm_* wrappers)
  * validated against the Phase 4a CPU reference on the SAME synthetic fixtures.
  * Each component runs the CPU oracle and the Metal kernel on identical inputs;
@@ -3270,6 +3289,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-quant-dequant", "glm-quant-dequant", "GLM-5.2 K-quant CPU dequant vs llama.cpp oracle", test_glm_quant_dequant},
     {"--glm-cpu-ref-components", "glm-cpu-ref-components", "GLM-5.2 CPU reference components (RoPE/MLA/dense-FFN/MoE) vs numpy oracle", test_glm_cpu_ref_components},
     {"--glm-cpu-forward-synth", "glm-cpu-forward-synth", "GLM-5.2 full CPU forward assembly on a tiny synthetic model (no model needed)", test_glm_cpu_forward_synth},
+    {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
 };
 

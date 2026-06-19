@@ -58,6 +58,7 @@ typedef struct {
     char *prompt_owned;
     bool inspect;
     bool glm_cpu_ref;
+    bool glm_metal_ref;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -1613,6 +1614,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.glm_cpu_ref = true;
             c.engine.glm_cpu_ref = true;
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--glm-metal-ref")) {
+            /* Phase 4c-iv: full GLM forward on Metal, reusing the validated
+             * ds4_gpu_glm_* kernels.  Correctness oracle = --glm-cpu-ref.
+             * Forces the Metal backend and bypasses the inference gate. */
+            c.glm_metal_ref = true;
+            c.engine.glm_metal_ref = true;
+            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -1701,6 +1709,8 @@ int main(int argc, char **argv) {
     int rc = 0;
     if (cfg.glm_cpu_ref) {
         rc = ds4_engine_glm_cpu_ref(engine, cfg.gen.prompt, cfg.gen.n_predict);
+    } else if (cfg.glm_metal_ref) {
+        rc = ds4_engine_glm_metal_ref(engine, cfg.gen.prompt, cfg.gen.n_predict);
     } else if (cfg.inspect) {
         ds4_engine_summary(engine);
     } else if (cfg.gen.imatrix_output_path) {
