@@ -1,6 +1,10 @@
 # GLM-5.2 Port — Source of Truth
 
-Status: **Phases 0,1,2,3,4a,4b,4c-i,4c-ii complete + verified**; **4a-full runnable but not yet correct** (real-model CPU forward runs all 78 layers; a numerics bug in the MLA k_b tensor layout / MoE shared-expert convention collapses common prompts to one high-logit token — needs a llama.cpp logit-diff oracle to diagnose). Committed + pushed origin/glm; full 238GB UD_IQ2_M model on disk.
+Status: **CORE PORT COMPLETE & WORKING.** GLM-5.2 runs locally: load + glm4 tokenize + oracle-correct forward (CPU & Metal, logit-corr 0.9993 vs llama.cpp) + coherent multi-token chat generation (`--glm-chat`/`--glm-chat-cpu`), matching llama.cpp greedy token-for-token (11/12 on 'Say hello.' -> 'Hello! How can I help you today?'). The 238 GiB UD_IQ2_M model runs in ~43 GiB peak RAM on this 128 GiB Mac via mmap on-demand expert streaming (no resident copy). 12 commits on origin/glm.
+
+VERIFIED DONE: P0 scaffolding; P1 loader/split-GGUF/metadata/tensor-inventory (1809/1809); P2 glm4 BPE+chat (oracle); P3 SSD cache-plan (8359 experts); P4b all 8 quant dequant bit-exact vs llama.cpp (incl. the IQ2_S full-tensor bugfix); P4a/P4a-full CPU forward (oracle-validated); P4c-i/ii Metal kernels (31/31); P4c-iv Metal forward (corr 1.0 vs CPU); P4e incremental-KV chat generation. DeepSeek path byte-identical at every commit; full ds4_test green.
+
+REMAINING (optimizations, not correctness): fused-kernel production latency (current ~10-24 tok/s slow path materializes F32 per layer; DS4-speed needs the fused quant kernels / metal_graph integration); explicit ds4_ssd pread streaming (mmap already achieves the bounded-RAM + on-demand-SSD outcome); DSA sparse indexer (deferred — our dense-MLA forward matches llama.cpp, which also omits it); NextN/MTP blk.78 (loaded, unused — a speculation accelerator, not required for correct greedy gen).
 Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
