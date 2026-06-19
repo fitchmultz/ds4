@@ -202,10 +202,11 @@ identical vs main across ASCII/CJK/code/whitespace/contraction prompts.
 **Phase 4 — GLM inference: dense-MLA fallback + dense leading FFN + sigmoid
 **top-8 MoE.** GLM graph path (not DeepSeek V4 HC graph); standard interleaved
 RoPE on rope slice (theta 8e6); single `attn_output` projection; dense SwiGLU
-for `blk.0`-`2`; sigmoid+bias+norm+scale-2.5 top-8 router for `blk.3`-`77`; add
-missing quant kernels (Q5_K/Q6_K dense, IQ2_S/IQ3_XXS/IQ4_XS/Q3_K routed).
-DSA deferred. DONE: `--metal --ctx 4096 -p 'Hello' -n 1` emits a token; logits
-match llama.cpp `glm-dsa` dense-fallback oracle; DeepSeek smoke unchanged.
+for `blk.0`-`2`; sigmoid+bias+norm+scale-2.5 top-8 router for `blk.3`-`77`.
+All quant types present in the downloaded UD_IQ2_M split now have CPU dequant
+coverage, including blk.78 NextN-only Q2_K/Q3_K. DSA deferred. DONE:
+`--glm-metal-ref -p 'Hello' -n 1` emits the oracle token; logits match llama.cpp
+`glm-dsa` dense-fallback oracle; DeepSeek smoke unchanged.
 **Needs full 238GB split on disk.**
 
 **Phase 5 — DSA sparse indexer + IndexShare.** Deferred. Dense MLA matches
@@ -244,8 +245,8 @@ The core GLM port is complete and verified. The active work is usability/speed:
 
 ## 8. Risks / blockers
 
-- Phase 4 needs net-new quant kernels: Q5_K/Q6_K dense; IQ2_S/IQ3_XXS/IQ4_XS/Q3_K
-  routed. Engine currently supports IQ2_XXS/Q2_K/Q4_K routed + the dense set.
+- NextN/MTP still needs graph wiring and fast kernels. CPU dequant now covers
+  blk.78 Q2_K/Q3_K, but no speculative acceptance loop is wired yet.
 - `DS4_MAX_*` cap bumps (DS4_MAX_LAYER>=79, DS4_MAX_VOCAB>=154880) for inference
   must not change DeepSeek shapes/allocs — decide between bumping vs a GLM-specific
   shape struct in Phase 4.

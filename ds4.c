@@ -401,6 +401,15 @@ typedef struct {
     uint16_t d;
 } block_q6_K;
 
+/* GLM-5.2 MTP Q3_K (110 bytes).  Appears in blk.78 NextN down experts.
+ * Layout matches ggml-common.h block_q3_K. */
+typedef struct {
+    uint8_t  hmask[QK_K / 8];
+    uint8_t  qs[QK_K / 4];
+    uint8_t  scales[12];
+    uint16_t d;
+} block_q3_K;
+
 /* GLM-5.2 routed down-expert IQ3_XXS (98 bytes): f16 d, then qs[QK_K/4] (the
  * 6-bit grid indices, 8 per 32-element sub-block) followed by scales_and_signs
  * (4 bytes per sub-block: 28-bit sign/3-bit-scale payload). Layout matches
@@ -434,6 +443,7 @@ DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
 DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
+DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
 DS4_STATIC_ASSERT(ds4_block_iq3_xxs_size, sizeof(block_iq3_xxs) == 98);
 DS4_STATIC_ASSERT(ds4_block_iq4_xs_size, sizeof(block_iq4_xs) == 136);
 DS4_STATIC_ASSERT(ds4_block_iq2_s_size, sizeof(block_iq2_s) == 82);
@@ -26614,8 +26624,77 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
  * quant*activation dot kernels, but the GLM reference/oracle needs plain
  * dequant-to-F32 to (a) build a per-component CPU oracle and (b) validate the
  * new quant types against an authoritative llama.cpp dequant oracle.  These are
- * direct ports of llama.cpp's dequantize_row_{q4,q5,q6}_K; see
- * tests/test-vectors/glm52-quant/.  IQ2_S/IQ3_XXS/IQ4_XS still TODO. */
+ * direct ports of llama.cpp dequantizers for the GGUF types GLM reads; see
+ * tests/test-vectors/glm52-quant/. */
+
+static void ds4_dequant_q2_K(const block_q2_K *x, float *y, uint32_t k) {
+    const uint32_t nb = k / QK_K;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const float min = f16_to_f32(x[i].dmin);
+        const uint8_t *q = x[i].qs;
+        int is = 0;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = x[i].scales[is++];
+                const float dl1 = d * (float)(sc & 0xF);
+                const float ml1 = min * (float)(sc >> 4);
+                for (int l = 0; l < 16; ++l)
+                    *y++ = dl1 * (float)((q[l] >> shift) & 3) - ml1;
+
+                sc = x[i].scales[is++];
+                const float dl2 = d * (float)(sc & 0xF);
+                const float ml2 = min * (float)(sc >> 4);
+                for (int l = 0; l < 16; ++l)
+                    *y++ = dl2 * (float)((q[l + 16] >> shift) & 3) - ml2;
+
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+static void ds4_dequant_q3_K(const block_q3_K *x, float *y, uint32_t k) {
+    const uint32_t nb = k / QK_K;
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    const int8_t *scales = (const int8_t *)aux;
+
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d_all = f16_to_f32(x[i].d);
+        const uint8_t *q = x[i].qs;
+        const uint8_t *hm = x[i].hmask;
+        uint8_t m = 1;
+
+        memcpy(aux, x[i].scales, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+        int is = 0;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                float dl = d_all * (float)(scales[is++] - 32);
+                for (int l = 0; l < 16; ++l)
+                    *y++ = dl * (float)(((q[l + 0] >> shift) & 3) - ((hm[l + 0] & m) ? 0 : 4));
+
+                dl = d_all * (float)(scales[is++] - 32);
+                for (int l = 0; l < 16; ++l)
+                    *y++ = dl * (float)(((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
 
 static inline void ds4_get_scale_min_k4(int j, const uint8_t *q,
                                         uint8_t *d, uint8_t *m) {
@@ -26809,10 +26888,9 @@ static void ds4_dequant_iq2_xxs(const void *block_data, float *out, uint32_t k) 
 /* Public dispatcher used by the --glm-quant-dequant oracle test and by the
  * full CPU reference forward (glm_dequant_weight/glm_dequant_count).  Returns
  * true and fills out[0..n) for every quant type present in GLM-5.2-UD-IQ2_M:
- * Q8_0 (attn projections), IQ2_XXS (expert gate/up), Q4_K/Q5_K/Q6_K,
- * IQ3_XXS/IQ4_XS/IQ2_S (expert down + dense FFN).  Divisibility is checked per
- * type (Q8_0 needs 32, the K-quants/IQ2_XS need 256).  Q2_K/Q3_K appear only in
- * the unused blk.78 NextN layer and are not dequanted here. */
+ * Q8_0 (attn projections), IQ2_XXS (expert gate/up), Q2_K/Q3_K/Q4_K/Q5_K/Q6_K,
+ * IQ3_XXS/IQ4_XS/IQ2_S (expert down + dense FFN + blk.78 NextN/MTP).  Divisibility
+ * is checked per type (Q8_0 needs 32, the K-quants/IQ2_XS need 256). */
 bool ds4_dequant_glm_row(uint32_t gguf_type, const void *block_data,
                          float *out, size_t n) {
     if (n == 0) return false;
@@ -26823,6 +26901,12 @@ bool ds4_dequant_glm_row(uint32_t gguf_type, const void *block_data,
         case 16 /*iq2_xxs*/:
             if (n % QK_K != 0) return false;
             ds4_dequant_iq2_xxs(block_data, out, (uint32_t)n); return true;
+        case 10 /*q2_k*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_q2_K(block_data, out, (uint32_t)n); return true;
+        case 11 /*q3_k*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_q3_K(block_data, out, (uint32_t)n); return true;
         case 12 /*q4_k*/:
             if (n % QK_K != 0) return false;
             ds4_dequant_q4_K(block_data, out, (uint32_t)n); return true;

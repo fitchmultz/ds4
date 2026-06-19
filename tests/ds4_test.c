@@ -2525,8 +2525,9 @@ static void test_glm_quant_dequant(void) {
     const char *dir = getenv("DS4_TEST_GLM52_QUANT_DIR");
     if (!dir || !dir[0]) dir = "tests/test-vectors/glm52-quant";
     static const struct { const char *name; uint32_t type; uint32_t block_bytes; uint32_t block_elems; } types[] = {
-        {"Q8_0", 8, 34, 32}, {"Q4_K", 12, 144, 256}, {"Q5_K", 13, 176, 256},
-        {"Q6_K", 14, 210, 256}, {"IQ3_XXS", 18, 98, 256}, {"IQ4_XS", 23, 136, 256},
+        {"Q8_0", 8, 34, 32}, {"Q2_K", 10, 84, 256}, {"Q3_K", 11, 110, 256},
+        {"Q4_K", 12, 144, 256}, {"Q5_K", 13, 176, 256}, {"Q6_K", 14, 210, 256},
+        {"IQ3_XXS", 18, 98, 256}, {"IQ4_XS", 23, 136, 256},
         {"IQ2_S", 22, 82, 256}, {"IQ2_XXS", 16, 66, 256},
     };
     const size_t n_types = sizeof(types) / sizeof(types[0]);
