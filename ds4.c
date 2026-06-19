@@ -27626,14 +27626,76 @@ static void glm_synth_free(glm_synth_ctx *c);
  * round-trips through the attn kernel.  No new quant math, no new kernels.
  * ======================================================================= */
 
+/* ---- Fast Metal path: fused Q8_0 MLA projections (Step 1) ---------------
+ *
+ * Env-gated (DS4_GLM_FAST=1). When enabled, the five Q8_0 MLA projections
+ * (attn_q_a / attn_q_b / attn_kv_a_mqa / attn_v_b / attn_output) use the
+ * engine's fused ds4_gpu_matmul_q8_0_tensor decode kernel: the quant weights
+ * stay Q8_0 in the mmap'd GGUF and are read straight off the registered model
+ * view (no per-layer F32 dequant, no per-call weight upload). The F32
+ * --glm-chat oracle path is byte-for-byte unchanged when the flag is unset.
+ *
+ * attn_k_b stays on the F32 oracle for now: its native [nope,kv_lora,n_head]
+ * layout requires the glm_k_b_reorder permutation, which a row-major [out,in]
+ * Q8_0 kernel cannot express (a reordered row mixes elements across source
+ * Q8_0 blocks). k_b is dequanted + reordered exactly as the oracle, so it
+ * matches the oracle by construction. Fusing k_b needs a one-time reordered
+ * quant buffer per layer and is deferred to a later step.
+ * ---------------------------------------------------------------------- */
+static bool glm_fast_enabled(void) {
+    const char *e = getenv("DS4_GLM_FAST");
+    return e && atoi(e) == 1;
+}
+
+/* Whether layer il can run the five fused Q8_0 MLA projections. The caller
+ * always prepares the k_b F32 weight, so a non-eligible layer simply keeps the
+ * full F32 oracle for that layer. */
+static bool glm_mla_fast_eligible(const ds4_model *m, uint32_t il) {
+    const ds4_tensor *a  = glm_layer_tensor(m, il, "attn_q_a");
+    const ds4_tensor *b  = glm_layer_tensor(m, il, "attn_q_b");
+    const ds4_tensor *ka = glm_layer_tensor(m, il, "attn_kv_a_mqa");
+    const ds4_tensor *vb = glm_layer_tensor(m, il, "attn_v_b");
+    const ds4_tensor *op = glm_layer_tensor(m, il, "attn_output");
+    return a && b && ka && vb && op &&
+           a->type  == DS4_TENSOR_Q8_0 &&
+           b->type  == DS4_TENSOR_Q8_0 &&
+           ka->type == DS4_TENSOR_Q8_0 &&
+           vb->type == DS4_TENSOR_Q8_0 &&
+           op->type == DS4_TENSOR_Q8_0;
+}
+
+/* One fused Q8_0 decode matvec: out[out_dim] = W_q8_0[out_dim,in_dim] @ x[in_dim]
+ * via ds4_gpu_matmul_q8_0_tensor, where W stays quantized in the mmap'd GGUF
+ * range (GPU-addressable through the registered model view). Only the small F32
+ * activation is uploaded and the F32 result read back -- the (large) weight is
+ * never dequanted or uploaded. Mirrors ds4_gpu_glm_matvec_f32's host upload /
+ * readback pattern minus the weight copy. Returns true on success. */
+static bool glm_fused_q8_matvec(const void *model_map, uint64_t model_size,
+                                uint64_t weight_offset,
+                                uint32_t in_dim, uint32_t out_dim,
+                                const float *x, float *out) {
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    ds4_gpu_tensor *to = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    if (!tx || !to) { ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to); return false; }
+    ds4_gpu_tensor_write(tx, 0, x, (uint64_t)in_dim * sizeof(float));
+    const int ok = ds4_gpu_matmul_q8_0_tensor(to, model_map, model_size,
+                                              weight_offset, in_dim, out_dim, tx, 1);
+    if (ok) ds4_gpu_tensor_read(to, 0, out, (uint64_t)out_dim * sizeof(float));
+    ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+    return ok != 0;
+}
+
 /* One-token MLA decode via the validated Metal kernels.  Mirrors
  * glm_mla_forward_token_f32 line-for-line; scratch is caller-allocated and
  * reused across layers/tokens (the CPU composite mallocs internally; this path
  * runs 78 layers x n_tokens so reuse matters).  KV caches are host-side
  * [nh,seq_n,dim] row-major, mutated at position t before the attn kernel reads
- * them.  Returns true on success. */
+ * them.  When `fast` is true the five Q8_0 MLA projections use the fused
+ * ds4_gpu_matmul_q8_0_tensor (weights stay quantized in the mmap); k_b always
+ * uses the F32 `WkB` (dequanted + reordered by the caller). Returns true. */
 static bool glm_mla_forward_token_metal(
         const float *x,
+        const ds4_model *m, uint32_t il, bool fast,
         const float *WqA, const float *WqB, const float *WkvA,
         const float *WkB, const float *WvB, const float *Wo,
         const float *w_q_a_norm, const float *w_kv_a_norm,
@@ -27653,18 +27715,39 @@ static bool glm_mla_forward_token_metal(
     const uint32_t qhd  = nope + rope;
     const uint32_t H    = shape->hidden;
 
+    /* Fast-path MLA tensors (NULL when !fast). The caller validated these are
+     * Q8_0 for this layer, so the fused kernel reads the quant weight straight
+     * from the mmap'd GGUF part -- no F32 dequant, no weight upload. k_b always
+     * uses the F32 WkB below (its native layout needs glm_k_b_reorder). */
+    const ds4_tensor *tq_a  = fast ? glm_layer_tensor(m, il, "attn_q_a")      : NULL;
+    const ds4_tensor *tq_b  = fast ? glm_layer_tensor(m, il, "attn_q_b")      : NULL;
+    const ds4_tensor *tkv_a = fast ? glm_layer_tensor(m, il, "attn_kv_a_mqa") : NULL;
+    const ds4_tensor *tv_b  = fast ? glm_layer_tensor(m, il, "attn_v_b")      : NULL;
+
     /* q path: WqA@x -> RMSNorm(learned) -> WqB@ -> q_flat [nh, qhd]. */
-    if (!ds4_gpu_glm_matvec_f32(WqA, x, wqa, ql, H)) return false;
+    if (fast) {
+        if (!glm_fused_q8_matvec(m->parts[tq_a->part].map, m->parts[tq_a->part].size,
+                                 tq_a->abs_offset, H, ql, x, wqa)) return false;
+    } else if (!ds4_gpu_glm_matvec_f32(WqA, x, wqa, ql, H)) return false;
     if (!ds4_gpu_glm_rmsnorm_f32(wqa, w_q_a_norm, wqa_n, ql, shape->rms_eps)) return false;
-    if (!ds4_gpu_glm_matvec_f32(WqB, wqa_n, q_flat, nh * qhd, ql)) return false;
+    if (fast) {
+        if (!glm_fused_q8_matvec(m->parts[tq_b->part].map, m->parts[tq_b->part].size,
+                                 tq_b->abs_offset, ql, nh * qhd, wqa_n, q_flat)) return false;
+    } else if (!ds4_gpu_glm_matvec_f32(WqB, wqa_n, q_flat, nh * qhd, ql)) return false;
 
     /* kv path: WkvA@x -> split latent/rope -> RMSNorm(latent) -> k_b/v_b. */
-    if (!ds4_gpu_glm_matvec_f32(WkvA, x, kva, kvl + rope, H)) return false;
+    if (fast) {
+        if (!glm_fused_q8_matvec(m->parts[tkv_a->part].map, m->parts[tkv_a->part].size,
+                                 tkv_a->abs_offset, H, kvl + rope, x, kva)) return false;
+    } else if (!ds4_gpu_glm_matvec_f32(WkvA, x, kva, kvl + rope, H)) return false;
     const float *latent     = kva;
     const float *k_rope_raw = kva + kvl;
     if (!ds4_gpu_glm_rmsnorm_f32(latent, w_kv_a_norm, kvln, kvl, shape->rms_eps)) return false;
-    if (!ds4_gpu_glm_matvec_f32(WkB, kvln, k_nope, nh * nope, kvl)) return false;
-    if (!ds4_gpu_glm_matvec_f32(WvB, kvln, v, nh * vd, kvl)) return false;
+    if (!ds4_gpu_glm_matvec_f32(WkB, kvln, k_nope, nh * nope, kvl)) return false;  /* k_b: F32 oracle */
+    if (fast) {
+        if (!glm_fused_q8_matvec(m->parts[tv_b->part].map, m->parts[tv_b->part].size,
+                                 tv_b->abs_offset, kvl, nh * vd, kvln, v)) return false;
+    } else if (!ds4_gpu_glm_matvec_f32(WvB, kvln, v, nh * vd, kvl)) return false;
 
     /* Insert current token k/v into host-side caches (rope unrotated first,
      * overwritten with rotated rope below -- mirrors the CPU composite). */
@@ -27698,7 +27781,11 @@ static bool glm_mla_forward_token_metal(
                                      attn_o, nh, nope, rope, vd, qhd, seq_n, t)) return false;
 
     /* Single attn_output projection: Wo @ attn_o -> out [H]. */
-    if (!ds4_gpu_glm_matvec_f32(Wo, attn_o, out, H, nh * vd)) return false;
+    if (fast) {
+        const ds4_tensor *twop = glm_layer_tensor(m, il, "attn_output");
+        if (!twop || !glm_fused_q8_matvec(m->parts[twop->part].map, m->parts[twop->part].size,
+                                          twop->abs_offset, nh * vd, H, attn_o, out)) return false;
+    } else if (!ds4_gpu_glm_matvec_f32(Wo, attn_o, out, H, nh * vd)) return false;
     return true;
 }
 
@@ -27778,6 +27865,13 @@ typedef struct {
     const ds4_tensor *t_embd, *t_out, *t_onorm;
     uint64_t embd_row_bytes;
     uint32_t vocab;
+    /* Fast Metal path: fused Q8_0 MLA projections (DS4_GLM_FAST=1). */
+    bool fast;
+    /* DS4_GLM_MLA_TIME: cumulative time inside glm_mla_forward_token_metal
+     * (the 6 MLA projections + rmsnorm/rope/attn/cache), for isolating the
+     * fused-Q8_0 MLA speedup from SSD-streaming / LM-head / MoE noise. */
+    double mla_total_s;
+    uint64_t mla_calls;
 } glm_metal_fwd_ctx;
 
 static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
@@ -27850,6 +27944,32 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
         c->Vc[l]    = xmalloc(v_bytes);
         c->Krop[l]  = xmalloc(k_rope_bytes);
     }
+
+    /* Fast path (DS4_GLM_FAST=1): register every split-GGUF part's mmap range
+     * as a no-copy Metal model view so ds4_gpu_matmul_q8_0_tensor can read the
+     * quant MLA weights straight from the mmap. ssd-streaming mode skips the
+     * full-residency wiring + warmup -- GLM streams the 238 GiB split on demand
+     * via mmap exactly like the F32 oracle, so no weight is materialized. */
+    c->fast = false;
+    if (glm_fast_enabled()) {
+        ds4_gpu_set_ssd_streaming(true);
+        bool ok = true;
+        for (uint32_t p = 0; p < m->part_count && ok; p++) {
+            if (!m->parts[p].map) continue;
+            /* max_tensor_bytes=0 lets the backend cap the view overlap per part
+             * (min(part_size, 4 GiB)), so the metadata-only shard and the
+             * 49 GiB data shards both register; the 4 GiB overlap still covers
+             * every MLA tensor (largest ~107 MB) so none spans a view edge. */
+            if (!ds4_gpu_set_model_map_range(m->parts[p].map, m->parts[p].size,
+                                             0, m->parts[p].size, 0)) {
+                fprintf(stderr, "ds4: glm-fast: failed to register model part %u\n", p);
+                ok = false;
+            }
+        }
+        c->fast = ok;
+        if (ok) fprintf(stderr, "ds4: glm-fast: fused Q8_0 MLA path enabled "
+                                "(DS4_GLM_FAST=1; attn_k_b stays on the F32 oracle)\n");
+    }
     return true;
 }
 
@@ -27863,6 +27983,12 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
     free(c->k_nope); free(c->vv); free(c->qrope); free(c->krope); free(c->attn_o); free(c->Q_comb);
     free(c->router_gate); free(c->moe_logits); free(c->idx); free(c->w);
     free(c->chunk_w); free(c->chunk_logits);
+    if (c->mla_calls && getenv("DS4_GLM_MLA_TIME"))
+        fprintf(stderr, "ds4: glm-metal MLA-block: %.3fs total, %.6fs avg/call "
+                        "(%llu calls, %s)\n",
+                c->mla_total_s, c->mla_total_s / (double)c->mla_calls,
+                (unsigned long long)c->mla_calls,
+                c->fast ? "fast=fused-Q8_0" : "fast=off-F32-oracle");
 }
 
 /* Process ONE token at sequence position `pos` on Metal, appending its K/V to
@@ -27895,22 +28021,37 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
         const ds4_tensor *wop  = glm_layer_tensor(m, il, "attn_output");
         if (!q_a || !q_b || !kv_a || !k_b || !v_b || !wop)
             ds4_die("glm-metal-ref: missing attention tensor");
-        glm_dequant_weight(m, q_a, c->WqA);
-        glm_dequant_weight(m, q_b, c->WqB);
-        glm_dequant_weight(m, kv_a, c->WkvA);
+        /* k_b is always dequanted + reordered (stays on the F32 oracle: its
+         * native [nope,kv_lora,n_head] layout cannot be read as a row-major
+         * [out,in] Q8_0 weight). The other five MLA projections are skipped
+         * here when this layer runs the fused Q8_0 fast path. */
+        const bool fast_l = c->fast && glm_mla_fast_eligible(m, il);
         glm_dequant_weight(m, k_b, c->WkBn);
         glm_k_b_reorder(c->WkB, c->WkBn, nope, kvl, nh);   /* real k_b is nope-contiguous */
-        glm_dequant_weight(m, v_b, c->WvB);
-        glm_dequant_weight(m, wop, c->Wo);
+        if (!fast_l) {
+            glm_dequant_weight(m, q_a, c->WqA);
+            glm_dequant_weight(m, q_b, c->WqB);
+            glm_dequant_weight(m, kv_a, c->WkvA);
+            glm_dequant_weight(m, v_b, c->WvB);
+            glm_dequant_weight(m, wop, c->Wo);
+        }
         const float *qa_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_q_a_norm"));
         const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
-        if (!glm_mla_forward_token_metal(xn, c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, c->Wo,
+        const bool mla_time = getenv("DS4_GLM_MLA_TIME") != NULL;
+        const double mla_t0 = mla_time ? now_sec() : 0.0;
+        if (!glm_mla_forward_token_metal(xn, m, il, fast_l,
+                                         c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, c->Wo,
                                          qa_norm, kv_norm,
                                          c->Knope[il], c->Vc[il], c->Krop[il],
                                          c->seq_n, pos, shape, mla_out,
                                          c->wqa, c->wqa_n, c->q_flat, c->kva, c->kvln,
                                          c->k_nope, c->vv, c->qrope, c->krope, c->attn_o, c->Q_comb))
             return false;
+        if (mla_time) { c->mla_total_s += now_sec() - mla_t0; c->mla_calls++; }
+        if (il == 3 && pos == 0 && getenv("DS4_GLM_ATTN3_OUT")) {
+            FILE *af = fopen(getenv("DS4_GLM_ATTN3_OUT"), "wb");
+            if (af) { fwrite(mla_out, sizeof(float), H, af); fclose(af); }
+        }
         for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
 
         /* ---- FFN block ---- */
