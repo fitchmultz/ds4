@@ -27136,3 +27136,159 @@ int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
         return ok;
     }
 }
+
+/* GLM top-K MoE fused gate/up via the existing IQ2_XXS pair+SwiGLU kernel.
+ * See ds4_gpu.h for the contract.  This is a thin host wrapper: it wraps the
+ * two IQ2_XXS expert tensor bases through the registered model view (weights
+ * stay quantized on the GPU), uploads the small F32 activation / K ids / K
+ * weights, dispatches kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32 with
+ * clamp_value=0 (GLM SwiGLU), and reads back the K*inter weighted mid.
+ * The down projection (no fused IQ3_XXS/IQ4_XS kernel) stays on the caller's
+ * F32 fallback. */
+int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
+        const void    *gate_map, uint64_t gate_map_size,
+        uint64_t gate_base_off, uint64_t gate_tensor_bytes,
+        const void    *up_map, uint64_t up_map_size,
+        uint64_t up_base_off, uint64_t up_tensor_bytes,
+        uint64_t expert_stride, uint32_t n_total_expert,
+        const float   *x,
+        const int32_t *selected_ids,
+        const float   *weights,
+        float         *mid_out,
+        uint32_t in_dim, uint32_t inter, uint32_t K) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!gate_map || !up_map || !x || !selected_ids || !weights || !mid_out ||
+        in_dim == 0 || (in_dim % 256u) != 0 || inter == 0 || K == 0 ||
+        expert_stride == 0 || n_total_expert == 0 ||
+        !g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline) {
+        return 0;
+    }
+    /* IQ2_XXS: 256-element blocks; one expert slab = [inter, in_dim] rows. */
+    const uint64_t row_bytes = expert_stride / inter;
+    const uint64_t want_gate_bytes = (uint64_t)n_total_expert * expert_stride;
+    if (want_gate_bytes != gate_tensor_bytes || want_gate_bytes != up_tensor_bytes) return 0;
+
+    @autoreleasepool {
+        /* Stage the K SELECTED experts' gate+up slabs into contiguous shared
+         * GPU buffers (CPU memcpy from the mmap, then the GPU reads resident
+         * memory).  The GLM model is SSD-streamed: the full expert tensor is
+         * 831 MB and only K=8 of 256 experts are touched per token, so the
+         * selected slabs are cold/evicted and a no-copy GPU view over the mmap
+         * page-faults slowly.  Staging K*expert_stride (~26 MB) per call keeps
+         * the fused kernel reading hot resident memory -- far less host->GPU
+         * traffic than the F32 path's K*inter*H*3 F32 uploads.  The compact
+         * id table [0..K-1] maps slot k to expert selected_ids[k] (staged in
+         * selection order). */
+        const uint64_t slot_bytes = expert_stride;
+        const uint64_t stage_bytes = (uint64_t)K * slot_bytes;
+        const char *gate_base = (const char *)gate_map + gate_base_off;
+        const char *up_base   = (const char *)up_map   + up_base_off;
+        ds4_gpu_tensor *tgate = ds4_gpu_tensor_alloc(stage_bytes);
+        ds4_gpu_tensor *tup   = ds4_gpu_tensor_alloc(stage_bytes);
+        if (!tgate || !tup) {
+            ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
+            return 0;
+        }
+        int range_ok = 1;
+        for (uint32_t k = 0; k < K && range_ok; k++) {
+            const uint64_t e = (uint64_t)(uint32_t)selected_ids[k];
+            if (e >= n_total_expert ||
+                e * slot_bytes > gate_tensor_bytes - slot_bytes ||
+                e * slot_bytes > up_tensor_bytes - slot_bytes ||
+                gate_base_off + e * slot_bytes > gate_map_size - slot_bytes ||
+                up_base_off   + e * slot_bytes > up_map_size   - slot_bytes) {
+                range_ok = 0;
+                break;
+            }
+            ds4_gpu_tensor_write(tgate, (uint64_t)k * slot_bytes,
+                                 gate_base + e * slot_bytes, slot_bytes);
+            ds4_gpu_tensor_write(tup, (uint64_t)k * slot_bytes,
+                                 up_base + e * slot_bytes, slot_bytes);
+        }
+        if (!range_ok) {
+            ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
+            return 0;
+        }
+
+        const uint64_t x_bytes       = (uint64_t)in_dim * sizeof(float);
+        const uint64_t ids_bytes     = (uint64_t)K * sizeof(int32_t);
+        const uint64_t weights_bytes = (uint64_t)K * sizeof(float);
+        const uint64_t mid_bytes     = (uint64_t)K * inter * sizeof(float);
+        ds4_gpu_tensor *tx   = ds4_gpu_tensor_alloc(x_bytes);
+        ds4_gpu_tensor *tids = ds4_gpu_tensor_alloc(ids_bytes);
+        ds4_gpu_tensor *tw   = ds4_gpu_tensor_alloc(weights_bytes);
+        ds4_gpu_tensor *tmid = ds4_gpu_tensor_alloc(mid_bytes);
+        /* The kernel always writes raw gate/up dots alongside mid; allocate
+         * scratch but do not read them back (only mid is needed for the down
+         * projection). */
+        ds4_gpu_tensor *tgdst = ds4_gpu_tensor_alloc(mid_bytes);
+        ds4_gpu_tensor *tudst = ds4_gpu_tensor_alloc(mid_bytes);
+        if (!tx || !tids || !tw || !tmid || !tgdst || !tudst) {
+            ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(tids); ds4_gpu_tensor_free(tw);
+            ds4_gpu_tensor_free(tmid); ds4_gpu_tensor_free(tgdst); ds4_gpu_tensor_free(tudst);
+            ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tx,   0, x,       x_bytes);
+        ds4_gpu_tensor_write(tw,   0, weights, weights_bytes);
+        /* Compact id table: slot k holds the k-th staged expert. */
+        int32_t compact_ids[4096];
+        if (K > sizeof(compact_ids) / sizeof(compact_ids[0])) {
+            ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(tids); ds4_gpu_tensor_free(tw);
+            ds4_gpu_tensor_free(tmid); ds4_gpu_tensor_free(tgdst); ds4_gpu_tensor_free(tudst);
+            ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
+            return 0;
+        }
+        for (uint32_t k = 0; k < K; k++) compact_ids[k] = (int32_t)k;
+        ds4_gpu_tensor_write(tids, 0, compact_ids, (uint64_t)K * sizeof(int32_t));
+
+        /* Mirrors ds4_metal.m's routed MoE path for IQ2_XXS (nr0=4, nsg=2,
+         * threadgroup = 256*uint64 + 128*uint8).  nb02 = slot_bytes (per-slot
+         * stride in the staging buffer); ne02 = K (only K staged slots). */
+        ds4_gpu_mul_mv_id_args args =
+            ds4_gpu_make_mul_mv_id_args(in_dim, inter, K,
+                                        row_bytes, slot_bytes,
+                                        1, K, 1, 4);
+        const uint64_t inter_bytes = (uint64_t)inter * sizeof(float);
+        ds4_gpu_dsv4_moe_swiglu_weight_args act = {
+            .width          = inter,
+            .rows           = K,
+            .gate_row_stride = inter_bytes,
+            .up_row_stride   = inter_bytes,
+            .mid_row_stride  = inter_bytes,
+            .weight_stride   = sizeof(float),
+            .write_clamped   = 0,
+            .clamp_value     = 0.0f,   /* GLM SwiGLU: no clamp */
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) {
+            ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(tids); ds4_gpu_tensor_free(tw);
+            ds4_gpu_tensor_free(tmid); ds4_gpu_tensor_free(tgdst); ds4_gpu_tensor_free(tudst);
+            ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
+            return 0;
+        }
+
+        const NSUInteger gate_smem = 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t);
+        int ok = ds4_gpu_encode_mul_mv_id_pair_swiglu(
+                cb,
+                g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline,
+                &args, &act,
+                ds4_gpu_tensor_buffer(tgate), ds4_gpu_tensor_offset(tgate),
+                ds4_gpu_tensor_buffer(tup),   ds4_gpu_tensor_offset(tup),
+                ds4_gpu_tensor_buffer(tx),   ds4_gpu_tensor_offset(tx),
+                ds4_gpu_tensor_buffer(tgdst), ds4_gpu_tensor_offset(tgdst),
+                ds4_gpu_tensor_buffer(tudst), ds4_gpu_tensor_offset(tudst),
+                ds4_gpu_tensor_buffer(tmid), ds4_gpu_tensor_offset(tmid),
+                ds4_gpu_tensor_buffer(tids), ds4_gpu_tensor_offset(tids),
+                ds4_gpu_tensor_buffer(tw),   ds4_gpu_tensor_offset(tw),
+                gate_smem, 2, false);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm moe gate/up iq2xxs");
+        if (ok) ds4_gpu_tensor_read(tmid, 0, mid_out, mid_bytes);
+        ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(tids); ds4_gpu_tensor_free(tw);
+        ds4_gpu_tensor_free(tmid); ds4_gpu_tensor_free(tgdst); ds4_gpu_tensor_free(tudst);
+        ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
+        return ok;
+    }
+}

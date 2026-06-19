@@ -27641,6 +27641,19 @@ static void glm_synth_free(glm_synth_ctx *c);
  * Q8_0 blocks). k_b is dequanted + reordered exactly as the oracle, so it
  * matches the oracle by construction. Fusing k_b needs a one-time reordered
  * quant buffer per layer and is deferred to a later step.
+ *
+ * Step 4 (same DS4_GLM_FAST=1 flag): the routed-expert MoE GATE/UP also runs a
+ * fused path for the common IQ2_XXS layers (ds4_gpu_glm_moe_gate_up_iq2xxs_
+ * fused -> kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32).  The K=8 selected
+ * experts' gate+up slabs are staged (CPU memcpy of the ~26 MB quant) into a
+ * hot shared GPU buffer, then one fused dispatch computes gate+up dot +
+ * SwiGLU + route-weight with the IQ2_XXS dequant ON THE GPU (previously each
+ * selected expert's gate/up/down slabs were dequanted to F32 and uploaded --
+ * ~1.2 GB F32 per layer, the dominant per-token cost across ~75 MoE layers).
+ * Staging (not a no-copy mmap view) is required because the 8 of 256 selected
+ * experts are SSD-evicted/cold, so a no-copy GPU view page-faults slowly.
+ * Down experts (IQ3_XXS / IQ4_XS, no fused kernel) and the shared expert stay
+ * on the F32 fallback. blk.8 (IQ2_S gate/up) falls back to F32.
  * ---------------------------------------------------------------------- */
 static bool glm_fast_enabled(void) {
     const char *e = getenv("DS4_GLM_FAST");
@@ -27662,6 +27675,24 @@ static bool glm_mla_fast_eligible(const ds4_model *m, uint32_t il) {
            ka->type == DS4_TENSOR_Q8_0 &&
            vb->type == DS4_TENSOR_Q8_0 &&
            op->type == DS4_TENSOR_Q8_0;
+}
+
+/* Step 4: the routed-expert GATE/UP MoE fast path.  Eligible when this layer's
+ * ffn_gate_exps / ffn_up_exps are both IQ2_XXS (the common case; blk.8 is
+ * IQ2_S and falls back to F32).  The fused IQ2_XXS pair+SwiGLU kernel stages
+ * the K selected experts' gate+up quant slabs into a hot shared GPU buffer
+ * and dequants ON THE GPU (no F32 gate/up dequant, no F32 gate/up upload);
+ * the DOWN experts (IQ3_XXS / IQ4_XS) have no fused kernel and stay on the
+ * F32 fallback.  Shared expert stays F32 (single expert, small cost). */
+static bool glm_moe_gate_up_iq2xxs_eligible(const ds4_model *m, uint32_t il) {
+    /* Only called from the MoE branch (il >= n_dense), so dense layers never
+     * reach here; ffn_gate_exps is absent on dense layers regardless. */
+    const ds4_tensor *ge = glm_layer_tensor(m, il, "ffn_gate_exps");
+    const ds4_tensor *ue = glm_layer_tensor(m, il, "ffn_up_exps");
+    return ge && ue &&
+           ge->type == DS4_TENSOR_IQ2_XXS &&
+           ue->type == DS4_TENSOR_IQ2_XXS &&
+           ge->dim[2] == ue->dim[2];
 }
 
 /* One fused Q8_0 decode matvec: out[out_dim] = W_q8_0[out_dim,in_dim] @ x[in_dim]
@@ -27856,6 +27887,9 @@ typedef struct {
     float *router_gate;   /* [E,H] F32 */
     float *moe_logits;
     int *idx; float *w;
+    /* Step 4 fast path: per-expert weighted SwiGLU mid [K,inter] produced by
+     * ds4_gpu_glm_moe_gate_up_iq2xxs_fused (route weight already baked in). */
+    float *moe_mid;
     /* LM head chunked scratch. */
     float *chunk_w, *chunk_logits;
     uint32_t chunk_rows;
@@ -27872,6 +27906,10 @@ typedef struct {
      * fused-Q8_0 MLA speedup from SSD-streaming / LM-head / MoE noise. */
     double mla_total_s;
     uint64_t mla_calls;
+    /* DS4_GLM_MOE_TIME: cumulative time in the MoE fast-path sub-stages
+     * (gate/up fused dispatch, down fallback, shared expert). */
+    double moe_gu_total, moe_down_total, moe_sh_total;
+    uint64_t moe_calls;
 } glm_metal_fwd_ctx;
 
 static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
@@ -27929,6 +27967,7 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
     c->moe_logits = xmalloc((size_t)E * sizeof(float));
     c->idx = xmalloc((size_t)K * sizeof(int));
     c->w = xmalloc((size_t)K * sizeof(float));
+    c->moe_mid = xmalloc((size_t)K * max_inter * sizeof(float));
     c->chunk_rows = 8192;
     c->chunk_w = xmalloc((size_t)c->chunk_rows * H * sizeof(float));
     c->chunk_logits = xmalloc((size_t)c->chunk_rows * sizeof(float));
@@ -27967,8 +28006,9 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
             }
         }
         c->fast = ok;
-        if (ok) fprintf(stderr, "ds4: glm-fast: fused Q8_0 MLA path enabled "
-                                "(DS4_GLM_FAST=1; attn_k_b stays on the F32 oracle)\n");
+        if (ok) fprintf(stderr, "ds4: glm-fast: fused Q8_0 MLA + IQ2_XXS MoE gate/up "
+                                "paths enabled (DS4_GLM_FAST=1; attn_k_b, down experts "
+                                "IQ3_XXS/IQ4_XS, shared expert stay F32 oracle)\n");
     }
     return true;
 }
@@ -27982,6 +28022,7 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
     free(c->wqa); free(c->wqa_n); free(c->q_flat); free(c->kva); free(c->kvln);
     free(c->k_nope); free(c->vv); free(c->qrope); free(c->krope); free(c->attn_o); free(c->Q_comb);
     free(c->router_gate); free(c->moe_logits); free(c->idx); free(c->w);
+    free(c->moe_mid);
     free(c->chunk_w); free(c->chunk_logits);
     if (c->mla_calls && getenv("DS4_GLM_MLA_TIME"))
         fprintf(stderr, "ds4: glm-metal MLA-block: %.3fs total, %.6fs avg/call "
@@ -27989,6 +28030,12 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
                 c->mla_total_s, c->mla_total_s / (double)c->mla_calls,
                 (unsigned long long)c->mla_calls,
                 c->fast ? "fast=fused-Q8_0" : "fast=off-F32-oracle");
+    if (c->moe_calls && getenv("DS4_GLM_MOE_TIME"))
+        fprintf(stderr, "ds4: glm-metal MoE fast-path: %.3fs gate/up, %.3fs down, "
+                        "%.3fs shared (%llu MoE-layer calls, %.6fs avg gu/call)\n",
+                c->moe_gu_total, c->moe_down_total, c->moe_sh_total,
+                (unsigned long long)c->moe_calls,
+                c->moe_gu_total / (double)c->moe_calls);
 }
 
 /* Process ONE token at sequence position `pos` on Metal, appending its K/V to
@@ -28093,24 +28140,66 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
             if (!ds4_gpu_glm_matvec_f32(c->router_gate, xn, c->moe_logits, c->E, H)) return false;
             if (!ds4_gpu_glm_moe_route_f32(c->moe_logits, (const float *)tensor_data(m, bias_t),
                                            c->idx, c->w, c->E, K, shape->moe_scale)) return false;
+            /* Step 4 fast path: when this layer's gate/up experts are IQ2_XXS,
+             * fuse the K selected experts' gate+up dot products + SwiGLU +
+             * route-weight into one dispatch (weights stay quantized on the
+             * GPU; route weight is baked into mid[k]).  DOWN experts (no fused
+             * IQ3_XXS/IQ4_XS kernel) stay on the F32 fallback below. */
+            const bool moe_fast =
+                c->fast && glm_moe_gate_up_iq2xxs_eligible(m, il);
+            const bool moe_prof = getenv("DS4_GLM_MOE_TIME") != NULL;
+            double gu_t = 0.0, down_t = 0.0, sh_t = 0.0;
+            if (moe_fast) {
+                const double gu0 = moe_prof ? now_sec() : 0.0;
+                if (!ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
+                        m->parts[ge->part].map, m->parts[ge->part].size,
+                        ge->abs_offset, ge->bytes,
+                        m->parts[ue->part].map, m->parts[ue->part].size,
+                        ue->abs_offset, ue->bytes,
+                        pe_gate, (uint32_t)ge->dim[2],
+                        xn, c->idx, c->w, c->moe_mid, H, ei, K))
+                    return false;
+                if (moe_prof) gu_t = now_sec() - gu0;
+            }
             for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] = 0.0f;
+            const double down0 = moe_prof ? now_sec() : 0.0;
             for (uint32_t k = 0; k < K; k++) {
                 const uint32_t e = (uint32_t)c->idx[k];
-                glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
-                glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
-                glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
-                if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
-                    return false;
                 const float wk = c->w[k];
-                for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
+                if (moe_fast) {
+                    /* gate/up fused above (mid[k] = silu(gate@x)*(up@x)*wk).
+                     * down @ mid[k] is already route-weighted, so accumulate
+                     * unweighted.  Only the down slab is dequanted per expert. */
+                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
+                    if (!ds4_gpu_glm_matvec_f32(c->fdown, c->moe_mid + (uint64_t)k * ei,
+                                                etmp, H, ei))
+                        return false;
+                    for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
+                } else {
+                    glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
+                    glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
+                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
+                    if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
+                        return false;
+                    for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
+                }
             }
             /* shared expert added directly (weight 1.0, DeepSeek/GLM convention). */
+            if (moe_prof) down_t = now_sec() - down0;
+            const double sh0 = moe_prof ? now_sec() : 0.0;
             glm_dequant_weight(m, gsh, c->fgate);
             glm_dequant_weight(m, ush, c->fup);
             glm_dequant_weight(m, dsh, c->fdown);
             if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
                 return false;
             for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
+            if (moe_prof) {
+                sh_t = now_sec() - sh0;
+                c->moe_gu_total += gu_t;
+                c->moe_down_total += down_t;
+                c->moe_sh_total += sh_t;
+                c->moe_calls++;
+            }
         }
         for (uint32_t d = 0; d < H; d++) x[d] = res[d] + ffn_out[d];
         if (glm_fwd_progress && prog_every && (il + 1) % prog_every == 0)

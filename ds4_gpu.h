@@ -1068,6 +1068,42 @@ int ds4_gpu_glm_moe_route_f32(const float * logits, const float * bias,
 int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
                            float * out, uint32_t n);
 
+/* GLM top-K MoE FUSED gate/up via the existing IQ2_XXS pair+SwiGLU kernel
+ * (kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32).  For each selected expert
+ * k=0..K-1, with e=selected_ids[k] and route weight w=weights[k]:
+ *
+ *     mid[k, 0..inter-1] = ( silu(gate_e @ x) * (up_e @ x) ) * w
+ *
+ * The K selected experts' IQ2_XXS gate+up slabs are STAGED (CPU memcpy of the
+ * ~26 MB quant) into hot shared GPU buffers, then one fused dispatch computes
+ * the gate+up dot + SwiGLU + route-weight with the IQ2_XXS dequant ON THE GPU
+ * -- no F32 gate/up dequant, no F32 gate/up upload (vs the F32 oracle's
+ * ~1.2 GB F32 upload per layer).  Staging (not a no-copy mmap view) is used
+ * because the 8 of 256 selected experts are SSD-evicted/cold, so a no-copy GPU
+ * view page-faults slowly; the small quant staging (~26 MB) keeps the fused
+ * kernel on hot resident memory.  clamp_value is 0 (GLM's SwiGLU has no clamp),
+ * so the kernel matches ds4.c glm_swiglu_dense_f32.
+ *
+ * gate/up expert tensors share shape [inter, in_dim] expert-major last dim,
+ * each expert slab = expert_stride bytes; the full expert tensor
+ * [inter, in_dim, n_total_expert] = expert_stride*n_total_expert bytes.
+ * gate_map/up_map may be the same or different GGUF parts.
+ *
+ * The DOWN projection (IQ3_XXS/IQ4_XS, no fused kernel) stays on the caller's
+ * F32 fallback: for each k, dequant down_e and dot against mid+k*inter.
+ * Returns 1 on success.  Behind DS4_GLM_FAST=1 (Step 4). */
+int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
+        const void    *gate_map, uint64_t gate_map_size,
+        uint64_t gate_base_off, uint64_t gate_tensor_bytes,
+        const void    *up_map,   uint64_t up_map_size,
+        uint64_t up_base_off,   uint64_t up_tensor_bytes,
+        uint64_t expert_stride, uint32_t n_total_expert,
+        const float   *x,             /* [in_dim]  F32 activation */
+        const int32_t *selected_ids,  /* [K]       expert ids     */
+        const float   *weights,       /* [K]       route weights  */
+        float         *mid_out,       /* [K*inter] F32 weighted mid */
+        uint32_t in_dim, uint32_t inter, uint32_t K);
+
 #ifdef __cplusplus
 }
 #endif
