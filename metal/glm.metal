@@ -243,3 +243,171 @@ kernel void kernel_glm_swiglu_f32(
                                   : exp(g) / (1.0f + exp(g));
     out[gid] = g * sig * u;
 }
+
+// =======================================================================
+// Phase 4c-fast-down: GLM routed-MoE DOWN projection, fused on the GPU.
+//
+// moe.metal #undefs QK_K at its end, so (re)define it locally for the block
+// math below (all GLM-5.2 routed quants use 256-element blocks).
+// =======================================================================
+#ifndef QK_K
+#define QK_K 256
+#endif
+
+// =======================================================================
+// Replaces the F32 fallback that dequanted each selected down slab to F32 on
+// the CPU (~50 MB/expert) and uploaded it for a per-expert F32 matvec.  The
+// K selected experts' QUANTIZED down slabs are staged into one hot shared GPU
+// buffer (as Step 4 did for gate/up); these kernels dequant ON the GPU and
+// accumulate the K route-weighted matvecs into a single ffn_out[hidden] in one
+// dispatch:
+//
+//     ffn_out[d] = sum_{k=0..K-1} sum_{i=0..inter-1}
+//                      dequant(W_down[k, d, i]) * mid[k, i]
+//
+// W_down native layout is [inter, hidden, expert] (inter contiguous): within a
+// staged expert slab the rows are hidden-major, each row `inter` elements =
+// (inter/QK_K) quant blocks laid out block-contiguous.  mid[k] is the route-
+// WEIGHTED SwiGLU mid from the fused gate/up path, so the down dot is
+// accumulated UNWEIGHTED across k.  Behind DS4_GLM_FAST=1.
+//
+// Decomposition mirrors kernel_mul_mv_iq2_xxs_f32_impl: one simdgroup (32
+// lanes) per OUTPUT ROW d; lanes stride over the row's (inter/32) 32-element
+// sub-blocks (each lane handles inter/32/32 sub-blocks) and over the K experts.
+// The lane-local dot is simd_sum-reduced; lane 0 writes the row.  Dequant math
+// mirrors ds4_dequant_iq3_xxs / ds4_dequant_iq4_xs (ds4.c) element-for-element
+// (same db/dl, same grid/sign/nibble order, same per-element weight fold) so the
+// only divergence from the F32 oracle is the parallel reduction ORDER -- well
+// inside the 1e-4 abs / 1e-5 rel tolerance used for the fused gate/up path.
+// =======================================================================
+
+struct ds4_metal_args_glm_moe_down {
+    uint32_t hidden;        // H: output rows (6144)
+    uint32_t inter;         // ei: input cols per expert (2048, multiple of QK_K)
+    uint32_t K;             // selected experts (8)
+    uint32_t block_bytes;   // bytes per quant block (98 IQ3_XXS / 136 IQ4_XS)
+    uint64_t row_bytes;     // bytes per down weight row = (inter/QK_K)*block_bytes
+    uint64_t expert_stride; // bytes per expert slab = hidden * row_bytes
+};
+
+// IQ3_XXS down experts (the common case: every MoE layer except blk.8 + blk.75..77).
+// Block (98 B): half d | qs[64] (8 grid idx/sub-block) | scales[32] (4 B/sub-block).
+// The 4-byte scales_and_signs packs a 4-bit scale (>>28) and four 7-bit sign
+// indices; db = d*(0.5 + scale)*0.5; grid lookups via iq3xxs_grid, signs via
+// ksigns_iq2xs (both shared with the IQ2_XXS path, defined in moe.metal).
+kernel void kernel_glm_moe_down_iq3xxs_f32(
+        constant ds4_metal_args_glm_moe_down & args [[buffer(0)]],
+        device const char  * src0   [[buffer(1)]],   // staged down weights [K*expert_stride]
+        device const float * mid    [[buffer(2)]],   // [K, inter] F32 (route-weighted)
+        device       float * dst    [[buffer(3)]],   // [hidden] F32
+        threadgroup  char  * shmem  [[threadgroup(0)]],
+        uint  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint32_t H = args.hidden, ei = args.inter, K = args.K;
+    if (tgpig >= H) return;
+    const uint32_t d = (uint32_t)tgpig;
+    const uint32_t nb32 = (ei / QK_K) * (QK_K / 32);   // 32-elem sub-blocks per row
+
+    // Stage iq3xxs_grid (256 uint32) + ksigns_iq2xs (128 uint8) into threadgroup
+    // so the data-dependent grid/sign lookups hit fast shared memory (same
+    // pattern as kernel_mul_mv_iq2_xxs_f32_impl).
+    threadgroup uint32_t * sgrid  = (threadgroup uint32_t *)shmem;
+    threadgroup uint8_t  * ssigns = (threadgroup uint8_t *)(sgrid + 256);
+    for (uint32_t i = tiisg; i < 256; i += 32) sgrid[i]  = ds4_metal_iq3xxs_grid[i];
+    for (uint32_t i = tiisg; i < 128; i += 32) ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sumf = 0.0f;
+    const uint32_t ix = tiisg;
+    for (uint32_t k = 0; k < K; k++) {
+        device const char  * row_base = src0 + (uint64_t)k * args.expert_stride
+                                        + (uint64_t)d * args.row_bytes;
+        device const float * y = mid + (uint64_t)k * ei + 32u * ix;
+        for (uint32_t ib32 = ix; ib32 < nb32; ib32 += 32) {
+            float yl[32];
+            for (uint32_t i = 0; i < 32; ++i) yl[i] = y[i];
+            const uint32_t ibl = ib32 / (QK_K / 32);   // block index in row
+            const uint32_t ib  = ib32 % (QK_K / 32);   // sub-block within block
+            device const char * blk = row_base + (uint64_t)ibl * args.block_bytes;
+            const float d_block = (float)((device const half *)blk)[0];
+            // qs (grid indices) at offset 2; scales_and_signs at offset 2+64.
+            device const uint8_t * qs = (device const uint8_t *)(blk + 2) + ib * 8;
+            device const uint8_t * sc = (device const uint8_t *)(blk + 2 + 64) + ib * 4;
+            const uint32_t aux32 = (uint32_t)sc[0] | ((uint32_t)sc[1] << 8)
+                                 | ((uint32_t)sc[2] << 16) | ((uint32_t)sc[3] << 24);
+            const float db = d_block * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+            float sum = 0.0f;
+            for (uint32_t l = 0; l < 4; ++l) {
+                const threadgroup uint8_t * g1 = (const threadgroup uint8_t *)(sgrid + qs[2*l]);
+                const threadgroup uint8_t * g2 = (const threadgroup uint8_t *)(sgrid + qs[2*l+1]);
+                const uint8_t signs = ssigns[(aux32 >> (7*l)) & 127];
+                for (uint32_t j = 0; j < 4; ++j) {
+                    // Fold db per element (matches the F32 oracle's dequant-then-matvec
+                    // order: w = (db*grid)*sign, then += w * mid).
+                    const float w1 = db * (float)g1[j] * (signs & ds4_metal_kmask_iq2xs[j]   ? -1.f : 1.f);
+                    const float w2 = db * (float)g2[j] * (signs & ds4_metal_kmask_iq2xs[j+4] ? -1.f : 1.f);
+                    sum += w1 * yl[8*l + j];
+                    sum += w2 * yl[8*l + 4 + j];
+                }
+            }
+            sumf += sum;
+            y += 32u * 32u;
+        }
+    }
+
+    const float total = simd_sum(sumf);
+    if (ix == 0) dst[d] = total;
+}
+
+// IQ4_XS down experts (blk.8 + blk.75..77).  Block (136 B): half d | uint16
+// scales_h | scales_l[4] | qs[128].  Per 32-elem sub-block ib: 16 qs bytes ->
+// 32 values via kvalues_iq4nl[16] (low/high nibble); ls packs 4 bits from
+// scales_l and 2 bits from scales_h; dl = d*(ls-32).
+kernel void kernel_glm_moe_down_iq4xs_f32(
+        constant ds4_metal_args_glm_moe_down & args [[buffer(0)]],
+        device const char  * src0   [[buffer(1)]],   // staged down weights [K*expert_stride]
+        device const float * mid    [[buffer(2)]],   // [K, inter] F32 (route-weighted)
+        device       float * dst    [[buffer(3)]],   // [hidden] F32
+        uint  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint32_t H = args.hidden, ei = args.inter, K = args.K;
+    if (tgpig >= H) return;
+    const uint32_t d = (uint32_t)tgpig;
+    const uint32_t nb32 = (ei / QK_K) * (QK_K / 32);
+
+    float sumf = 0.0f;
+    const uint32_t ix = tiisg;
+    for (uint32_t k = 0; k < K; k++) {
+        device const char  * row_base = src0 + (uint64_t)k * args.expert_stride
+                                        + (uint64_t)d * args.row_bytes;
+        device const float * y = mid + (uint64_t)k * ei + 32u * ix;
+        for (uint32_t ib32 = ix; ib32 < nb32; ib32 += 32) {
+            float yl[32];
+            for (uint32_t i = 0; i < 32; ++i) yl[i] = y[i];
+            const uint32_t ibl = ib32 / (QK_K / 32);
+            const uint32_t ib  = ib32 % (QK_K / 32);
+            device const char * blk = row_base + (uint64_t)ibl * args.block_bytes;
+            const float d_block = (float)((device const half *)blk)[0];
+            // scales_h (uint16) at offset 2; scales_l[4] at offset 4; qs[128] at offset 8.
+            const uint16_t scales_h = (uint16_t)((uint8_t)blk[2] | ((uint8_t)blk[3] << 8));
+            device const uint8_t * scales_l = (device const uint8_t *)(blk + 4);
+            device const uint8_t * qs = (device const uint8_t *)(blk + 8) + ib * 16;
+            const uint32_t ls = ((uint32_t)(scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf)
+                              | (((uint32_t)(scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d_block * (float)((int32_t)ls - 32);
+            float sum = 0.0f;
+            for (uint32_t j = 0; j < 16; ++j) {
+                const uint8_t qb = qs[j];
+                const float w_lo = dl * (float)ds4_metal_kvalues_iq4nl[qb & 0xf];
+                const float w_hi = dl * (float)ds4_metal_kvalues_iq4nl[qb >> 4];
+                sum += w_lo * yl[j];
+                sum += w_hi * yl[j + 16];
+            }
+            sumf += sum;
+            y += 32u * 32u;
+        }
+    }
+
+    const float total = simd_sum(sumf);
+    if (ix == 0) dst[d] = total;
+}

@@ -83,6 +83,8 @@ static id<MTLComputePipelineState> g_bin_div_row_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
+static id<MTLComputePipelineState> g_glm_moe_down_iq3xxs_pipeline;
+static id<MTLComputePipelineState> g_glm_moe_down_iq4xs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q2_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pipeline;
@@ -5153,6 +5155,42 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
+        fn = [library newFunctionWithName:@"kernel_glm_moe_down_iq3xxs_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_glm_moe_down_iq3xxs_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_glm_moe_down_iq3xxs_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_glm_moe_down_iq3xxs_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_glm_moe_down_iq3xxs_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_glm_moe_down_iq4xs_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_glm_moe_down_iq4xs_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_glm_moe_down_iq4xs_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_glm_moe_down_iq4xs_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_glm_moe_down_iq4xs_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_id_q2_K_f32"
                            constantValues:moe_mv_id_constants
                                     error:&error];
@@ -6736,6 +6774,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_id_iq2_xxs_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pair_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline = nil;
+        g_glm_moe_down_iq3xxs_pipeline = nil;
+        g_glm_moe_down_iq4xs_pipeline = nil;
         g_moe_mul_mv_id_q2_k_pipeline = nil;
         g_moe_mul_mv_id_q2_k_sum6_pipeline = nil;
         g_moe_mul_mv_id_q4_k_pipeline = nil;
@@ -27291,4 +27331,144 @@ int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
         ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
         return ok;
     }
+}
+
+/* Host mirror of ds4_metal_args_glm_moe_down (metal/glm.metal). */
+struct ds4_gpu_glm_moe_down_args {
+    uint32_t hidden;
+    uint32_t inter;
+    uint32_t K;
+    uint32_t block_bytes;
+    uint64_t row_bytes;
+    uint64_t expert_stride;
+};
+
+/* Shared host driver for the fused GLM MoE DOWN projection (IQ3_XXS / IQ4_XS).
+ * See ds4_gpu.h for the contract.  Stages the K selected experts' quantized
+ * down slabs into one hot shared GPU buffer (CPU memcpy, no dequant), uploads
+ * the route-weighted mid, dispatches the type-specific kernel, reads back
+ * ffn_out[hidden].  Mirrors the gate/up wrapper's staging/range discipline. */
+static int ds4_gpu_glm_moe_down_fused_impl(
+        id<MTLComputePipelineState> pipe,
+        uint32_t block_bytes,
+        const void    *down_map, uint64_t down_map_size,
+        uint64_t down_base_off, uint64_t down_tensor_bytes,
+        uint64_t expert_stride, uint32_t n_total_expert,
+        const int32_t *selected_ids,
+        const float   *mid,        /* [K*inter] F32, route-weighted */
+        float         *ffn_out,    /* [hidden] F32 */
+        uint32_t hidden, uint32_t inter, uint32_t K) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!pipe || !down_map || !selected_ids || !mid || !ffn_out ||
+        hidden == 0 || inter == 0 || K == 0 || (inter % 256u) != 0 ||
+        expert_stride == 0 || n_total_expert == 0 ||
+        expert_stride % hidden != 0) {
+        return 0;
+    }
+    const uint64_t row_bytes = expert_stride / hidden;
+    const uint64_t want_bytes = (uint64_t)n_total_expert * expert_stride;
+    if (want_bytes != down_tensor_bytes) return 0;
+    if (row_bytes != (inter / 256u) * block_bytes) return 0;   /* sanity */
+
+    @autoreleasepool {
+        const uint64_t slot_bytes = expert_stride;
+        const uint64_t stage_bytes = (uint64_t)K * slot_bytes;
+        const char *down_base = (const char *)down_map + down_base_off;
+        ds4_gpu_tensor *tdown = ds4_gpu_tensor_alloc(stage_bytes);
+        if (!tdown) return 0;
+        int range_ok = 1;
+        for (uint32_t k = 0; k < K && range_ok; k++) {
+            const uint64_t e = (uint64_t)(uint32_t)selected_ids[k];
+            if (e >= n_total_expert ||
+                e * slot_bytes > down_tensor_bytes - slot_bytes ||
+                down_base_off + e * slot_bytes > down_map_size - slot_bytes) {
+                range_ok = 0;
+                break;
+            }
+            ds4_gpu_tensor_write(tdown, (uint64_t)k * slot_bytes,
+                                 down_base + e * slot_bytes, slot_bytes);
+        }
+        if (!range_ok) { ds4_gpu_tensor_free(tdown); return 0; }
+
+        const uint64_t mid_bytes  = (uint64_t)K * inter * sizeof(float);
+        const uint64_t out_bytes  = (uint64_t)hidden * sizeof(float);
+        ds4_gpu_tensor *tmid = ds4_gpu_tensor_alloc(mid_bytes);
+        ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(out_bytes);
+        if (!tmid || !tout) {
+            ds4_gpu_tensor_free(tdown); ds4_gpu_tensor_free(tmid); ds4_gpu_tensor_free(tout);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tmid, 0, mid, mid_bytes);
+
+        struct ds4_gpu_glm_moe_down_args args = {
+            .hidden = hidden,
+            .inter = inter,
+            .K = K,
+            .block_bytes = block_bytes,
+            .row_bytes = row_bytes,
+            .expert_stride = expert_stride,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) {
+            ds4_gpu_tensor_free(tdown); ds4_gpu_tensor_free(tmid); ds4_gpu_tensor_free(tout);
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        int ok = 0;
+        [enc setComputePipelineState:pipe];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(tdown) offset:ds4_gpu_tensor_offset(tdown) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(tmid)  offset:ds4_gpu_tensor_offset(tmid)  atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(tout)  offset:ds4_gpu_tensor_offset(tout)  atIndex:3];
+        /* IQ3_XXS kernel needs threadgroup memory for the grid+signs tables
+         * (256 uint32 + 128 uint8 = 1152 B); IQ4_XS uses no threadgroup mem,
+         * but allocating it is harmless. */
+        const NSUInteger tg_bytes = 256u * sizeof(uint32_t) + 128u * sizeof(uint8_t);
+        [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
+        /* One threadgroup (32 lanes = 1 simdgroup) per output row. */
+        [enc dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ok = 1;
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm moe down fused");
+        if (ok) ds4_gpu_tensor_read(tout, 0, ffn_out, out_bytes);
+        ds4_gpu_tensor_free(tdown); ds4_gpu_tensor_free(tmid); ds4_gpu_tensor_free(tout);
+        return ok;
+    }
+}
+
+/* GLM top-K MoE FUSED down projection for IQ3_XXS down experts (the common
+ * case).  See ds4_gpu.h for the full contract. */
+int ds4_gpu_glm_moe_down_iq3xxs_fused(
+        const void    *down_map, uint64_t down_map_size,
+        uint64_t down_base_off, uint64_t down_tensor_bytes,
+        uint64_t expert_stride, uint32_t n_total_expert,
+        const int32_t *selected_ids,
+        const float   *mid,
+        float         *ffn_out,
+        uint32_t hidden, uint32_t inter, uint32_t K) {
+    return ds4_gpu_glm_moe_down_fused_impl(g_glm_moe_down_iq3xxs_pipeline,
+            /*block_bytes=*/98u,
+            down_map, down_map_size, down_base_off, down_tensor_bytes,
+            expert_stride, n_total_expert,
+            selected_ids, mid, ffn_out, hidden, inter, K);
+}
+
+/* GLM top-K MoE FUSED down projection for IQ4_XS down experts (blk.8 +
+ * blk.75..77).  See ds4_gpu.h. */
+int ds4_gpu_glm_moe_down_iq4xs_fused(
+        const void    *down_map, uint64_t down_map_size,
+        uint64_t down_base_off, uint64_t down_tensor_bytes,
+        uint64_t expert_stride, uint32_t n_total_expert,
+        const int32_t *selected_ids,
+        const float   *mid,
+        float         *ffn_out,
+        uint32_t hidden, uint32_t inter, uint32_t K) {
+    return ds4_gpu_glm_moe_down_fused_impl(g_glm_moe_down_iq4xs_pipeline,
+            /*block_bytes=*/136u,
+            down_map, down_map_size, down_base_off, down_tensor_bytes,
+            expert_stride, n_total_expert,
+            selected_ids, mid, ffn_out, hidden, inter, K);
 }

@@ -1104,6 +1104,43 @@ int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
         float         *mid_out,       /* [K*inter] F32 weighted mid */
         uint32_t in_dim, uint32_t inter, uint32_t K);
 
+/* GLM top-K MoE FUSED DOWN projection (Step 6) for the routed-expert down
+ * tensors.  For each selected expert k=0..K-1 with e=selected_ids[k],
+ * accumulates the route-weighted down matvec into one ffn_out[hidden]:
+ *
+ *     ffn_out[d] = sum_{k=0..K-1} sum_{i=0..inter-1}
+ *                      dequant(W_down[e_k, d, i]) * mid[k, i]
+ *
+ * `mid` is the route-WEIGHTED SwiGLU mid from the fused gate/up path
+ * (ds4_gpu_glm_moe_gate_up_iq2xxs_fused), so the K dots are accumulated
+ * UNWEIGHTED.  The K selected experts' quantized down slabs are STAGED (CPU
+ * memcpy, no dequant) into a hot shared GPU buffer, then one fused dispatch
+ * dequants ON the GPU (IQ3_XXS or IQ4_XS) and sums the K dots -- replacing
+ * the F32 fallback's per-expert CPU dequant + F32 upload + F32 matvec.
+ *
+ * Down expert tensor native layout is [inter, hidden, expert] (inter
+ * contiguous); expert_stride = bytes per expert slab = hidden*row_bytes; the
+ * full tensor = expert_stride*n_total_expert bytes.  iq3xxs covers the common
+ * layers; iq4xs covers blk.8 + blk.75..77.  Returns 1 on success.
+ * Behind DS4_GLM_FAST=1 (Step 6). */
+int ds4_gpu_glm_moe_down_iq3xxs_fused(
+        const void    *down_map, uint64_t down_map_size,
+        uint64_t down_base_off, uint64_t down_tensor_bytes,
+        uint64_t expert_stride, uint32_t n_total_expert,
+        const int32_t *selected_ids,  /* [K]       expert ids            */
+        const float   *mid,           /* [K*inter] F32 route-weighted mid */
+        float         *ffn_out,       /* [hidden]  F32 output             */
+        uint32_t hidden, uint32_t inter, uint32_t K);
+
+int ds4_gpu_glm_moe_down_iq4xs_fused(
+        const void    *down_map, uint64_t down_map_size,
+        uint64_t down_base_off, uint64_t down_tensor_bytes,
+        uint64_t expert_stride, uint32_t n_total_expert,
+        const int32_t *selected_ids,  /* [K]       expert ids            */
+        const float   *mid,           /* [K*inter] F32 route-weighted mid */
+        float         *ffn_out,       /* [hidden]  F32 output             */
+        uint32_t hidden, uint32_t inter, uint32_t K);
+
 #ifdef __cplusplus
 }
 #endif

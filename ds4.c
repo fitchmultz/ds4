@@ -27695,6 +27695,75 @@ static bool glm_moe_gate_up_iq2xxs_eligible(const ds4_model *m, uint32_t il) {
            ge->dim[2] == ue->dim[2];
 }
 
+/* Step 6: the routed-expert DOWN fast path.  Eligible when this layer's
+ * ffn_down_exps is IQ3_XXS (ggml type 18, the common case) or IQ4_XS (type 23,
+ * blk.8 + blk.75..77); both have a fused GPU dequant+matvec kernel.  Returns
+ * the ggml type (18/23) when eligible, 0 otherwise (caller falls back to the
+ * F32 per-expert down loop).  The down slab is laid out [inter,hidden] per
+ * expert (inter contiguous), ei a multiple of QK_K=256, so the kernel's
+ * 256-element block dequant applies directly. */
+#define GLM_DOWN_TYPE_IQ3_XXS 18
+#define GLM_DOWN_TYPE_IQ4_XS  23
+static int glm_moe_down_fused_type(const ds4_model *m, uint32_t il) {
+    const ds4_tensor *de = glm_layer_tensor(m, il, "ffn_down_exps");
+    if (!de || de->ndim < 3) return 0;
+    const uint32_t ei = (uint32_t)de->dim[0];
+    if (ei == 0 || (ei % 256u) != 0) return 0;
+    if (de->type == GLM_DOWN_TYPE_IQ3_XXS) return GLM_DOWN_TYPE_IQ3_XXS;
+    if (de->type == GLM_DOWN_TYPE_IQ4_XS)  return GLM_DOWN_TYPE_IQ4_XS;
+    return 0;
+}
+
+/* Step 6 diagnostic: parse DS4_GLM_DOWN_VERIFY_LAYERS (comma list, e.g.
+ * "9,30,8,75") and return true if `il` is listed.  Used to A/B the fused down
+ * output against the F32-oracle down sum on specific layers (token 0 only, to
+ * avoid per-token spam).  Returns false when the env is unset. */
+static bool glm_down_verify_layer(uint32_t il) {
+    const char *list = getenv("DS4_GLM_DOWN_VERIFY_LAYERS");
+    if (!list || !list[0]) return false;
+    char buf[128];
+    /* ponytail: tiny env scan, strtok over a copy; layers are <= 3 digits. */
+    snprintf(buf, sizeof(buf), "%s", list);
+    for (char *p = strtok(buf, ","); p; p = strtok(NULL, ",")) {
+        if ((uint32_t)atoi(p) == il) return true;
+    }
+    return false;
+}
+
+/* Step 6 diagnostic: diff the fused down output (fused[H]) against the
+ * F32-oracle down sum (ref[H]) over H elements and print max abs / rel error.
+ * Optionally dumps both vectors to DS4_GLM_DOWN_VERIFY_DIR for offline A/B. */
+static void glm_down_verify_report(uint32_t il, int type,
+                                   const float *fused, const float *ref, uint32_t H) {
+    float max_abs = 0.0f, max_rel = 0.0f;
+    double sum_abs = 0.0;
+    for (uint32_t d = 0; d < H; d++) {
+        const float a = fused[d], b = ref[d];
+        const float dd = fabsf(a - b);
+        if (dd > max_abs) max_abs = dd;
+        const float denom = fmaxf(fabsf(a), fabsf(b));
+        if (denom > 1e-6f) {
+            const float rel = dd / denom;
+            if (rel > max_rel) max_rel = rel;
+        }
+        sum_abs += (double)dd;
+    }
+    fprintf(stderr, "ds4: glm-down-verify: blk.%u type=%d H=%u "
+                    "max_abs=%.3e max_rel=%.3e mean_abs=%.3e\n",
+            il, type, H, (double)max_abs, (double)max_rel,
+            sum_abs / (double)H);
+    const char *dir = getenv("DS4_GLM_DOWN_VERIFY_DIR");
+    if (dir && dir[0]) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/ds4_down_fused_%u.bin", dir, il);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(fused, sizeof(float), H, f); fclose(f); }
+        snprintf(path, sizeof(path), "%s/ds4_down_ref_%u.bin", dir, il);
+        f = fopen(path, "wb");
+        if (f) { fwrite(ref, sizeof(float), H, f); fclose(f); }
+    }
+}
+
 /* Step 5: the SHARED-expert fast path.  The shared expert (Q5_K gate/up +
  * Q6_K down in GLM UD-IQ2_M) runs on every MoE layer of every token, so its
  * pages are resident after the first touch (unlike the SSD-evicted routed
@@ -27901,6 +27970,10 @@ typedef struct {
     /* Step 4 fast path: per-expert weighted SwiGLU mid [K,inter] produced by
      * ds4_gpu_glm_moe_gate_up_iq2xxs_fused (route weight already baked in). */
     float *moe_mid;
+    /* Step 6 diagnostic: when DS4_GLM_DOWN_VERIFY_LAYERS is set, holds the
+     * F32-oracle down sum for one layer so it can be diffed against the fused
+     * down output (per-layer tolerance proof). NULL unless verify is used. */
+    float *down_ref;
     /* LM head chunked scratch. */
     float *chunk_w, *chunk_logits;
     uint32_t chunk_rows;
@@ -27933,6 +28006,10 @@ typedef struct {
     /* Step 5 diagnostic: count MoE layers that took the fused shared-expert
      * path (for verifying eligibility + A/B attribution). */
     uint64_t shexp_fast_calls, shexp_fallback_calls;
+    /* Step 6 diagnostic: count MoE layers that took the fused down path vs
+     * the F32 fallback (verifies eligibility + A/B attribution via
+     * DS4_GLM_NO_DOWN_FAST). */
+    uint64_t down_fast_calls, down_fallback_calls;
     /* Step 5 fast path: resident PRE-DEQUANTED shared-expert F32 weights, one
      * gate/up/down pair per backbone layer (NULL for dense layers and when the
      * fast path is off).  Pre-dequanted ONCE at init so the per-token MoE step
@@ -27998,6 +28075,9 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
     c->idx = xmalloc((size_t)K * sizeof(int));
     c->w = xmalloc((size_t)K * sizeof(float));
     c->moe_mid = xmalloc((size_t)K * max_inter * sizeof(float));
+    /* Step 6 verify scratch (only allocated when the diagnostic is requested,
+     * to keep the production ctx lean).  Resolved lazily on first verify use. */
+    c->down_ref = NULL;
     c->chunk_rows = 8192;
     c->chunk_w = xmalloc((size_t)c->chunk_rows * H * sizeof(float));
     c->chunk_logits = xmalloc((size_t)c->chunk_rows * sizeof(float));
@@ -28082,8 +28162,8 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
                             now_sec() - shp_t0);
             }
             fprintf(stderr, "ds4: glm-fast: fused Q8_0 MLA + IQ2_XXS MoE gate/up%s "
-                                "paths enabled (DS4_GLM_FAST=1; attn_k_b, "
-                                "down experts IQ3_XXS/IQ4_XS stay F32 oracle)\n",
+                                "+ IQ3_XXS/IQ4_XS MoE down paths enabled (DS4_GLM_FAST=1; "
+                                "attn_k_b stays F32 oracle)\n",
                     shexp_resident ? " + resident shared-expert" : "");
         }
     }
@@ -28100,6 +28180,7 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
     free(c->k_nope); free(c->vv); free(c->qrope); free(c->krope); free(c->attn_o); free(c->Q_comb);
     free(c->router_gate); free(c->moe_logits); free(c->idx); free(c->w);
     free(c->moe_mid);
+    free(c->down_ref);
     if (c->sh_g) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_g[l]); free(c->sh_g); }
     if (c->sh_u) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_u[l]); free(c->sh_u); }
     if (c->sh_d) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_d[l]); free(c->sh_d); }
@@ -28130,6 +28211,11 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
                 (unsigned long long)c->shexp_fast_calls,
                 (unsigned long long)c->shexp_fallback_calls,
                 getenv("DS4_GLM_NO_SHEXP_FAST") ? "A/B: forced F32" : "fast=on");
+        fprintf(stderr, "ds4: glm-metal down-expert: %llu fused / %llu fallback "
+                        "(%s)\n",
+                (unsigned long long)c->down_fast_calls,
+                (unsigned long long)c->down_fallback_calls,
+                getenv("DS4_GLM_NO_DOWN_FAST") ? "A/B: forced F32" : "fast=on");
     }
 }
 
@@ -28246,10 +28332,15 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
             /* Step 4 fast path: when this layer's gate/up experts are IQ2_XXS,
              * fuse the K selected experts' gate+up dot products + SwiGLU +
              * route-weight into one dispatch (weights stay quantized on the
-             * GPU; route weight is baked into mid[k]).  DOWN experts (no fused
-             * IQ3_XXS/IQ4_XS kernel) stay on the F32 fallback below. */
+             * GPU; route weight is baked into mid[k]).
+             * Step 6 fast path: when this layer's DOWN experts are IQ3_XXS /
+             * IQ4_XS, the K down matvecs are ALSO fused (one GPU dispatch with
+             * on-GPU dequant); otherwise they fall back to the F32 loop below. */
             const bool moe_fast =
                 c->fast && glm_moe_gate_up_iq2xxs_eligible(m, il);
+            const int down_fast_type =
+                (c->fast && moe_fast && getenv("DS4_GLM_NO_DOWN_FAST") == NULL)
+                    ? glm_moe_down_fused_type(m, il) : 0;
             const bool moe_prof = (getenv("DS4_GLM_MOE_TIME") != NULL) || dec_prof;
             double gu_t = 0.0, down_t = 0.0, sh_t = 0.0;
             if (moe_fast) {
@@ -28266,25 +28357,66 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
             }
             for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] = 0.0f;
             const double down0 = moe_prof ? now_sec() : 0.0;
-            for (uint32_t k = 0; k < K; k++) {
-                const uint32_t e = (uint32_t)c->idx[k];
-                const float wk = c->w[k];
-                if (moe_fast) {
-                    /* gate/up fused above (mid[k] = silu(gate@x)*(up@x)*wk).
-                     * down @ mid[k] is already route-weighted, so accumulate
-                     * unweighted.  Only the down slab is dequanted per expert. */
-                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
-                    if (!ds4_gpu_glm_matvec_f32(c->fdown, c->moe_mid + (uint64_t)k * ei,
-                                                etmp, H, ei))
-                        return false;
-                    for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
-                } else {
-                    glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
-                    glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
-                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
-                    if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
-                        return false;
-                    for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
+            if (down_fast_type != 0) {
+                c->down_fast_calls++;
+                /* Step 6 FUSED DOWN: one dispatch dequants the K staged down
+                 * slabs on the GPU and sums the K route-weighted matvecs into
+                 * ffn_out[hidden] (mid[k] already route-weighted by gate/up). */
+                const int df_ok =
+                    (down_fast_type == GLM_DOWN_TYPE_IQ3_XXS)
+                      ? ds4_gpu_glm_moe_down_iq3xxs_fused(
+                            m->parts[de->part].map, m->parts[de->part].size,
+                            de->abs_offset, de->bytes, pe_down,
+                            (uint32_t)de->dim[2], c->idx, c->moe_mid,
+                            ffn_out, H, ei, K)
+                      : ds4_gpu_glm_moe_down_iq4xs_fused(
+                            m->parts[de->part].map, m->parts[de->part].size,
+                            de->abs_offset, de->bytes, pe_down,
+                            (uint32_t)de->dim[2], c->idx, c->moe_mid,
+                            ffn_out, H, ei, K);
+                if (!df_ok) return false;
+                /* Diagnostic: A/B fused vs F32-oracle down on chosen layers
+                 * (first token only). Confirms tolerance before trusting the
+                 * fast path end-to-end. */
+                if (pos == 0 && glm_down_verify_layer(il)) {
+                    if (!c->down_ref) c->down_ref = xmalloc((size_t)H * sizeof(float));
+                    for (uint32_t d0 = 0; d0 < H; d0++) c->down_ref[d0] = 0.0f;
+                    for (uint32_t k = 0; k < K; k++) {
+                        const uint32_t e = (uint32_t)c->idx[k];
+                        glm_dequant_count(m, de, (uint64_t)e * pe_down,
+                                          (size_t)H * ei, c->fdown);
+                        if (!ds4_gpu_glm_matvec_f32(c->fdown,
+                                    c->moe_mid + (uint64_t)k * ei, etmp, H, ei))
+                            return false;
+                        for (uint32_t d0 = 0; d0 < H; d0++) c->down_ref[d0] += etmp[d0];
+                    }
+                    glm_down_verify_report(il, down_fast_type, ffn_out, c->down_ref, H);
+                }
+            } else {
+                /* Fused down not eligible (gate/up not IQ2_XXS, e.g. blk.8 IQ2_S, or
+                 * down tensor not IQ3_XXS/IQ4_XS): fall back to the per-expert
+                 * F32 dequant + matvec. */
+                for (uint32_t k = 0; k < K; k++) {
+                    c->down_fallback_calls++;
+                    const uint32_t e = (uint32_t)c->idx[k];
+                    const float wk = c->w[k];
+                    if (moe_fast) {
+                        /* gate/up fused above (mid[k] = silu(gate@x)*(up@x)*wk).
+                         * down @ mid[k] is already route-weighted, so accumulate
+                         * unweighted.  Only the down slab is dequanted per expert. */
+                        glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
+                        if (!ds4_gpu_glm_matvec_f32(c->fdown, c->moe_mid + (uint64_t)k * ei,
+                                                    etmp, H, ei))
+                            return false;
+                        for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
+                    } else {
+                        glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
+                        glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
+                        glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
+                        if (!glm_swiglu_metal(xn, c->fgate, c->fup, c->fdown, H, ei, etmp, c->sg, c->su))
+                            return false;
+                        for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
+                    }
                 }
             }
             /* shared expert added directly (weight 1.0, DeepSeek/GLM convention).
