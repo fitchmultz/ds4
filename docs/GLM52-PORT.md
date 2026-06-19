@@ -223,9 +223,13 @@ microkernels), `DS4_TEST_GLM52_SHARD1`, `DS4_TEST_GLM52_GGUF`, `DS4_TEST_GLM52_L
 
 The core GLM port is complete and verified. The active work is usability/speed:
 
-- Current fastest path is `DS4_GLM_FAST=1 --glm-chat`: routed MoE gate/up/down
+- Current fastest chat path is `DS4_GLM_FAST=1 --glm-chat`: routed MoE gate/up/down
   fused plus resident shared expert. Warm decode is about **9–12s/token** on the
   128 GiB Mac; short chat prefill is still about one full pass per prompt token.
+- `--glm-raw` / `--glm-raw-cpu` bypass the GLM chat template and raw-tokenize
+  `-p/--prompt`. This is a usability/benchmark mode, not chat: a one-token raw
+  prompt avoids the 13-token chat-template prefill while batched prefill is
+  pending.
 - A critical probe showed the older “fused Q8 MLA” path is not active for the
   downloaded UD_IQ2_M quant: `attn_q_a` and `attn_output` are Q5_K (Q6_K on
   blk.8), so the all-Q8 eligibility is false for every backbone layer.

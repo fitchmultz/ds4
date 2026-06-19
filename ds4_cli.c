@@ -60,6 +60,7 @@ typedef struct {
     bool glm_cpu_ref;
     bool glm_metal_ref;
     bool glm_chat;          /* Phase 4e: --glm-chat / --glm-chat-cpu */
+    bool glm_raw;           /* Raw GLM generation, no chat template */
     bool glm_chat_metal;    /* true = metal backend, false = cpu */
 } cli_config;
 
@@ -1637,6 +1638,16 @@ static cli_config parse_options(int argc, char **argv) {
             c.glm_chat_metal = false;
             c.engine.glm_chat = true;
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--glm-raw")) {
+            c.glm_raw = true;
+            c.glm_chat_metal = true;
+            c.engine.glm_chat = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--glm-raw-cpu")) {
+            c.glm_raw = true;
+            c.glm_chat_metal = false;
+            c.engine.glm_chat = true;
+            c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -1730,6 +1741,9 @@ int main(int argc, char **argv) {
     } else if (cfg.glm_chat) {
         rc = ds4_engine_glm_chat(engine, cfg.gen.system, cfg.gen.prompt,
                                  cfg.gen.n_predict, cfg.glm_chat_metal);
+    } else if (cfg.glm_raw) {
+        rc = ds4_engine_glm_raw_generate(engine, cfg.gen.prompt,
+                                         cfg.gen.n_predict, cfg.glm_chat_metal);
     } else if (cfg.inspect) {
         ds4_engine_summary(engine);
     } else if (cfg.gen.imatrix_output_path) {

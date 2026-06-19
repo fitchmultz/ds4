@@ -28778,7 +28778,8 @@ static bool glm_gen_metal_step(void *ctx, int token, uint32_t pos,
  * grows by one entry per decode step (incremental).  Prints generated text to
  * `out` and reports prefill/decode timing + tok/s to stderr.  Returns 0 on
  * success, 1 on a kernel/step failure. */
-static int glm_generate_loop(glm_gen_step_fn step, void *ctx,
+static int glm_generate_loop(const char *label,
+                             glm_gen_step_fn step, void *ctx,
                              const int *prompt, uint32_t prompt_len,
                              int n_predict, float *logits, uint32_t vocab,
                              ds4_engine *e, int eos_id, FILE *out,
@@ -28812,8 +28813,8 @@ static int glm_generate_loop(glm_gen_step_fn step, void *ctx,
     const double decode_s = now_sec() - dec0;
     if (out_generated) *out_generated = generated;
     if (out_decode_s) *out_decode_s = decode_s;
-    fprintf(stderr, "ds4: glm-chat: prefill %.2fs (%u tok), decode %d tok in %.2fs (%.2f tok/s)\n",
-            prefill_s, prompt_len, generated, decode_s,
+    fprintf(stderr, "ds4: %s: prefill %.2fs (%u tok), decode %d tok in %.2fs (%.2f tok/s)\n",
+            label ? label : "glm-generate", prefill_s, prompt_len, generated, decode_s,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
     return 0;
 }
@@ -28887,7 +28888,7 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
              * (MLA / MoE gu/down/shared / LM head) only for pos >= prompt_len,
              * so prefill is excluded and each entry is exactly one decode token. */
             if (getenv("DS4_GLM_DECODE_TIME")) mc.profile_after_pos = prompt_len;
-            rc = glm_generate_loop(glm_gen_metal_step, &mc, chat.v, prompt_len,
+            rc = glm_generate_loop("glm-chat", glm_gen_metal_step, &mc, chat.v, prompt_len,
                                    n_predict, logits, vocab, e, eos_id, stdout,
                                    &generated, gen_ids, &decode_s);
             glm_metal_fwd_free(&mc);
@@ -28900,7 +28901,7 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
     } else {
         glm_cpu_fwd_ctx cc;
         glm_cpu_fwd_init(&cc, m, &shape, n_layer, n_dense, cap);
-        rc = glm_generate_loop(glm_gen_cpu_step, &cc, chat.v, prompt_len,
+        rc = glm_generate_loop("glm-chat", glm_gen_cpu_step, &cc, chat.v, prompt_len,
                                n_predict, logits, vocab, e, eos_id, stdout,
                                &generated, gen_ids, &decode_s);
         glm_cpu_fwd_free(&cc);
@@ -28922,6 +28923,81 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
     free(gen_ids);
     free(logits);
     free(chat.v);
+    return rc;
+}
+
+/* Raw GLM generation: same persistent incremental KV path as --glm-chat, but
+ * tokenizes the prompt directly instead of applying the GLM chat template.  This
+ * is useful while prefill is still one full model pass per prompt token: a raw
+ * one-token prompt avoids the 13-token chat wrapper startup cost. */
+int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
+                                int n_predict, bool use_metal) {
+    const ds4_model *m = &e->model;
+    const glm_cpu_shape shape = glm_cpu_shape_real();
+    uint32_t block_count = 0, nextn = 1, n_dense = 0;
+    if (!model_get_u32(m, "glm-dsa.block_count", &block_count) ||
+        !model_get_u32(m, "glm-dsa.nextn_predict_layers", &nextn) ||
+        !model_get_u32(m, "glm-dsa.leading_dense_block_count", &n_dense)) {
+        fprintf(stderr, "ds4: --glm-raw requires a GLM-5.2 (glm-dsa) model\n");
+        return 1;
+    }
+    const uint32_t n_layer = block_count >= nextn ? block_count - nextn : block_count;
+    if (n_layer == 0 || n_layer > 256) {
+        fprintf(stderr, "ds4: glm-raw: bad backbone layer count %u\n", n_layer);
+        return 1;
+    }
+    if (n_predict <= 0) n_predict = 64;
+
+    ds4_tokens toks = {0};
+    ds4_tokenize_text(e, prompt ? prompt : "", &toks);
+    if (toks.len <= 0) {
+        fprintf(stderr, "ds4: glm-raw: prompt tokenized to 0 tokens\n");
+        free(toks.v);
+        return 1;
+    }
+    const uint32_t prompt_len = (uint32_t)toks.len;
+    const ds4_tensor *t_out = model_find_tensor(m, "output.weight");
+    const uint32_t vocab = (uint32_t)t_out->dim[1];
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
+    const uint32_t cap = prompt_len + (uint32_t)n_predict + 8;
+    const int eos_id = e->vocab.eos_id;
+    fprintf(stderr, "ds4: glm-raw: %u prompt tokens, decoding up to %d tokens "
+            "(cap %u), %u backbone layers (%s)\n",
+            prompt_len, n_predict, cap, n_layer, use_metal ? "metal" : "cpu");
+
+    int generated = 0, rc = 1;
+    double decode_s = 0.0;
+    int *gen_ids = xmalloc((size_t)n_predict * sizeof(int));
+    glm_fwd_progress = false;
+    if (use_metal) {
+#ifndef DS4_NO_GPU
+        glm_metal_fwd_ctx mc;
+        if (glm_metal_fwd_init(&mc, m, &shape, n_layer, n_dense, cap)) {
+            if (getenv("DS4_GLM_DECODE_TIME")) mc.profile_after_pos = prompt_len;
+            rc = glm_generate_loop("glm-raw", glm_gen_metal_step, &mc, toks.v, prompt_len,
+                                   n_predict, logits, vocab, e, eos_id, stdout,
+                                   &generated, gen_ids, &decode_s);
+            glm_metal_fwd_free(&mc);
+        } else {
+            fprintf(stderr, "ds4: glm-raw: Metal context init failed\n");
+        }
+#else
+        fprintf(stderr, "ds4: glm-raw requires a Metal build; use --glm-raw-cpu\n");
+#endif
+    } else {
+        glm_cpu_fwd_ctx cc;
+        glm_cpu_fwd_init(&cc, m, &shape, n_layer, n_dense, cap);
+        rc = glm_generate_loop("glm-raw", glm_gen_cpu_step, &cc, toks.v, prompt_len,
+                               n_predict, logits, vocab, e, eos_id, stdout,
+                               &generated, gen_ids, &decode_s);
+        glm_cpu_fwd_free(&cc);
+    }
+    if (rc == 0)
+        fprintf(stderr, "\nds4: glm-raw: generated %d tokens (%s)\n",
+                generated, use_metal ? "metal" : "cpu");
+    free(gen_ids);
+    free(logits);
+    free(toks.v);
     return rc;
 }
 
