@@ -1,10 +1,10 @@
 # GLM-5.2 Port — Source of Truth
 
-Status: **CORE PORT COMPLETE & WORKING.** GLM-5.2 runs locally: load + glm4 tokenize + oracle-correct forward (CPU & Metal, logit-corr 0.9993 vs llama.cpp) + coherent multi-token chat generation (`--glm-chat`/`--glm-chat-cpu`), matching llama.cpp greedy token-for-token (11/12 on 'Say hello.' -> 'Hello! How can I help you today?'). The 238 GiB UD_IQ2_M model runs in ~43 GiB peak RAM on this 128 GiB Mac via mmap on-demand expert streaming (no resident copy). 12 commits on origin/glm.
+Status: **CORE PORT COMPLETE & WORKING; FAST PATH IN PROGRESS.** GLM-5.2 runs locally: load + glm4 tokenize + oracle-correct forward (CPU & Metal, logit-corr 0.9993 vs llama.cpp) + coherent multi-token chat generation (`--glm-chat`/`--glm-chat-cpu`), matching llama.cpp greedy token-for-token (11/12 on 'Say hello.' -> 'Hello! How can I help you today?'). The 238 GiB UD_IQ2_M model runs in bounded RAM on this 128 GiB Mac via mmap/on-demand streaming plus resident fast-path caches.
 
-VERIFIED DONE: P0 scaffolding; P1 loader/split-GGUF/metadata/tensor-inventory (1809/1809); P2 glm4 BPE+chat (oracle); P3 SSD cache-plan (8359 experts); P4b all 8 quant dequant bit-exact vs llama.cpp (incl. the IQ2_S full-tensor bugfix); P4a/P4a-full CPU forward (oracle-validated); P4c-i/ii Metal kernels (31/31); P4c-iv Metal forward (corr 1.0 vs CPU); P4e incremental-KV chat generation. DeepSeek path byte-identical at every commit; full ds4_test green.
+VERIFIED DONE: P0 scaffolding; P1 loader/split-GGUF/metadata/tensor-inventory (1809/1809); P2 glm4 BPE+chat (oracle); P3 SSD cache-plan (8359 experts); P4b all 8 quant dequant bit-exact vs llama.cpp (incl. the IQ2_S full-tensor bugfix); P4a/P4a-full CPU forward (oracle-validated); P4c-i/ii Metal kernels (31/31); P4c-iv Metal forward (corr 1.0 vs CPU); P4e incremental-KV chat generation; routed MoE fast path (IQ2_XXS gate/up + IQ3_XXS/IQ4_XS down + resident shared expert) with decode improving from ~27s/token to ~9–12s/token on warm runs. DeepSeek path byte-identical at every commit; full ds4_test green.
 
-REMAINING (optimizations, not correctness): fused-kernel production latency (current ~10-24 tok/s slow path materializes F32 per layer; DS4-speed needs the fused quant kernels / metal_graph integration); explicit ds4_ssd pread streaming (mmap already achieves the bounded-RAM + on-demand-SSD outcome); DSA sparse indexer (deferred — our dense-MLA forward matches llama.cpp, which also omits it); NextN/MTP blk.78 (loaded, unused — a speculation accelerator, not required for correct greedy gen).
+REMAINING (usability/speed, not correctness): batched/persistent GLM graph or speculation to avoid one full model pass per token; explicit ds4_ssd expert pread/cache integration (mmap works, controlled hot-expert residency is still needed for DS4-speed); MLA still uses the F32 materialization path on UD_IQ2_M because q_a/attn_output are Q5_K/Q6_K and tested one-off Q5/Q6/Q8 wrappers were slower; DSA sparse indexer (deferred — dense MLA matches llama.cpp); NextN/MTP blk.78 (loaded, unused — speculation accelerator).
 Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
@@ -208,37 +208,35 @@ DSA deferred. DONE: `--metal --ctx 4096 -p 'Hello' -n 1` emits a token; logits
 match llama.cpp `glm-dsa` dense-fallback oracle; DeepSeek smoke unchanged.
 **Needs full 238GB split on disk.**
 
-**Phase 5 — DSA sparse indexer + IndexShare.** Indexer projections, top-k=2048
-mask, IndexShare reuse every 4 layers. Net-new kernels. DONE: long-context
-logits beat dense fallback where sparse matters.
+**Phase 5 — DSA sparse indexer + IndexShare.** Deferred. Dense MLA matches
+llama.cpp on the current oracle prompts; sparse DSA/index sharing is a later
+long-context quality/perf task.
 
-**Phase 6 — NextN/MTP speculative.** Bind `blk.78.nextn.*`. DONE: greedy
-spec-verify correct.
+**Phase 6 — NextN/MTP speculative.** Deferred. `blk.78.nextn.*` tensors are
+loaded/identified, but the GLM generator currently ignores them. This is now a
+high-value speed direction because single-token decode still costs ~9–12s/token.
 
 **Phase 7 — tests/eval/docs.** Tiered: always-on (metadata/cache-math/router
 microkernels), `DS4_TEST_GLM52_SHARD1`, `DS4_TEST_GLM52_GGUF`, `DS4_TEST_GLM52_LONG`.
 
-## 7. Session scope
+## 7. Current optimization notes
 
-Done this session: **Phases 0, 1, 2, 3** — all committed + pushed `origin/glm`, all
-verified against the real 238GB `UD-IQ2_M` model (now fully downloaded). The
-inspect/tokenizer/SSD-sizing foundation is complete and tested:
-- 1809/1809 tensors load across 6 shards (split invariant enforced).
-- glm4 BPE = 43/43 HF-tokenizers oracle match (incl. contractions).
-- SSD cache plan live = documented: 8359 experts / 88 GiB / 43.5% @ 128 GiB.
-- DeepSeek path byte-identical to `main` throughout.
+The core GLM port is complete and verified. The active work is usability/speed:
 
-Next: **Phase 4** (inference). This is the large, multi-session core. Recommended
-first sub-step: a GLM **CPU reference** forward pass for a single layer on
-synthetic fixtures (the engine keeps CPU as reference/debug per AGENT.md) to
-serve as the oracle for the Metal kernels, then port kernels one at a time
-(RoPE → MLA projections → dense FFN → sigmoid MoE → quant dots → per-part SSD
-pread), each validated against the CPU ref. Needs: Q5_K/Q6_K dense +
-IQ2_S/IQ3_XXS/IQ4_XS/Q3_K routed quant kernels; standard interleaved RoPE
-(theta 8e6, dim 64); single `attn_output`; dense FFN for blk.0-2; sigmoid
-top-8 MoE (bias + norm + scale 2.5). DSA (Phase 5) and NextN/MTP (Phase 6)
-after. A llama.cpp `glm-dsa` dense-fallback build is the natural full-model
-logit oracle once Phase 4 produces tokens.
+- Current fastest path is `DS4_GLM_FAST=1 --glm-chat`: routed MoE gate/up/down
+  fused plus resident shared expert. Warm decode is about **9–12s/token** on the
+  128 GiB Mac; short chat prefill is still about one full pass per prompt token.
+- A critical probe showed the older “fused Q8 MLA” path is not active for the
+  downloaded UD_IQ2_M quant: `attn_q_a` and `attn_output` are Q5_K (Q6_K on
+  blk.8), so the all-Q8 eligibility is false for every backbone layer.
+- Tested and rejected: resident reordered `attn_k_b` (correct, no speedup),
+  naive Q5_K/Q6_K Metal row-dot for `q_a/out` (correct, slower), llama-style
+  Q5_K/Q6_K decode kernels through the current wrapper (correct, slower), and
+  per-projection Q8-only MLA fusion (slower). Do not re-chase these without a
+  new benchmark reason.
+- Next meaningful bar-movers: GLM-specific persistent/batched graph (especially
+  batched prefill), NextN/MTP speculative decode, and controlled hot-expert SSD
+  cache/prefetch. LM head is only ~0.5–0.6s/token and is not the next target.
 
 ## 8. Risks / blockers
 

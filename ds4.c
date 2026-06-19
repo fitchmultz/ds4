@@ -27626,23 +27626,23 @@ static void glm_synth_free(glm_synth_ctx *c);
  * round-trips through the attn kernel.  No new quant math, no new kernels.
  * ======================================================================= */
 
-/* ---- Fast Metal path: fused Q8_0 MLA projections (Step 1) ---------------
+/* ---- Fast Metal path: routed MoE fusion (DS4_GLM_FAST=1) ----------------
  *
- * Env-gated (DS4_GLM_FAST=1). When enabled, the five Q8_0 MLA projections
- * (attn_q_a / attn_q_b / attn_kv_a_mqa / attn_v_b / attn_output) use the
- * engine's fused ds4_gpu_matmul_q8_0_tensor decode kernel: the quant weights
- * stay Q8_0 in the mmap'd GGUF and are read straight off the registered model
- * view (no per-layer F32 dequant, no per-call weight upload). The F32
- * --glm-chat oracle path is byte-for-byte unchanged when the flag is unset.
+ * This GLM UD-IQ2_M quant does NOT currently take the older all-Q8 MLA fast
+ * path: q_a and attn_output are Q5_K on most layers (Q6_K on blk.8), so
+ * glm_mla_fast_eligible() is false for 78/78 layers and MLA stays on the F32
+ * oracle/materialization path. Two follow-up probes confirmed that naive Q5/Q6
+ * Metal row-dot kernels and per-projection Q8-only fusion were slower than the
+ * F32 oracle path for these shapes; do not re-enable them without a measured
+ * win. A real MLA speedup needs a resident/prepacked graph or a proven MPP K-
+ * quant path, not the one-off wrappers.
  *
- * attn_k_b stays on the F32 oracle for now: its native [nope,kv_lora,n_head]
+ * attn_k_b also stays on the F32 oracle: its native [nope,kv_lora,n_head]
  * layout requires the glm_k_b_reorder permutation, which a row-major [out,in]
- * Q8_0 kernel cannot express (a reordered row mixes elements across source
- * Q8_0 blocks). k_b is dequanted + reordered exactly as the oracle, so it
- * matches the oracle by construction. Fusing k_b needs a one-time reordered
- * quant buffer per layer and is deferred to a later step.
+ * quant kernel cannot express directly. A resident reordered k_b cache was
+ * tested and did not move wall-clock, so it was not kept.
  *
- * Step 4 (same DS4_GLM_FAST=1 flag): the routed-expert MoE GATE/UP also runs a
+ * Step 4 (same DS4_GLM_FAST=1 flag): the routed-expert MoE GATE/UP runs a
  * fused path for the common IQ2_XXS layers (ds4_gpu_glm_moe_gate_up_iq2xxs_
  * fused -> kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32).  The K=8 selected
  * experts' gate+up slabs are staged (CPU memcpy of the ~26 MB quant) into a
@@ -27652,17 +27652,19 @@ static void glm_synth_free(glm_synth_ctx *c);
  * ~1.2 GB F32 per layer, the dominant per-token cost across ~75 MoE layers).
  * Staging (not a no-copy mmap view) is required because the 8 of 256 selected
  * experts are SSD-evicted/cold, so a no-copy GPU view page-faults slowly.
- * Down experts (IQ3_XXS / IQ4_XS, no fused kernel) and the shared expert stay
- * on the F32 fallback. blk.8 (IQ2_S gate/up) falls back to F32.
+ *
+ * Step 5/6: shared experts are pre-dequanted once to resident F32, and routed
+ * DOWN experts use fused IQ3_XXS/IQ4_XS Metal kernels. blk.8 (IQ2_S gate/up)
+ * still falls back to F32 for the whole routed expert branch.
  * ---------------------------------------------------------------------- */
 static bool glm_fast_enabled(void) {
     const char *e = getenv("DS4_GLM_FAST");
     return e && atoi(e) == 1;
 }
 
-/* Whether layer il can run the five fused Q8_0 MLA projections. The caller
- * always prepares the k_b F32 weight, so a non-eligible layer simply keeps the
- * full F32 oracle for that layer. */
+/* Whether layer il can run the legacy all-Q8 MLA path.  This is false for the
+ * downloaded UD-IQ2_M GLM-5.2 (q_a/attn_output are Q5_K/Q6_K), so the current
+ * production fast path gets its speedup from MoE fusion, not MLA fusion. */
 static bool glm_mla_fast_eligible(const ds4_model *m, uint32_t il) {
     const ds4_tensor *a  = glm_layer_tensor(m, il, "attn_q_a");
     const ds4_tensor *b  = glm_layer_tensor(m, il, "attn_q_b");
@@ -27983,7 +27985,7 @@ typedef struct {
     const ds4_tensor *t_embd, *t_out, *t_onorm;
     uint64_t embd_row_bytes;
     uint32_t vocab;
-    /* Fast Metal path: fused Q8_0 MLA projections (DS4_GLM_FAST=1). */
+    /* Fast Metal path: routed MoE fusion (DS4_GLM_FAST=1). */
     bool fast;
     /* DS4_GLM_MLA_TIME: cumulative time inside glm_mla_forward_token_metal
      * (the 6 MLA projections + rmsnorm/rope/attn/cache), for isolating the
@@ -28161,9 +28163,9 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
                             (double)sh_total_bytes / (1024.0*1024.0*1024.0),
                             now_sec() - shp_t0);
             }
-            fprintf(stderr, "ds4: glm-fast: fused Q8_0 MLA + IQ2_XXS MoE gate/up%s "
+            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s "
                                 "+ IQ3_XXS/IQ4_XS MoE down paths enabled (DS4_GLM_FAST=1; "
-                                "attn_k_b stays F32 oracle)\n",
+                                "MLA stays F32 oracle on UD-IQ2_M)\n",
                     shexp_resident ? " + resident shared-expert" : "");
         }
     }
