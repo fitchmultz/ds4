@@ -26758,19 +26758,89 @@ static void ds4_dequant_iq2_s(const block_iq2_s *x, float *y, uint32_t k) {
     }
 }
 
-/* Public dispatcher used by the --glm-quant-dequant oracle test.  Returns true
- * and fills out[0..n) for the supported K-quants; false for unsupported types
- * (IQ2_S/IQ3_XXS/IQ4_XS are Phase 4b TODO).  n must be a multiple of 256. */
+/* Q8_0 reference dequant, ported byte-for-byte from llama.cpp
+ * dequantize_row_q8_0 so the CPU forward matches the oracle exactly.  Block:
+ * f16 d (2 bytes) + int8 qs[32]; stride 34; QK8_0 = 32.  GLM-5.2-UD-IQ2_M
+ * stores attn_q_b/attn_k_b/attn_v_b/attn_kv_a_mqa as Q8_0. */
+static void ds4_dequant_q8_0(const void *block_data, float *out, uint32_t k) {
+    const uint8_t *p = (const uint8_t *)block_data;
+    const uint32_t nb = k / 32;                  /* QK8_0 */
+    for (uint32_t b = 0; b < nb; b++) {
+        const uint16_t dh = (uint16_t)p[b * 34] | ((uint16_t)p[b * 34 + 1] << 8);
+        const float d = f16_to_f32(dh);
+        const int8_t *qs = (const int8_t *)(p + b * 34 + 2);
+        for (uint32_t j = 0; j < 32; j++) out[b * 32 + j] = (float)qs[j] * d;
+    }
+}
+
+/* IQ2_XXS reference dequant, ported byte-for-byte from llama.cpp
+ * dequantize_row_iq2_xxs (same iq2xxs_grid/ksigns_iq2xs/kmask_iq2xs tables).
+ * GLM-5.2-UD-IQ2_M stores blk.{3..7,9..77}.ffn_{gate,up}_exps as IQ2_XXS.
+ * ds4's block_iq2_xxs.qs is uint16_t[32] (64 bytes); index it as raw bytes to
+ * match ggml's uint8 view (memcpy 8 bytes per 32-element sub-block). */
+static void ds4_dequant_iq2_xxs(const void *block_data, float *out, uint32_t k) {
+    const block_iq2_xxs *x = (const block_iq2_xxs *)block_data;
+    const uint32_t nb = k / QK_K;
+    uint32_t aux32[2];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    float *y = out;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        /* qs is uint16_t[32] (64 bytes).  Index it as uint16_t* so +4*ib32 steps
+         * 8 BYTES per sub-block, byte-for-byte with llama.cpp's
+         * dequantize_row_iq2_xxs (memcpy(aux32, x[i].qs + 4*ib32, ...)).  The
+         * previous cast to uint8_t* advanced only 4 bytes/ib32, overlapping the
+         * reads from ib32>=1 and corrupting every element past offset 32. */
+        const uint16_t *qs = x[i].qs;
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            memcpy(aux32, qs + 4 * ib32, 2 * sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+            for (uint32_t l = 0; l < 4; ++l) {
+                const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+                for (uint32_t j = 0; j < 8; ++j)
+                    y[j] = db * (float)grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f);
+                y += 8;
+            }
+        }
+    }
+}
+
+/* Public dispatcher used by the --glm-quant-dequant oracle test and by the
+ * full CPU reference forward (glm_dequant_weight/glm_dequant_count).  Returns
+ * true and fills out[0..n) for every quant type present in GLM-5.2-UD-IQ2_M:
+ * Q8_0 (attn projections), IQ2_XXS (expert gate/up), Q4_K/Q5_K/Q6_K,
+ * IQ3_XXS/IQ4_XS/IQ2_S (expert down + dense FFN).  Divisibility is checked per
+ * type (Q8_0 needs 32, the K-quants/IQ2_XS need 256).  Q2_K/Q3_K appear only in
+ * the unused blk.78 NextN layer and are not dequanted here. */
 bool ds4_dequant_glm_row(uint32_t gguf_type, const void *block_data,
                          float *out, size_t n) {
-    if (n == 0 || (n % QK_K) != 0) return false;
+    if (n == 0) return false;
     switch (gguf_type) {
-        case 12 /*q4_k*/: ds4_dequant_q4_K(block_data, out, (uint32_t)n); return true;
-        case 13 /*q5_k*/: ds4_dequant_q5_K(block_data, out, (uint32_t)n); return true;
-        case 14 /*q6_k*/: ds4_dequant_q6_K(block_data, out, (uint32_t)n); return true;
-        case 18 /*iq3_xxs*/: ds4_dequant_iq3_xxs(block_data, out, (uint32_t)n); return true;
-        case 23 /*iq4_xs*/:  ds4_dequant_iq4_xs(block_data, out, (uint32_t)n); return true;
-        case 22 /*iq2_s*/:   ds4_dequant_iq2_s(block_data, out, (uint32_t)n); return true;
+        case 8 /*q8_0*/:
+            if (n % 32 != 0) return false;
+            ds4_dequant_q8_0(block_data, out, (uint32_t)n); return true;
+        case 16 /*iq2_xxs*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_iq2_xxs(block_data, out, (uint32_t)n); return true;
+        case 12 /*q4_k*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_q4_K(block_data, out, (uint32_t)n); return true;
+        case 13 /*q5_k*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_q5_K(block_data, out, (uint32_t)n); return true;
+        case 14 /*q6_k*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_q6_K(block_data, out, (uint32_t)n); return true;
+        case 18 /*iq3_xxs*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_iq3_xxs(block_data, out, (uint32_t)n); return true;
+        case 23 /*iq4_xs*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_iq4_xs(block_data, out, (uint32_t)n); return true;
+        case 22 /*iq2_s*/:
+            if (n % QK_K != 0) return false;
+            ds4_dequant_iq2_s(block_data, out, (uint32_t)n); return true;
         default: return false;
     }
 }
@@ -27166,23 +27236,32 @@ static void glm_k_b_reorder(float *dst, const float *src,
 static const ds4_tensor *glm_layer_tensor(const ds4_model *m,
                                           uint32_t il, const char *base);
 
-/* Dequant `count` contiguous elements (a multiple of 256 for K-quants) from
- * byte_offset within tensor t into out.  F32 tensors are copied verbatim.
- * Returns false for an unsupported type. */
-static bool glm_dequant_count(const ds4_model *m, const ds4_tensor *t,
+/* Dequant `count` contiguous elements from byte_offset within tensor t into
+ * out.  F32 tensors are copied verbatim; other types go through
+ * ds4_dequant_glm_row.  Dies on any failure: an unhandled/unsupported quant
+ * type MUST abort loudly rather than leave the caller with uninitialized
+ * (garbage) weights -- the silent-failure path was the original token-mismatch
+ * root cause (Q8_0/IQ2_XXS were missing from the dispatcher). */
+static void glm_dequant_count(const ds4_model *m, const ds4_tensor *t,
                               uint64_t byte_offset, size_t count, float *out) {
-    if (!t) return false;
+    if (!t) ds4_die("glm-cpu-ref: dequant on NULL tensor");
     const uint8_t *base = (const uint8_t *)tensor_data(m, t) + byte_offset;
     if (t->type == DS4_TENSOR_F32) {
         memcpy(out, base, count * sizeof(float));
-        return true;
+        return;
     }
-    return ds4_dequant_glm_row(t->type, base, out, count);
+    if (!ds4_dequant_glm_row(t->type, base, out, count)) {
+        char dm[160];
+        snprintf(dm, sizeof(dm),
+                 "glm-cpu-ref: unsupported quant type %u for tensor '%.*s'",
+                 t->type, (int)t->name.len, t->name.ptr);
+        ds4_die(dm);
+    }
 }
 
-static bool glm_dequant_weight(const ds4_model *m, const ds4_tensor *t,
+static void glm_dequant_weight(const ds4_model *m, const ds4_tensor *t,
                                float *out) {
-    return glm_dequant_count(m, t, 0, (size_t)t->elements, out);
+    glm_dequant_count(m, t, 0, (size_t)t->elements, out);
 }
 
 /* Core full forward.  Reuses the validated Phase 4a leaf math (rmsnorm/rope/
@@ -27248,9 +27327,9 @@ static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
 
     for (uint32_t t = 0; t < n_tokens; t++) {
         /* Embedding lookup: dequant the single token's hidden row. */
-        if (!glm_dequant_count(m, t_embd, (uint64_t)tokens[t] * embd_row_bytes,
-                               H, x))
-            ds4_die("glm-cpu-ref: token embedding dequant failed");
+        /* Embedding lookup: dequant the single token's hidden row. */
+        glm_dequant_count(m, t_embd, (uint64_t)tokens[t] * embd_row_bytes,
+                          H, x);
         const uint32_t prog_every = n_layer > 8 ? n_layer / 8 : 0;
 
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -27285,6 +27364,10 @@ static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
             memcpy(res, x, (size_t)H * sizeof(float));
             const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
             glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, fnorm_t), H, eps);
+            if (il == 3 && t == 0 && getenv("DS4_GLM_XN3_OUT")) {
+                FILE *xf = fopen(getenv("DS4_GLM_XN3_OUT"), "wb");
+                if (xf) { fwrite(xn, sizeof(float), H, xf); fclose(xf); }
+            }
             if (il < n_dense) {
                 /* Dense SwiGLU FFN (blk.0..n_dense-1). */
                 const ds4_tensor *g = glm_layer_tensor(m, il, "ffn_gate");
@@ -27325,8 +27408,16 @@ static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
                     glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, fup);
                     glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, fdown);
                     glm_swiglu_dense_f32(etmp, xn, fgate, fup, fdown, &eshape, sg, su);
+                    if (il == 3 && t == 0 && getenv("DS4_GLM_EXP_PEREXP")) {
+                        double er = 0; for (uint32_t d = 0; d < H; d++) er += (double)etmp[d]*etmp[d];
+                        fprintf(stderr, "  exp k=%u e=%u w=%.5f outrms=%.6f\n", k, e, w[k], sqrt(er/H));
+                    }
                     const float wk = w[k];
                     for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += wk * etmp[d0];
+                }
+                if (il == 3 && t == 0 && getenv("DS4_GLM_ROUTED3_OUT")) {
+                    FILE *rf = fopen(getenv("DS4_GLM_ROUTED3_OUT"), "wb");
+                    if (rf) { fwrite(ffn_out, sizeof(float), H, rf); fclose(rf); }
                 }
                 /* shared expert added directly (weight 1.0, DeepSeek/GLM convention) */
                 glm_dequant_weight(m, gsh, fgate);
@@ -27335,7 +27426,21 @@ static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
                 glm_swiglu_dense_f32(etmp, xn, fgate, fup, fdown, &eshape, sg, su);
                 for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += etmp[d0];
             }
+            if (il == 3 && t == 0 && getenv("DS4_GLM_FFN3_OUT")) {
+                FILE *ff = fopen(getenv("DS4_GLM_FFN3_OUT"), "wb");
+                if (ff) { fwrite(ffn_out, sizeof(float), H, ff); fclose(ff); }
+            }
+            if (il == 3 && t == 0 && getenv("DS4_GLM_ATTN3_OUT")) {
+                FILE *af = fopen(getenv("DS4_GLM_ATTN3_OUT"), "wb");
+                if (af) { fwrite(mla_out, sizeof(float), H, af); fclose(af); }
+            }
             for (uint32_t d = 0; d < H; d++) x[d] = res[d] + ffn_out[d];
+            if (t == n_tokens - 1 && getenv("DS4_GLM_LAYER_DIR")) {
+                char lp[512];
+                snprintf(lp, sizeof(lp), "%s/ds4_layer_%u.bin", getenv("DS4_GLM_LAYER_DIR"), il);
+                FILE *lf = fopen(lp, "wb");
+                if (lf) { fwrite(x, sizeof(float), H, lf); fclose(lf); }
+            }
             if (prog_every && (il + 1) % prog_every == 0)
                 fprintf(stderr, "ds4: glm-cpu-ref: token %u/%u layer %u/%u\r",
                         t + 1, n_tokens, il + 1, n_layer);
@@ -27345,8 +27450,7 @@ static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
         if (t == n_tokens - 1) {
             glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, t_onorm), H, eps);
             for (uint32_t v = 0; v < vocab; v++) {
-                if (!glm_dequant_count(m, t_out, (uint64_t)v * out_row_bytes, H, logits_row))
-                    ds4_die("glm-cpu-ref: output head dequant failed");
+                glm_dequant_count(m, t_out, (uint64_t)v * out_row_bytes, H, logits_row);
                 float s = 0.0f;
                 for (uint32_t d = 0; d < H; d++) s += logits_row[d] * xn[d];
                 logits[v] = s;
@@ -27412,6 +27516,17 @@ int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict) {
     }
     printf("glm-cpu-ref: token=%d top_logit=%.6f logits_finite=%s vocab=%u prompt_tokens=%u\n",
            argmax, (double)top, finite ? "yes" : "no", vocab, toks.len);
+    /* Optional full-logit dump for the strong full-vector comparison vs the
+     * llama.cpp oracle (DS4_GLM_LOGITS_OUT=<path>).  Raw F32, vocab entries. */
+    const char *lpath = getenv("DS4_GLM_LOGITS_OUT");
+    if (lpath && lpath[0]) {
+        FILE *lf = fopen(lpath, "wb");
+        if (lf) {
+            fwrite(logits, sizeof(float), vocab, lf);
+            fclose(lf);
+            fprintf(stderr, "ds4: glm-cpu-ref: dumped %u logits to %s\n", vocab, lpath);
+        }
+    }
 
     free(logits);
     free(toks.v);

@@ -2518,14 +2518,16 @@ typedef struct {
 } ds4_test_entry;
 
 /* GLM-5.2 K-quant CPU dequant vs the authoritative llama.cpp oracle
- * (tests/test-vectors/glm52-quant/<TYPE>.bin + <TYPE>.oracle.txt). Covers q4_k
- * (engine sanity), q5_k, q6_k. IQ2_S/IQ3_XXS/IQ4_XS still TODO. */
+ * (tests/test-vectors/glm52-quant/<TYPE>.bin + <TYPE>.oracle.txt). Covers every
+ * quant type the UD-IQ2_M forward touches: Q8_0 (attn projections), IQ2_XXS
+ * (expert gate/up), Q4_K/Q5_K/Q6_K, IQ3_XXS/IQ4_XS/IQ2_S (expert down + dense). */
 static void test_glm_quant_dequant(void) {
     const char *dir = getenv("DS4_TEST_GLM52_QUANT_DIR");
     if (!dir || !dir[0]) dir = "tests/test-vectors/glm52-quant";
-    static const struct { const char *name; uint32_t type; uint32_t block_bytes; } types[] = {
-        {"Q4_K", 12, 144}, {"Q5_K", 13, 176}, {"Q6_K", 14, 210},
-        {"IQ3_XXS", 18, 98}, {"IQ4_XS", 23, 136}, {"IQ2_S", 22, 82},
+    static const struct { const char *name; uint32_t type; uint32_t block_bytes; uint32_t block_elems; } types[] = {
+        {"Q8_0", 8, 34, 32}, {"Q4_K", 12, 144, 256}, {"Q5_K", 13, 176, 256},
+        {"Q6_K", 14, 210, 256}, {"IQ3_XXS", 18, 98, 256}, {"IQ4_XS", 23, 136, 256},
+        {"IQ2_S", 22, 82, 256}, {"IQ2_XXS", 16, 66, 256},
     };
     const size_t n_types = sizeof(types) / sizeof(types[0]);
     int n_pass = 0, n_run = 0;
@@ -2541,23 +2543,28 @@ static void test_glm_quant_dequant(void) {
             free(b); free(o); continue;
         }
         const size_t n_blocks = blen / types[t].block_bytes;
-        const size_t n_elem   = n_blocks * 256;
-        float ref[8192];
+        const size_t n_elem   = n_blocks * types[t].block_elems;
+        /* Large-slice reference: llama.cpp oracle (one F32 per line).  Uses a
+         * dynamically-sized buffer so fixtures can be >=1000 blocks (256k+
+         * elements) -- the IQ2_XXS pointer-arithmetic regression only surfaced
+         * on a large real slice, not the old 8-block fixtures. */
+        float *ref = malloc(sizeof(float) * n_elem);
+        TEST_ASSERT(ref != NULL);
         size_t nref = 0;
-        for (char *p = o; *p && nref < 8192; ) {
+        for (char *p = o; *p && nref < n_elem; ) {
             char *e = NULL; double v = strtod(p, &e);
             if (e == p) { p++; continue; }
             ref[nref++] = (float)v; p = e;
         }
-        if (n_elem > 8192 || nref < n_elem) {
+        if (nref < n_elem) {
             fprintf(stderr, "  glm-quant-dequant: FAIL %s (fixture size: %zu blocks/%zu ref)\n", types[t].name, n_blocks, nref);
-            free(b); free(o); continue;
+            free(ref); free(b); free(o); continue;
         }
         float *out = malloc(sizeof(float) * n_elem);
         TEST_ASSERT(out != NULL);
         if (!ds4_dequant_glm_row(types[t].type, b, out, n_elem)) {
             fprintf(stderr, "  glm-quant-dequant: FAIL %s (unsupported type %u)\n", types[t].name, types[t].type);
-            free(out); free(b); free(o); continue;
+            free(out); free(ref); free(b); free(o); continue;
         }
         float maxabs = 0.0f, maxrel = 0.0f;
         for (size_t i = 0; i < n_elem; i++) {
@@ -2570,7 +2577,7 @@ static void test_glm_quant_dequant(void) {
                 types[t].name, ok ? "PASS" : "FAIL", n_elem, (double)maxabs, (double)maxrel);
         if (ok) n_pass++;
         n_run++;
-        free(out); free(b); free(o);
+        free(out); free(ref); free(b); free(o);
     }
     fprintf(stderr, "  glm-quant-dequant: %d/%d types match llama.cpp oracle\n", n_pass, (int)n_types);
     TEST_ASSERT(n_run == (int)n_types);
