@@ -27205,14 +27205,30 @@ static uint64_t g_glm_expert_cache_stores;
 static uint64_t g_glm_expert_cache_evictions;
 static int g_glm_expert_cache_summary_printed;
 
-static uint64_t ds4_gpu_glm_expert_cache_parse_bytes(void) {
+static uint64_t ds4_gpu_glm_expert_cache_decode_preset_bytes(void) {
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    uint64_t mem = ds4_gpu_system_memory_bytes();
+    uint64_t budget = mem ? mem / 16u : 8ull * gib;
+    if (budget < gib) budget = gib;
+    if (budget > 8ull * gib) budget = 8ull * gib;
+    return budget;
+}
+
+static uint64_t ds4_gpu_glm_expert_cache_plan_preset_bytes(void) {
+    /* docs/GLM52-PORT.md §5/§7: 8359 experts * 11304960 bytes/expert ≈ 88 GiB. */
+    return 8359ull * 11304960ull;
+}
+
+static uint64_t ds4_gpu_glm_expert_cache_parse_bytes(const char **source_out) {
     const uint64_t mib = 1024ull * 1024ull;
     const uint64_t gib = 1024ull * mib;
+    if (source_out) *source_out = NULL;
     const char *mib_env = getenv("DS4_GLM_EXPERT_CACHE_MIB");
     if (mib_env && mib_env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(mib_env, &end, 10);
         if (end != mib_env && *end == '\0') {
+            if (source_out) *source_out = "DS4_GLM_EXPERT_CACHE_MIB";
             return v > UINT64_MAX / mib ? UINT64_MAX : v * mib;
         }
     }
@@ -27221,18 +27237,44 @@ static uint64_t ds4_gpu_glm_expert_cache_parse_bytes(void) {
         char *end = NULL;
         unsigned long long v = strtoull(gib_env, &end, 10);
         if (end != gib_env && *end == '\0') {
+            if (source_out) *source_out = "DS4_GLM_EXPERT_CACHE_GIB";
             return v > UINT64_MAX / gib ? UINT64_MAX : v * gib;
         }
+    }
+    const char *preset = getenv("DS4_GLM_EXPERT_CACHE_PRESET");
+    if (preset && preset[0]) {
+        if (strcmp(preset, "0") == 0 || strcmp(preset, "off") == 0) {
+            if (source_out) *source_out = "DS4_GLM_EXPERT_CACHE_PRESET=off";
+            return 0;
+        }
+        if (strcmp(preset, "decode") == 0 || strcmp(preset, "auto") == 0) {
+            if (source_out) *source_out = "DS4_GLM_EXPERT_CACHE_PRESET=decode";
+            return ds4_gpu_glm_expert_cache_decode_preset_bytes();
+        }
+        if (strcmp(preset, "plan") == 0) {
+            if (source_out) *source_out = "DS4_GLM_EXPERT_CACHE_PRESET=plan";
+            return ds4_gpu_glm_expert_cache_plan_preset_bytes();
+        }
+        fprintf(stderr,
+                "ds4: glm-fast: ignoring unknown DS4_GLM_EXPERT_CACHE_PRESET=%s (use decode, plan, or off)\n",
+                preset);
+    }
+    const char *auto_env = getenv("DS4_GLM_EXPERT_CACHE_AUTO");
+    if (auto_env && auto_env[0] && strcmp(auto_env, "0") != 0) {
+        if (source_out) *source_out = "DS4_GLM_EXPERT_CACHE_AUTO";
+        return ds4_gpu_glm_expert_cache_decode_preset_bytes();
     }
     return 0;
 }
 
 static void ds4_gpu_glm_expert_cache_init_once(void) {
-    g_glm_expert_cache_budget_bytes = ds4_gpu_glm_expert_cache_parse_bytes();
+    const char *source = NULL;
+    g_glm_expert_cache_budget_bytes = ds4_gpu_glm_expert_cache_parse_bytes(&source);
     if (g_glm_expert_cache_budget_bytes != 0) {
         fprintf(stderr,
-                "ds4: glm-fast: expert slab cache budget %.2f GiB (DS4_GLM_EXPERT_CACHE_*), policy=LRU\n",
-                ds4_gpu_gib(g_glm_expert_cache_budget_bytes));
+                "ds4: glm-fast: expert slab cache budget %.2f GiB (%s), policy=LRU\n",
+                ds4_gpu_gib(g_glm_expert_cache_budget_bytes),
+                source ? source : "DS4_GLM_EXPERT_CACHE_*" );
     }
 }
 

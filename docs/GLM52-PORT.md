@@ -232,15 +232,19 @@ The core GLM port is complete and verified. The active work is usability/speed:
   part fd. It is validated with the real model and keeps the same oracle token.
 - `DS4_GLM_EXPERT_CACHE_MIB=<n>` or `DS4_GLM_EXPERT_CACHE_GIB=<n>` enables a
   bounded LRU CPU slab cache for the quantized routed-expert slabs staged by the
-  fused GLM MoE gate/up/down kernels. The cache key is map identity + tensor
-  offset + expert id + slab geometry, so gate/up/down tensors and split-GGUF
-  parts stay isolated; defaults stay off. Validation: `DS4_GLM_FAST=1 DS4_GLM_EXPERT_PREAD=1
-  DS4_GLM_EXPERT_CACHE_MIB=256 --glm-metal-ref -p Hello` keeps token `154820`
-  and reports cache stores/evictions (`1776` stores, `1719` evictions for this
-  small smoke budget). With `DS4_GLM_EXPERT_CACHE_GIB=8`, `--glm-raw -p
-  asdfqwer -n 2` emits `12345` and reports `2616/8880` slab-cache hits
-  (29.5%), proving hot slabs are retained across decode steps. Further tuning is
-  still needed for the production default/prefetch policy.
+  fused GLM MoE gate/up/down kernels. `DS4_GLM_EXPERT_CACHE_PRESET=decode` (or
+  `DS4_GLM_EXPERT_CACHE_AUTO=1`) picks a conservative RAM-derived decode cache
+  capped at 8 GiB; `DS4_GLM_EXPERT_CACHE_PRESET=plan` uses the documented Phase
+  3 8359-expert / ~88 GiB plan. Explicit MIB/GIB settings win over presets.
+  The cache key is map identity + tensor offset + expert id + slab geometry, so
+  gate/up/down tensors and split-GGUF parts stay isolated; defaults stay off.
+  Validation: `DS4_GLM_FAST=1 DS4_GLM_EXPERT_PREAD=1 DS4_GLM_EXPERT_CACHE_MIB=256
+  --glm-metal-ref -p Hello` keeps token `154820` and reports cache
+  stores/evictions (`1776` stores, `1719` evictions for this small smoke
+  budget). With `DS4_GLM_EXPERT_CACHE_GIB=8`, `--glm-raw -p asdfqwer -n 2`
+  emits `12345` and reports `2616/8880` slab-cache hits (29.5%), proving hot
+  slabs are retained across decode steps. Further tuning is still needed for the
+  production default/prefetch policy.
 - `DS4_GLM_H_NEXTN_OUT=<path>` dumps the post-output-norm hidden state that feeds
   the LM head. SGLang's NextN path uses this vector as the target-model hidden
   input to `nextn.hnorm`; CPU-vs-Metal on `Hello` matches at maxabs ~3.4e-5,
