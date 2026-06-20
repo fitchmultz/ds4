@@ -28995,6 +28995,9 @@ typedef struct {
     uint32_t vocab;
     /* Fast Metal path: routed MoE fusion (DS4_GLM_FAST=1). */
     bool fast;
+    /* Batch helper fast MoE bridge. Defaults to the verifier env for existing
+     * NextN diagnostics; live batched prefill can enable it per scratch ctx. */
+    bool batch_fast_moe;
     /* DS4_GLM_MLA_TIME: cumulative time inside glm_mla_forward_token_metal
      * (the 6 MLA projections + rmsnorm/rope/attn/cache), for isolating the
      * fused-Q8_0 MLA speedup from SSD-streaming / LM-head / MoE noise. */
@@ -29118,6 +29121,7 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
      * full-residency wiring + warmup -- GLM streams the 238 GiB split on demand
      * via mmap exactly like the F32 oracle, so no weight is materialized. */
     c->fast = false;
+    c->batch_fast_moe = glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE");
     if (glm_fast_enabled()) {
         ds4_gpu_set_ssd_streaming(true);
         bool ok = true;
@@ -29733,8 +29737,7 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
                                                          E, K, n_tok, shape->moe_scale) != 0;
             if (!ok) break;
             memset(ffn_out, 0, h_rows * sizeof(float));
-            const bool batch_fast_moe = c->fast &&
-                                        glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE") &&
+            const bool batch_fast_moe = c->fast && c->batch_fast_moe &&
                                         glm_moe_gate_up_iq2xxs_eligible(m, il);
             const int batch_down_fast_type =
                 (batch_fast_moe && getenv("DS4_GLM_NO_DOWN_FAST") == NULL)
@@ -30816,7 +30819,7 @@ static void glm_metal_prefill_batch_check(const char *label,
                 seq_top == batch_top ? "yes" : "no", seq_top, batch_top,
                 (double)max_abs, cont_ok ? "yes" : "no",
                 seq_cont_top, batch_cont_top, (double)cont_max_abs, elapsed,
-                glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE") ? " fast-moe=on" : " fast-moe=off");
+                bat.batch_fast_moe ? " fast-moe=on" : " fast-moe=off");
     } else {
         fprintf(stderr, "ds4: %s: prefill batch check failed rows=%u time=%.3fs\n",
                 label ? label : "glm-generate", prompt_len, elapsed);
@@ -31024,6 +31027,7 @@ static int glm_generate_loop(const char *label,
                                             live->n_layer, live->n_dense,
                                             live->seq_n, false);
             if (ok) (void)glm_metal_fwd_borrow_shared_experts(&scratch, live);
+            scratch.batch_fast_moe = live->fast;
             if (ok) ok = glm_metal_fwd_batch_f32(&scratch, prompt, 0, prompt_len,
                                                  true, batch_logits, NULL, NULL);
             if (ok) ok = glm_metal_fwd_copy_kv_slots(live, &scratch, 0, prompt_len);
@@ -31038,7 +31042,7 @@ static int glm_generate_loop(const char *label,
                     "ds4: %s: prefill batch live rows=%u ok=%s time=%.3fs%s\n",
                     label ? label : "glm-generate", prompt_len, ok ? "yes" : "no",
                     now_sec() - b0,
-                    glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE") ? " fast-moe=on" : " fast-moe=off");
+                    scratch.batch_fast_moe ? " fast-moe=on" : " fast-moe=off");
             free(batch_logits);
             if (scratch.m) glm_metal_fwd_free(&scratch);
         } else {

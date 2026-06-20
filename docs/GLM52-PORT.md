@@ -412,14 +412,19 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `DS4_GLM_PREFILL_BATCH_LIVE=1` is now the guarded experimental live path for
   short Metal prompts: it batch-prefills a fresh scratch ctx, copies KV/final
   hidden/logits into the live ctx only after success, and falls back to sequential
-  prefill on failure. Real guarded-live smokes with `DS4_GLM_FAST=1
-  DS4_GLM_VERIFY_BATCH_FAST_MOE=1` match plain greedy ids/stdout: `asdfqwer -n 2`
-  stays `108714 100461` / `12345` while prefill drops `35.18s -> 12.31s`,
-  `The meaning of life is -n 2` stays `264 27066` / ` a profound` while prefill
-  drops `50.84s -> 14.59s`, and `asdfqwer --glm-nextn --glm-nextn-draft 1 -n 3`
-  still emits `108714 100461 21` / `123456` with `target_batches=1`. It is not
-  default and needs broader real-prompt validation before it can become production
-  behavior.
+  prefill on failure. With `DS4_GLM_FAST=1`, the live-prefill scratch ctx enables
+  the batch fast-MoE bridge directly, without the verifier-specific
+  `DS4_GLM_VERIFY_BATCH_FAST_MOE` env. Real guarded-live smokes match plain
+  greedy ids/stdout: `asdfqwer -n 2` stays `108714 100461` / `12345` while
+  prefill drops `35.18s -> 12.31s` (`13.47s` without the verifier env after the
+  ctx-field split), `The meaning of life is -n 2` stays `264 27066` /
+  ` a profound` while prefill drops `50.84s -> 14.59s`, and
+  `asdfqwer --glm-nextn --glm-nextn-draft 1 -n 3` still emits
+  `108714 100461 21` / `123456` with `target_batches=1`. A broader short-prompt
+  sweep also matched plain greedy for `Once upon a time` (`11 1052`, prefill
+  `45.33s -> 13.42s`), `Q: 2+2 =` (`220 20`, `71.45s -> 16.73s`), and
+  `def add(a, b):` (`220 671`, `60.41s -> 15.46s`). It is not default and needs
+  broader real-prompt validation before it can become production behavior.
   LM head is only ~0.5–0.6s/token and is not the next target.
   A measured top-1-only verifier readback experiment was discarded: on
   `asdfqwer -n 2` the full-logit path reported lm-head ~0.462s while the
