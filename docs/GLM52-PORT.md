@@ -322,7 +322,8 @@ The core GLM port is complete and verified. The active work is usability/speed:
   semantics. `ds4_test --glm-spec-generate-synth` pins full/partial/miss cases
   to the exact naive greedy sequence, `--glm-spec-metal-target-synth` now routes
   those cases through a rollback-safe Metal scratch/replay verifier callback
-  (still internally single-step; no speed claim),
+  using Metal batch-argmax over collected target rows (target rows are still
+  produced by single-token steps; no speed claim),
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and

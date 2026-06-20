@@ -30138,11 +30138,12 @@ static bool glm_metal_fwd_clone_kv(glm_metal_fwd_ctx *dst,
     return true;
 }
 
-/* Rollback-safe Metal verifier seam.  It first verifies the after-bonus suffix
- * in a scratch copy of the target KV cache, then replays only the committed
- * target-prefix tokens into the live context.  This is still single-step Metal
- * math internally, so target_batches remains the real single-step count; the
- * next step is replacing the scratch verifier loop with the batch graph. */
+/* Rollback-safe Metal verifier seam.  It runs the candidate after-bonus chain
+ * against a scratch copy of the target KV cache, reduces all collected row
+ * logits through the Metal batch-argmax primitive, then replays only the live
+ * committed target-prefix tokens into the real context.  The target rows are
+ * still produced by single-token steps; this is a correctness seam for the
+ * future batch graph, not a speed claim. */
 static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
                                                       int bonus_token,
                                                       const int *draft,
@@ -30160,31 +30161,100 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
                                                       int *next_out,
                                                       uint32_t *target_batches_out) {
     glm_metal_fwd_ctx *live = (glm_metal_fwd_ctx *)verify_ctx;
-    if (!live || !pos_io || !logits || !emit_after) return false;
+    if (!live || !pos_io || !logits || !emit_after || !emit_count ||
+        !accepted || !fallback_emitted || !fallback_token || !next_out)
+        return false;
+
+    *emit_count = 0;
+    *accepted = 0;
+    *fallback_emitted = false;
+    *fallback_token = -1;
+    *next_out = -1;
+    if (target_batches_out) *target_batches_out = 0;
+    if (remaining_after_bonus <= 0) return true;
+
+    const uint32_t pos0 = *pos_io;
+    uint32_t chain_rows = (uint32_t)active_depth + 1u;
+    if (chain_rows > (uint32_t)remaining_after_bonus) chain_rows = (uint32_t)remaining_after_bonus;
+    if (chain_rows == 0 || chain_rows > DS4_GLM_NEXTN_MAX_DEPTH + 1u) return false;
+
     glm_metal_fwd_ctx scratch;
     if (!glm_metal_fwd_clone_kv(&scratch, live)) return false;
-    float *scratch_logits = xmalloc((size_t)vocab * sizeof(float));
-    const uint32_t pos0 = *pos_io;
-    uint32_t scratch_pos = pos0;
-    uint32_t scratch_batches = 0;
-    bool ok = glm_spec_verify_after_bonus_single(glm_gen_metal_step, &scratch,
-                                                 bonus_token, draft, active_depth,
-                                                 &scratch_pos, remaining_after_bonus,
-                                                 scratch_logits, vocab, eos_id,
-                                                 emit_after, emit_count, accepted,
-                                                 fallback_emitted, fallback_token,
-                                                 next_out, &scratch_batches);
+    float *row_logits = xmalloc((size_t)chain_rows * vocab * sizeof(float));
+    int *row_top = xmalloc((size_t)chain_rows * sizeof(int));
+    float *row_val = xmalloc((size_t)chain_rows * sizeof(float));
+    bool ok = true;
+    for (uint32_t r = 0; r < chain_rows && ok; r++) {
+        const int tok = (r == 0) ? bonus_token : draft[r - 1u];
+        ok = glm_gen_metal_step(&scratch, tok, pos0 + r, true,
+                                row_logits + (size_t)r * vocab);
+    }
+    if (ok) ok = ds4_gpu_glm_argmax_batch_f32(row_logits, row_top, row_val,
+                                              vocab, chain_rows) != 0;
+
+    uint32_t replay_steps = 0;
+    uint32_t fallback_extra = 0;
     if (ok) {
-        const uint32_t steps = scratch_pos - pos0;
-        for (uint32_t i = 0; i < steps; i++) {
+        for (uint32_t r = 0; r < chain_rows && *emit_count < remaining_after_bonus; r++) {
+            const int next = row_top[r];
+            if (next == eos_id) {
+                replay_steps = r + 1u;
+                *next_out = next;
+                break;
+            }
+            if (*accepted < active_depth && draft[*accepted] == next) {
+                emit_after[(*emit_count)++] = next;
+                (*accepted)++;
+                replay_steps = r + 1u;
+                *next_out = next;
+                if (*emit_count >= remaining_after_bonus) break;
+                if (*accepted >= active_depth) {
+                    if (r + 1u < chain_rows) {
+                        replay_steps = r + 2u;
+                        *next_out = row_top[r + 1u];
+                    }
+                    break;
+                }
+                continue;
+            }
+
+            emit_after[(*emit_count)++] = next;
+            *fallback_emitted = true;
+            *fallback_token = next;
+            *next_out = next;
+            replay_steps = r + 1u;
+            break;
+        }
+
+        for (uint32_t i = 0; i < replay_steps && ok; i++) {
             const int tok = (i == 0) ? bonus_token : emit_after[i - 1u];
             ok = glm_gen_metal_step(live, tok, pos0 + i, true, logits);
-            if (!ok) break;
         }
-        *pos_io = scratch_pos;
-        if (target_batches_out) *target_batches_out = scratch_batches;
+        if (ok && *fallback_emitted && *emit_count < remaining_after_bonus) {
+            ok = glm_gen_metal_step(live, *fallback_token, pos0 + replay_steps,
+                                    true, logits);
+            if (ok) {
+                int top = -1;
+                float val = 0.0f;
+                ok = ds4_gpu_glm_argmax_batch_f32(logits, &top, &val, vocab, 1) != 0;
+                if (ok) {
+                    *next_out = top;
+                    replay_steps++;
+                    fallback_extra = 1;
+                }
+            }
+        }
+        if (ok) {
+            *pos_io = pos0 + replay_steps;
+            /* Count scratch target rows, plus any sequential fallback-carry row.
+             * This intentionally does not claim a batch target-speed win yet. */
+            if (target_batches_out) *target_batches_out = chain_rows + fallback_extra;
+        }
     }
-    free(scratch_logits);
+
+    free(row_val);
+    free(row_top);
+    free(row_logits);
     glm_metal_fwd_free(&scratch);
     return ok;
 }
