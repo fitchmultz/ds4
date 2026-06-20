@@ -369,7 +369,13 @@ The core GLM port is complete and verified. The active work is usability/speed:
   and calls the generic F32 projection helpers. For two decode steps, MLA spent
   `dequant=4.747s`, `reorder=0.414s`, `gpu=8.806s`; inside the F32 helpers
   `attn_output` alone cost `4.478s`, followed by `q_b=1.527s`, `q_a=0.785s`,
-  `kv_a=0.482s`, `v_b=0.428s`, `k_b=0.344s`. A fair no-profile run on the same prompt
+  `kv_a=0.482s`, `v_b=0.428s`, `k_b=0.344s`. `--glm-proj-bench` now isolates
+  real projection tensors before any decode integration: on `blk.0.attn_output`
+  (Q5_K, `6144x16384`), 5 warmed iterations measured current dequant+F32 helper
+  `0.0536s`/call versus cached-host-F32 helper `0.0294s`/call; on Q6_K `blk.8`
+  it measured `0.0737s` versus `0.0296s`. A full host-F32 `attn_output` cache
+  would cost ~29.25 GiB, so it is an opt-in/benchmark candidate, not a default.
+  A fair no-profile run on the same prompt
   measured plain greedy `DS4_GLM_FAST=1 --glm-raw -n 3` at decode `21.21s` and
   opt-in `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1
   DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at decode `12.30s`, with identical ids/stdout

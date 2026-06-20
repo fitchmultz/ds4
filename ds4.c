@@ -31618,6 +31618,99 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
     return rc;
 }
 
+int ds4_engine_glm_proj_bench(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    const ds4_model *m = &e->model;
+    if (m->arch != DS4_ARCH_GLM_DSA) {
+        fprintf(stderr, "ds4: --glm-proj-bench requires a GLM-5.2 (glm-dsa) model\n");
+        return 1;
+    }
+    const glm_cpu_shape shape = glm_cpu_shape_real();
+    uint32_t block_count = 0, nextn = 1;
+    if (!model_get_u32(m, "glm-dsa.block_count", &block_count) ||
+        !model_get_u32(m, "glm-dsa.nextn_predict_layers", &nextn)) {
+        fprintf(stderr, "ds4: --glm-proj-bench missing GLM metadata\n");
+        return 1;
+    }
+    const uint32_t n_layer = block_count >= nextn ? block_count - nextn : block_count;
+    uint32_t il = 0;
+    const char *layer_env = getenv("DS4_GLM_PROJ_BENCH_LAYER");
+    if (layer_env && layer_env[0]) il = (uint32_t)strtoul(layer_env, NULL, 10);
+    if (il >= n_layer) {
+        fprintf(stderr, "ds4: --glm-proj-bench layer %u out of range (n_layer=%u)\n", il, n_layer);
+        return 1;
+    }
+    int iters = 2;
+    const char *iters_env = getenv("DS4_GLM_PROJ_BENCH_ITERS");
+    if (iters_env && iters_env[0]) iters = atoi(iters_env);
+    if (iters < 1) iters = 1;
+    if (iters > 16) iters = 16;
+
+    const ds4_tensor *wop = glm_layer_tensor(m, il, "attn_output");
+    if (!wop) {
+        fprintf(stderr, "ds4: --glm-proj-bench missing blk.%u.attn_output\n", il);
+        return 1;
+    }
+    const uint32_t rows = shape.hidden;
+    const uint32_t cols = shape.n_head * shape.v_dim;
+    if (wop->elements != (uint64_t)rows * cols) {
+        fprintf(stderr, "ds4: --glm-proj-bench unexpected attn_output elements: got %llu want %llu\n",
+                (unsigned long long)wop->elements,
+                (unsigned long long)((uint64_t)rows * cols));
+        return 1;
+    }
+
+    float *W = xmalloc((size_t)rows * cols * sizeof(float));
+    float *x = xmalloc((size_t)cols * sizeof(float));
+    float *baseline = xmalloc((size_t)rows * sizeof(float));
+    float *cached = xmalloc((size_t)rows * sizeof(float));
+    for (uint32_t i = 0; i < cols; i++) x[i] = ((float)((int)(i % 251u) - 125)) * (1.0f / 251.0f);
+
+    double dequant_s = 0.0, matvec_s = 0.0, cached_s = 0.0;
+    bool ok = true;
+    for (int it = 0; ok && it < iters; it++) {
+        double t0 = now_sec();
+        glm_dequant_weight(m, wop, W);
+        dequant_s += now_sec() - t0;
+        t0 = now_sec();
+        ok = ds4_gpu_glm_matvec_f32(W, x, baseline, rows, cols) != 0;
+        matvec_s += now_sec() - t0;
+    }
+    if (ok) {
+        for (int it = 0; ok && it < iters; it++) {
+            const double t0 = now_sec();
+            ok = ds4_gpu_glm_matvec_f32(W, x, cached, rows, cols) != 0;
+            cached_s += now_sec() - t0;
+        }
+    }
+    const float max_abs = ok ? max_abs_diff(baseline, cached, rows) : 1.0e30f;
+    fprintf(stderr,
+            "ds4: glm-proj-bench tensor=blk.%u.attn_output type=%s rows=%u cols=%u iters=%d\n",
+            il, tensor_type_name(wop->type), rows, cols, iters);
+    fprintf(stderr,
+            "ds4: glm-proj-bench current dequant=%.3fs matvec=%.3fs total=%.3fs avg=%.3fs\n",
+            dequant_s, matvec_s, dequant_s + matvec_s,
+            (dequant_s + matvec_s) / (double)iters);
+    fprintf(stderr,
+            "ds4: glm-proj-bench cached-host-f32 matvec=%.3fs avg=%.3fs max_abs=%g\n",
+            cached_s, cached_s / (double)iters, (double)max_abs);
+    printf("glm-proj-bench: layer=%u type=%s current_avg=%.6f cached_avg=%.6f max_abs=%g\n",
+           il, tensor_type_name(wop->type),
+           (dequant_s + matvec_s) / (double)iters,
+           cached_s / (double)iters, (double)max_abs);
+
+    free(cached);
+    free(baseline);
+    free(x);
+    free(W);
+    return ok ? 0 : 1;
+#else
+    (void)e;
+    fprintf(stderr, "ds4: --glm-proj-bench requires a Metal build\n");
+    return 1;
+#endif
+}
+
 /* Phase 4e synth self-check: incremental generation must produce the SAME
  * greedy argmax at every decode step as a fresh NAIVE full forward
  * (glm_cpu_forward) over the growing prefix.  Pins that the incremental KV

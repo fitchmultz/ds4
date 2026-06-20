@@ -249,6 +249,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--glm-chat-cpu", "GLM-5.2 only: same as --glm-chat on the CPU reference backend (identical greedy sequence).");
     opt(fp, c, "--glm-raw", "GLM-5.2 only: raw-tokenize -p/--prompt and greedy-decode without the chat template. Useful for low-prefill latency experiments while batched prefill is pending.");
     opt(fp, c, "--glm-raw-cpu", "GLM-5.2 only: same as --glm-raw on the CPU reference backend.");
+    opt(fp, c, "--glm-proj-bench", "GLM-5.2 Metal diagnostic: benchmark one real MLA projection tensor in isolation. Env: DS4_GLM_PROJ_BENCH_LAYER, DS4_GLM_PROJ_BENCH_ITERS.");
     opt(fp, c, "--glm-nextn", "GLM-5.2 only (opt-in, default off, Metal target only): enable the correctness-first NextN/MTP speculative greedy scaffold for --glm-raw/--glm-chat. Uses the Metal blk.78 drafter by default; output stays byte-for-byte greedy-identical because every emitted token is the verified target argmax and drafts never touch the target KV cache. CPU target ignores it with a diagnostic.");
     opt(fp, c, "--glm-nextn-draft N", "GLM-5.2 only: recursive NextN draft depth for --glm-nextn, capped at 4 (default 4). Separate from DeepSeek --mtp-draft.");
     opt(fp, c, "DS4_GLM_NEXTN_DRAFT_BACKEND=cpu|metal", "GLM diagnostic: select the --glm-nextn drafter backend. Default is metal on Metal builds; cpu is for A/B/debug only.");
