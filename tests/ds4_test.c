@@ -2591,6 +2591,72 @@ static void test_glm_quant_dequant(void) {
  * the MLA composite end-to-end, on the SAME synthetic inputs the numpy
  * reference consumes.  Tolerance: 1e-4 abs / 1e-5 rel (per task spec). */
 
+static void test_glm_qk_direct_matvec(void) {
+#ifndef DS4_NO_GPU
+    const char *dir = getenv("DS4_TEST_GLM52_QUANT_DIR");
+    if (!dir || !dir[0]) dir = "tests/test-vectors/glm52-quant";
+    static const struct {
+        const char *name;
+        const char *kernel;
+        uint32_t block_bytes;
+        uint32_t nr0;
+    } cases[] = {
+        {"Q5_K", "kernel_glm_matvec_q5_k_f32", 176, 1},
+        {"Q6_K", "kernel_glm_matvec_q6_k_f32", 210, 2},
+    };
+    float x[256];
+    for (uint32_t i = 0; i < 256; i++) x[i] = ((float)((int)(i % 29u) - 14)) * (1.0f / 29.0f);
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        char bin[512], oracle[512];
+        snprintf(bin, sizeof(bin), "%s/%s.bin", dir, cases[c].name);
+        snprintf(oracle, sizeof(oracle), "%s/%s.oracle.txt", dir, cases[c].name);
+        size_t blen = 0, olen = 0;
+        char *b = test_read_whole_file(bin, &blen);
+        char *o = test_read_whole_file(oracle, &olen);
+        TEST_ASSERT(b != NULL && o != NULL);
+        const size_t rows = blen / cases[c].block_bytes;
+        const size_t n_elem = rows * 256u;
+        float *ref = malloc(sizeof(float) * n_elem);
+        float *cpu = calloc(rows, sizeof(float));
+        float *gpu = calloc(rows, sizeof(float));
+        TEST_ASSERT(ref != NULL && cpu != NULL && gpu != NULL);
+        size_t nref = 0;
+        for (char *p = o; *p && nref < n_elem; ) {
+            char *e = NULL;
+            double v = strtod(p, &e);
+            if (e == p) { p++; continue; }
+            ref[nref++] = (float)v;
+            p = e;
+        }
+        TEST_ASSERT(nref == n_elem);
+        for (size_t r = 0; r < rows; r++) {
+            double acc = 0.0;
+            for (uint32_t k = 0; k < 256; k++) acc += (double)ref[r * 256u + k] * (double)x[k];
+            cpu[r] = (float)acc;
+        }
+        int gok = ds4_gpu_glm_matvec_qk_f32(b, blen, x, gpu,
+                                            (uint32_t)rows, 256,
+                                            cases[c].block_bytes,
+                                            cases[c].nr0,
+                                            cases[c].kernel);
+        TEST_ASSERT(gok != 0);
+        float maxabs = 0.0f, maxrel = 0.0f;
+        for (size_t r = 0; r < rows; r++) {
+            const float d = fabsf(cpu[r] - gpu[r]);
+            if (d > maxabs) maxabs = d;
+            if (fabsf(cpu[r]) > 1e-9f) { float rr = d / fabsf(cpu[r]); if (rr > maxrel) maxrel = rr; }
+        }
+        const bool ok = maxabs < 1e-4f || maxrel < 1e-5f;
+        fprintf(stderr, "  glm-qk-direct: %s %s (rows=%zu maxabs=%.3g maxrel=%.3g)\n",
+                cases[c].name, ok ? "PASS" : "FAIL", rows, (double)maxabs, (double)maxrel);
+        TEST_ASSERT(ok);
+        free(gpu); free(cpu); free(ref); free(b); free(o);
+    }
+#else
+    fprintf(stderr, "  glm-qk-direct: SKIP (no GPU build)\n");
+#endif
+}
+
 static float *glm_ref_load_floats(const char *dir, const char *fname, size_t n) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", dir, fname);
@@ -4044,6 +4110,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-ssd-math", "glm-ssd-math", "GLM-5.2 SSD cache-plan arithmetic regression (no model needed)", test_glm_ssd_cache_plan},
     {"--glm-bpe", "glm-bpe", "GLM-5.2 glm4 BPE tokenizer vs HF tokenizers oracle (shard 1)", test_glm_bpe},
     {"--glm-quant-dequant", "glm-quant-dequant", "GLM-5.2 K-quant CPU dequant vs llama.cpp oracle", test_glm_quant_dequant},
+    {"--glm-qk-direct", "glm-qk-direct", "GLM-5.2 direct Q5_K/Q6_K Metal matvec vs dequant oracle", test_glm_qk_direct_matvec},
     {"--glm-cpu-ref-components", "glm-cpu-ref-components", "GLM-5.2 CPU reference components (RoPE/MLA/dense-FFN/MoE) vs numpy oracle", test_glm_cpu_ref_components},
     {"--glm-cpu-forward-synth", "glm-cpu-forward-synth", "GLM-5.2 full CPU forward assembly on a tiny synthetic model (no model needed)", test_glm_cpu_forward_synth},
     {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},

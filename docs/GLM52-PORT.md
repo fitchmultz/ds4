@@ -379,6 +379,15 @@ The core GLM port is complete and verified. The active work is usability/speed:
   contexts, and is intentionally not default because it competes with routed
   expert-cache memory. On `asdfqwer -n 5` it preserved ids/stdout and improved
   no-profile decode `41.32s -> 36.51s` while adding ~2.1s startup cache build.
+  The stronger path is `DS4_GLM_MLA_DIRECT_OUT_QK=1`: benchmark-only Q5_K/Q6_K
+  direct Metal kernels measured `blk.0.attn_output` `0.0060s`/call and `blk.8`
+  `0.0065s`/call versus cached F32 `~0.030s`, with max abs versus F32 of
+  `2.2e-6` / `8.5e-6`. Wired into live fast contexts for `attn_output` only,
+  it preserves `asdfqwer -n 5` ids/stdout and improves no-profile decode
+  `40.61s -> 29.30s`; profiled `-n 3` improves decode `20.33s -> 15.00s`
+  and MLA avg/call `0.0514s -> 0.0322s`. Direct QK supersedes the host-F32
+  `attn_output` cache when both env flags are set. `./ds4_test --glm-qk-direct`
+  covers the Q5_K/Q6_K kernels against tiny dequant oracle fixtures.
   A fair no-profile run on the same prompt
   measured plain greedy `DS4_GLM_FAST=1 --glm-raw -n 3` at decode `21.21s` and
   opt-in `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1

@@ -44,6 +44,179 @@ kernel void kernel_glm_matvec_f32(
     out[gid] = acc;
 }
 
+#define DS4_GLM_QK_K 256
+
+struct ds4_metal_args_glm_qk_matvec {
+    uint32_t rows;
+    uint32_t cols;
+    uint64_t row_bytes;
+};
+
+struct ds4_metal_block_q5_K {
+    half d;
+    half dmin;
+    uchar scales[12];
+    uchar qh[DS4_GLM_QK_K / 8];
+    uchar qs[DS4_GLM_QK_K / 2];
+};
+
+struct ds4_metal_block_q6_K {
+    uchar ql[DS4_GLM_QK_K / 2];
+    uchar qh[DS4_GLM_QK_K / 4];
+    char  scales[DS4_GLM_QK_K / 16];
+    half d;
+};
+
+kernel void kernel_glm_matvec_q5_k_f32(
+        constant ds4_metal_args_glm_qk_matvec & args,
+        device const char  * src0,
+        device const float * yy,
+        device       float * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = 2;
+    constexpr short nr0 = 1;
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+
+    const int nb = args.cols / DS4_GLM_QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    if (first_row >= (int)args.rows) return;
+
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short iq  = tid / 4;
+    const short ir  = tid % 4;
+    const short l0 = 8 * ir;
+    const short q_offset = 32 * iq + l0;
+    const short y_offset = 64 * iq + l0;
+
+    const uchar hm1 = 1u << (2 * iq);
+    const uchar hm2 = hm1 << 1;
+    const uchar hm3 = hm1 << 4;
+    const uchar hm4 = hm2 << 4;
+
+    float sumf = 0.0f;
+    float yl[16];
+    float yh[16];
+    ushort sc16[4];
+    thread const uchar * sc8 = (thread const uchar *)sc16;
+    device const float * y1 = yy + ix * DS4_GLM_QK_K + y_offset;
+    device const ds4_metal_block_q5_K * x = (device const ds4_metal_block_q5_K *)(src0 + (uint64_t)first_row * args.row_bytes);
+
+    for (int i = ix; i < nb; i += 4) {
+        device const uchar * q1 = x[i].qs + q_offset;
+        device const uchar * qh = x[i].qh + l0;
+        device const half * dh = &x[i].d;
+        device const ushort * a = (device const ushort *)x[i].scales + iq;
+        device const float * y2 = y1 + 128;
+        float4 sumy = float4(0.0f);
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l +  0]; sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32]; sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l +  0]; sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32]; sumy[3] += yh[l + 8];
+        }
+
+        device const uchar * q2 = q1 + 64;
+        sc16[0] = a[0] & kmask1;
+        sc16[1] = a[2] & kmask1;
+        sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+        sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+        float4 acc1 = float4(0.0f);
+        float4 acc2 = float4(0.0f);
+        for (short l = 0; l < 8; ++l) {
+            const uchar h = qh[l];
+            acc1[0] += yl[l + 0] * (q1[l] & 0x0F);
+            acc1[1] += yl[l + 8] * (q1[l] & 0xF0);
+            acc1[2] += yh[l + 0] * (q2[l] & 0x0F);
+            acc1[3] += yh[l + 8] * (q2[l] & 0xF0);
+            acc2[0] += h & hm1 ? yl[l + 0] : 0.0f;
+            acc2[1] += h & hm2 ? yl[l + 8] : 0.0f;
+            acc2[2] += h & hm3 ? yh[l + 0] : 0.0f;
+            acc2[3] += h & hm4 ? yh[l + 8] : 0.0f;
+        }
+
+        sumf += (float)dh[0] * (sc8[0] * (acc1[0]      + 16.0f * acc2[0]) +
+                                sc8[1] * (acc1[1]/16.0f + 16.0f * acc2[1]) +
+                                sc8[4] * (acc1[2]      + 16.0f * acc2[2]) +
+                                sc8[5] * (acc1[3]/16.0f + 16.0f * acc2[3])) -
+                (float)dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        y1 += 4 * DS4_GLM_QK_K;
+    }
+
+    const float tot = simd_sum(sumf);
+    if (tiisg == 0) dst[first_row] = tot;
+}
+
+kernel void kernel_glm_matvec_q6_k_f32(
+        constant ds4_metal_args_glm_qk_matvec & args,
+        device const char  * src0,
+        device const float * yy,
+        device       float * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = 2;
+    constexpr short nr0 = 2;
+    constexpr uchar kmask1 = 0x03;
+    constexpr uchar kmask2 = 0x0C;
+    constexpr uchar kmask3 = 0x30;
+    constexpr uchar kmask4 = 0xC0;
+
+    const int nb = args.cols / DS4_GLM_QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    if (first_row >= (int)args.rows) return;
+
+    const short tid = tiisg / 2;
+    const short ix  = tiisg % 2;
+    const short ip  = tid / 8;
+    const short il  = tid % 8;
+    const short l0  = 4 * il;
+    const short is  = 8 * ip + l0 / 16;
+    const short y_offset   = 128 * ip + l0;
+    const short q_offset_l =  64 * ip + l0;
+    const short q_offset_h =  32 * ip + l0;
+
+    float sumf[nr0] = { 0.0f, 0.0f };
+    float yl[16];
+    device const ds4_metal_block_q6_K * x0 = (device const ds4_metal_block_q6_K *)(src0 + (uint64_t)first_row * args.row_bytes);
+
+    for (int i = ix; i < nb; i += 2) {
+        device const float * y = yy + i * DS4_GLM_QK_K + y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+        for (short row = 0; row < nr0 && first_row + row < (int)args.rows; ++row) {
+            device const ds4_metal_block_q6_K * x = (device const ds4_metal_block_q6_K *)((device const char *)x0 + (uint64_t)row * args.row_bytes);
+            device const uchar * q1 = x[i].ql + q_offset_l;
+            device const uchar * q2 = q1 + 32;
+            device const uchar * qh = x[i].qh + q_offset_h;
+            device const char  * sc = x[i].scales + is;
+            const float d = (float)x[i].d;
+            float4 sums = float4(0.0f);
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((char)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((char)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((char)((q1[l] >>  4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((char)((q2[l] >>  4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+            sumf[row] += d * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
+    }
+
+    for (short row = 0; row < nr0 && first_row + row < (int)args.rows; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) dst[first_row + row] = tot;
+    }
+}
+
 // out[t*rows + r] = dot(W[r], x[t]).  Same accumulation order as matvec.
 // This is the small GLM primitive needed by future layer-major verifier and
 // prefill microbatches; it deliberately stays F32/simple like the component

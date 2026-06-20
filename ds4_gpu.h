@@ -1030,6 +1030,11 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
  * q_a / q_b / kv_a / k_b / v_b / attn_output (all F32 on the fixtures). */
 int ds4_gpu_glm_matvec_f32(const float * W, const float * x, float * out,
                            uint32_t rows, uint32_t cols);
+int ds4_gpu_glm_matvec_qk_f32(const void *Wq, uint64_t Wq_bytes,
+                              const float *x, float *out,
+                              uint32_t rows, uint32_t cols,
+                              uint64_t row_bytes, uint32_t nr0,
+                              const char *kernel_name);
 
 /* out[t*rows+r] = sum_c W[r*cols+c] * x[t*cols+c] for a tiny token batch.
  * Enabling primitive for future GLM layer-major verifier/prefill microbatches. */
