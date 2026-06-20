@@ -27454,8 +27454,7 @@ static void ds4_gpu_glm_expert_cache_clear(void) {
 }
 
 static int ds4_gpu_glm_expert_pread_enabled(void) {
-    const char *e = getenv("DS4_GLM_EXPERT_PREAD");
-    return e && atoi(e) == 1;
+    return ds4_gpu_env_bool("DS4_GLM_EXPERT_PREAD") > 0;
 }
 
 static int ds4_gpu_glm_stage_selected_slabs(
@@ -27483,7 +27482,7 @@ static int ds4_gpu_glm_stage_selected_slabs(
     if (use_pread) {
         static int warned = 0;
         if (!warned) {
-            fprintf(stderr, "ds4: glm-fast: selected expert staging uses pread (DS4_GLM_EXPERT_PREAD=1)\n");
+            fprintf(stderr, "ds4: glm-fast: selected expert staging uses pread (DS4_GLM_EXPERT_PREAD enabled)\n");
             warned = 1;
         }
     }
