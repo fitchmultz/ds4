@@ -30119,6 +30119,77 @@ static bool glm_spec_verify_after_bonus_single(glm_gen_step_fn step,
     return true;
 }
 
+#ifndef DS4_NO_GPU
+static bool glm_metal_fwd_clone_kv(glm_metal_fwd_ctx *dst,
+                                   const glm_metal_fwd_ctx *src) {
+    if (!dst || !src || !src->m || !src->shape) return false;
+    memset(dst, 0, sizeof(*dst));
+    if (!glm_metal_fwd_init(dst, src->m, src->shape,
+                            src->n_layer, src->n_dense, src->seq_n))
+        return false;
+    const size_t kn = (size_t)src->nh * src->seq_n * src->nope * sizeof(float);
+    const size_t vn = (size_t)src->nh * src->seq_n * src->vd * sizeof(float);
+    const size_t rn = (size_t)src->nh * src->seq_n * src->rope * sizeof(float);
+    for (uint32_t il = 0; il < src->n_layer; il++) {
+        memcpy(dst->Knope[il], src->Knope[il], kn);
+        memcpy(dst->Vc[il],    src->Vc[il],    vn);
+        memcpy(dst->Krop[il],  src->Krop[il],  rn);
+    }
+    return true;
+}
+
+/* Rollback-safe Metal verifier seam.  It first verifies the after-bonus suffix
+ * in a scratch copy of the target KV cache, then replays only the committed
+ * target-prefix tokens into the live context.  This is still single-step Metal
+ * math internally, so target_batches remains the real single-step count; the
+ * next step is replacing the scratch verifier loop with the batch graph. */
+static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
+                                                      int bonus_token,
+                                                      const int *draft,
+                                                      int active_depth,
+                                                      uint32_t *pos_io,
+                                                      int remaining_after_bonus,
+                                                      float *logits,
+                                                      uint32_t vocab,
+                                                      int eos_id,
+                                                      int *emit_after,
+                                                      int *emit_count,
+                                                      int *accepted,
+                                                      bool *fallback_emitted,
+                                                      int *fallback_token,
+                                                      int *next_out,
+                                                      uint32_t *target_batches_out) {
+    glm_metal_fwd_ctx *live = (glm_metal_fwd_ctx *)verify_ctx;
+    if (!live || !pos_io || !logits || !emit_after) return false;
+    glm_metal_fwd_ctx scratch;
+    if (!glm_metal_fwd_clone_kv(&scratch, live)) return false;
+    float *scratch_logits = xmalloc((size_t)vocab * sizeof(float));
+    const uint32_t pos0 = *pos_io;
+    uint32_t scratch_pos = pos0;
+    uint32_t scratch_batches = 0;
+    bool ok = glm_spec_verify_after_bonus_single(glm_gen_metal_step, &scratch,
+                                                 bonus_token, draft, active_depth,
+                                                 &scratch_pos, remaining_after_bonus,
+                                                 scratch_logits, vocab, eos_id,
+                                                 emit_after, emit_count, accepted,
+                                                 fallback_emitted, fallback_token,
+                                                 next_out, &scratch_batches);
+    if (ok) {
+        const uint32_t steps = scratch_pos - pos0;
+        for (uint32_t i = 0; i < steps; i++) {
+            const int tok = (i == 0) ? bonus_token : emit_after[i - 1u];
+            ok = glm_gen_metal_step(live, tok, pos0 + i, true, logits);
+            if (!ok) break;
+        }
+        *pos_io = scratch_pos;
+        if (target_batches_out) *target_batches_out = scratch_batches;
+    }
+    free(scratch_logits);
+    glm_metal_fwd_free(&scratch);
+    return ok;
+}
+#endif
+
 /* Opt-in GLM NextN speculative decode. Correctness-first, NOT a
  * speed claim: verification reuses the existing single-token target step; the
  * real-model drafter defaults to Metal with a CPU A/B fallback. Every emitted
@@ -30913,8 +30984,9 @@ int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
                                       glm_gen_metal_hnorm, &c, prompt, plen,
                                       n_steps, li, sc.vocab, NULL, eos_id, NULL,
                                       &generated, ids, NULL, depth,
-                                      glm_spec_mock_draft, &mc, NULL, NULL, NULL,
-                                      &live_generated)
+                                      glm_spec_mock_draft, &mc, NULL,
+                                      glm_spec_verify_after_bonus_metal_scratch,
+                                      &c, &live_generated)
                     : 1;
         ok = ok && rc == 0 && generated == n_steps;
         for (int s = 0; ok && s < n_steps; s++)

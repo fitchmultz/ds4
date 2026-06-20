@@ -320,8 +320,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `glm_spec_verify_after_bonus_single`, giving the future Metal verifier
   microbatch a concrete contract to replace without changing accept/rollback
   semantics. `ds4_test --glm-spec-generate-synth` pins full/partial/miss cases
-  to the exact naive greedy sequence, `--glm-spec-batch-verify-synth` pins the
-  future batched-verifier contract to the same sequence,
+  to the exact naive greedy sequence, `--glm-spec-metal-target-synth` now routes
+  those cases through a rollback-safe Metal scratch/replay verifier callback
+  (still internally single-step; no speed claim),
+  `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
+  the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and
   `--glm-spec-trace-synth` pins the CSV trace shape, including the final
   no-draft row plus `target_steps`/`target_batches` accounting. `target_batches`
