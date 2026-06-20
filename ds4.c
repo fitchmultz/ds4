@@ -29681,6 +29681,17 @@ static int glm_spec_decode(const char *label,
     if (depth < 1) depth = 1;
     if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
     int *draft = xmalloc(sizeof(int) * (size_t)depth);
+    FILE *trace = NULL;
+    const char *trace_path = getenv("DS4_GLM_NEXTN_TRACE_OUT");
+    if (trace_path && trace_path[0]) {
+        trace = fopen(trace_path, "w");
+        if (trace) {
+            fprintf(trace,
+                    "round,generated_before,seed_token,active_depth,first_target,"
+                    "draft0,draft1,draft2,draft3,accepted,fallback_emitted,"
+                    "fallback_token,generated_after\n");
+        }
+    }
 
     int next = sample_argmax(logits, vocab);   /* first verified target token */
     uint32_t pos = prompt_len;
@@ -29692,6 +29703,11 @@ static int glm_spec_decode(const char *label,
     const double dec0 = now_sec();
     while (generated < n_predict && next != eos_id) {
         rounds++;
+        const int round_generated = generated;
+        const int seed_token = last_committed;
+        const int first_target = next;
+        int fallback_token = -1;
+        bool fallback_emitted = false;
         const float *seed_h = hnorm ? hnorm(ctx) : NULL;
         if (obs_generated) *obs_generated = generated;
         for (int j = 0; j < depth; j++) draft[j] = -1;
@@ -29720,6 +29736,7 @@ static int glm_spec_decode(const char *label,
             acc++;
             if (generated >= n_predict) break;
             if (!step(ctx, next, pos, true, logits)) {
+                if (trace) fclose(trace);
                 free(draft);
                 if (out_decode_s) *out_decode_s = now_sec() - dec0;
                 if (out_generated) *out_generated = generated;
@@ -29736,6 +29753,8 @@ static int glm_spec_decode(const char *label,
          * touched the target cache, so nothing is rolled back. */
         if (generated < n_predict && next != eos_id) {
             if (gen_ids_out) gen_ids_out[generated] = next;
+            fallback_token = next;
+            fallback_emitted = true;
             if (out) {
                 size_t pl = 0;
                 char *piece = ds4_token_text(e, next, &pl);
@@ -29743,15 +29762,17 @@ static int glm_spec_decode(const char *label,
             }
             last_committed = next;
             generated++;
-            if (generated >= n_predict) break;
-            if (!step(ctx, next, pos, true, logits)) {
-                free(draft);
-                if (out_decode_s) *out_decode_s = now_sec() - dec0;
-                if (out_generated) *out_generated = generated;
-                return 1;
+            if (generated < n_predict) {
+                if (!step(ctx, next, pos, true, logits)) {
+                    if (trace) fclose(trace);
+                    free(draft);
+                    if (out_decode_s) *out_decode_s = now_sec() - dec0;
+                    if (out_generated) *out_generated = generated;
+                    return 1;
+                }
+                pos++;
+                next = sample_argmax(logits, vocab);
             }
-            pos++;
-            next = sample_argmax(logits, vocab);
         }
 
         if (active_depth == 0) {
@@ -29759,8 +29780,18 @@ static int glm_spec_decode(const char *label,
         } else if (acc == 0) acc_miss++;
         else if (acc < active_depth) acc_partial++;
         else acc_full++;
+        if (trace) {
+            fprintf(trace, "%llu,%d,%d,%d,%d",
+                    (unsigned long long)rounds, round_generated, seed_token,
+                    active_depth, first_target);
+            for (int j = 0; j < DS4_GLM_NEXTN_MAX_DEPTH; j++)
+                fprintf(trace, ",%d", j < active_depth ? draft[j] : -1);
+            fprintf(trace, ",%d,%d,%d,%d\n", acc,
+                    fallback_emitted ? 1 : 0, fallback_token, generated);
+        }
         if (obs_generated) *obs_generated = generated;
     }
+    if (trace) fclose(trace);
     free(draft);
     const double decode_s = now_sec() - dec0;
     if (out_generated) *out_generated = generated;

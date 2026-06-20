@@ -252,6 +252,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--glm-nextn", "GLM-5.2 only (opt-in, default off, Metal target only): enable the correctness-first NextN/MTP speculative greedy scaffold for --glm-raw/--glm-chat. Uses the Metal blk.78 drafter by default; output stays byte-for-byte greedy-identical because every emitted token is the verified target argmax and drafts never touch the target KV cache. CPU target ignores it with a diagnostic.");
     opt(fp, c, "--glm-nextn-draft N", "GLM-5.2 only: recursive NextN draft depth for --glm-nextn, capped at 4 (default 4). Separate from DeepSeek --mtp-draft.");
     opt(fp, c, "DS4_GLM_NEXTN_DRAFT_BACKEND=cpu|metal", "GLM diagnostic: select the --glm-nextn drafter backend. Default is metal on Metal builds; cpu is for A/B/debug only.");
+    opt(fp, c, "DS4_GLM_NEXTN_TRACE_OUT=FILE", "GLM diagnostic: write --glm-nextn per-round CSV trace with drafts, accepted count, fallback token, and generated count.");
     opt(fp, c, "DS4_GLM_FAST=1", "GLM-5.2 Metal fast path: fused routed MoE gate/up/down plus resident shared experts.");
     opt(fp, c, "DS4_GLM_EXPERT_PREAD=1", "GLM fast path: stage selected routed-expert quant slabs with explicit pread instead of mmap page faults.");
     opt(fp, c, "DS4_GLM_EXPERT_CACHE_PRESET=decode|plan", "GLM fast path: enable bounded LRU routed-expert slab cache; decode is conservative, plan is the documented ~88 GiB cache plan.");

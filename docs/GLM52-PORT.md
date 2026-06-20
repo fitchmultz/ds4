@@ -285,7 +285,10 @@ The core GLM port is complete and verified. The active work is usability/speed:
   the validated Metal NextN path (`DS4_GLM_NEXTN_DRAFT_BACKEND=cpu` keeps a CPU
   A/B fallback), but verification still reuses the single-token target step
   (one target forward per emitted token), so the speedup still needs batched
-  target verification. `ds4_test --glm-spec-generate-synth` pins full/partial/
+  target verification. `DS4_GLM_NEXTN_TRACE_OUT=<path>` writes a per-round CSV
+  trace for acceptance-rate analysis; current real `asdfqwer -n 2` trace shows
+  round 1 target `108714`, draft `198`, accepted `0`, fallback `108714`, then
+  final target `100461`. `ds4_test --glm-spec-generate-synth` pins full/partial/
   miss cases to the exact naive greedy sequence.
 - `--glm-raw` / `--glm-raw-cpu` bypass the GLM chat template and raw-tokenize
   `-p/--prompt`. This is a usability/benchmark mode, not chat: a one-token raw
