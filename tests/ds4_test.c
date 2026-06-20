@@ -3622,6 +3622,153 @@ static void test_glm_metal_components(void) {
             glm_metal_cmp("FFN batch2 dense composite", bmff, bcff,
                           (size_t)batch_n * H, tol_abs, tol_rel);
 
+            /* Batch-2 full dense residual block: attn RMSNorm -> MLA ->
+             * residual -> FFN RMSNorm -> dense FFN -> residual. This ties the
+             * batch primitives into the same layer-level shape the verifier and
+             * prefill graph need, not just isolated sublayer checks. */
+            {
+                const uint32_t block_pos0 = t_pos - 1u;
+                float *ones_h = malloc((size_t)H * sizeof(float));
+                float *bc_an = malloc((size_t)batch_n * H * sizeof(float));
+                float *bm_an = malloc((size_t)batch_n * H * sizeof(float));
+                float *bc_mla = malloc((size_t)batch_n * H * sizeof(float));
+                float *bm_mla = malloc((size_t)batch_n * H * sizeof(float));
+                float *bc_res1 = malloc((size_t)batch_n * H * sizeof(float));
+                float *bm_res1 = malloc((size_t)batch_n * H * sizeof(float));
+                float *bc_fn = malloc((size_t)batch_n * H * sizeof(float));
+                float *bm_fn = malloc((size_t)batch_n * H * sizeof(float));
+                float *bc_ffn = malloc((size_t)batch_n * H * sizeof(float));
+                float *bm_ffn = malloc((size_t)batch_n * H * sizeof(float));
+                float *bc_block = malloc((size_t)batch_n * H * sizeof(float));
+                float *bm_block = malloc((size_t)batch_n * H * sizeof(float));
+                float *bc_blk_kn = malloc((size_t)nh * seq_n * nope * sizeof(float));
+                float *bc_blk_kr = malloc((size_t)nh * seq_n * rope * sizeof(float));
+                float *bc_blk_v = malloc((size_t)nh * seq_n * vd * sizeof(float));
+                float *bm_blk_qa = malloc((size_t)batch_n * ql * sizeof(float));
+                float *bm_blk_qan = malloc((size_t)batch_n * ql * sizeof(float));
+                float *bm_blk_q = malloc((size_t)batch_n * nh * qhd * sizeof(float));
+                float *bm_blk_kva = malloc((size_t)batch_n * (kvl + rope) * sizeof(float));
+                float *bm_blk_lat = malloc((size_t)batch_n * kvl * sizeof(float));
+                float *bm_blk_kvln = malloc((size_t)batch_n * kvl * sizeof(float));
+                float *bm_blk_k = malloc((size_t)batch_n * nh * nope * sizeof(float));
+                float *bm_blk_vproj = malloc((size_t)batch_n * nh * vd * sizeof(float));
+                float *bm_blk_qr = malloc((size_t)batch_n * nh * rope * sizeof(float));
+                float *bm_blk_qrr = malloc((size_t)batch_n * nh * rope * sizeof(float));
+                float *bm_blk_kr_raw = malloc((size_t)batch_n * nh * rope * sizeof(float));
+                float *bm_blk_krr = malloc((size_t)batch_n * nh * rope * sizeof(float));
+                float *bm_blk_Q = malloc((size_t)batch_n * nh * qhd * sizeof(float));
+                float *bm_blk_Kn = malloc((size_t)nh * seq_n * nope * sizeof(float));
+                float *bm_blk_Kr = malloc((size_t)nh * seq_n * rope * sizeof(float));
+                float *bm_blk_Vc = malloc((size_t)nh * seq_n * vd * sizeof(float));
+                float *bm_blk_attn = malloc((size_t)batch_n * nh * vd * sizeof(float));
+                float *bm_blk_gh = malloc((size_t)batch_n * ff * sizeof(float));
+                float *bm_blk_uh = malloc((size_t)batch_n * ff * sizeof(float));
+                float *bm_blk_act = malloc((size_t)batch_n * ff * sizeof(float));
+                TEST_ASSERT(ones_h && bc_an && bm_an && bc_mla && bm_mla && bc_res1 && bm_res1 &&
+                            bc_fn && bm_fn && bc_ffn && bm_ffn && bc_block && bm_block &&
+                            bc_blk_kn && bc_blk_kr && bc_blk_v && bm_blk_qa && bm_blk_qan &&
+                            bm_blk_q && bm_blk_kva && bm_blk_lat && bm_blk_kvln && bm_blk_k &&
+                            bm_blk_vproj && bm_blk_qr && bm_blk_qrr && bm_blk_kr_raw &&
+                            bm_blk_krr && bm_blk_Q && bm_blk_Kn && bm_blk_Kr && bm_blk_Vc &&
+                            bm_blk_attn && bm_blk_gh && bm_blk_uh && bm_blk_act);
+                for (uint32_t i = 0; i < H; i++) ones_h[i] = 1.0f;
+                memcpy(bc_blk_kn, K_nope_ref, (size_t)nh * seq_n * nope * sizeof(float));
+                memcpy(bc_blk_kr, K_rope_ref, (size_t)nh * seq_n * rope * sizeof(float));
+                memcpy(bc_blk_v, V_ref, (size_t)nh * seq_n * vd * sizeof(float));
+                for (uint32_t t = 0; t < batch_n; t++) {
+                    glm_rmsnorm_f32(bc_an + (size_t)t * H, xb + (size_t)t * H,
+                                    ones_h, H, shape.rms_eps);
+                    glm_mla_forward_token_f32(bc_mla + (size_t)t * H,
+                                              bc_an + (size_t)t * H,
+                                              WqA, WqB, WkvA, WkB, WvB, Wo,
+                                              NULL, NULL, bc_blk_kn, bc_blk_v,
+                                              bc_blk_kr, seq_n, block_pos0 + t,
+                                              &shape, NULL);
+                    for (uint32_t i = 0; i < H; i++)
+                        bc_res1[(size_t)t * H + i] = xb[(size_t)t * H + i] + bc_mla[(size_t)t * H + i];
+                    glm_rmsnorm_f32(bc_fn + (size_t)t * H, bc_res1 + (size_t)t * H,
+                                    ones_h, H, shape.rms_eps);
+                    glm_swiglu_dense_f32(bc_ffn + (size_t)t * H, bc_fn + (size_t)t * H,
+                                         ff_gate, ff_up, ff_down, &shape, cgh, cuh);
+                    for (uint32_t i = 0; i < H; i++)
+                        bc_block[(size_t)t * H + i] = bc_res1[(size_t)t * H + i] + bc_ffn[(size_t)t * H + i];
+                }
+
+                TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(xb, ones_h, bm_an, H, batch_n, shape.rms_eps));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(WqA, bm_an, bm_blk_qa, ql, H, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(bm_blk_qa, ones, bm_blk_qan, ql, batch_n, shape.rms_eps));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(WqB, bm_blk_qan, bm_blk_q, nh * qhd, ql, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(WkvA, bm_an, bm_blk_kva, kvl + rope, H, batch_n));
+                for (uint32_t t = 0; t < batch_n; t++) {
+                    memcpy(bm_blk_lat + (size_t)t * kvl,
+                           bm_blk_kva + (size_t)t * (kvl + rope),
+                           (size_t)kvl * sizeof(float));
+                    for (uint32_t h = 0; h < nh; h++) {
+                        memcpy(bm_blk_qr + ((size_t)t * nh + h) * rope,
+                               bm_blk_q + (size_t)t * nh * qhd + (size_t)h * qhd + nope,
+                               (size_t)rope * sizeof(float));
+                        memcpy(bm_blk_kr_raw + ((size_t)t * nh + h) * rope,
+                               bm_blk_kva + (size_t)t * (kvl + rope) + kvl,
+                               (size_t)rope * sizeof(float));
+                    }
+                }
+                TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(bm_blk_lat, ones, bm_blk_kvln, kvl, batch_n, shape.rms_eps));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(WkB, bm_blk_kvln, bm_blk_k, nh * nope, kvl, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(WvB, bm_blk_kvln, bm_blk_vproj, nh * vd, kvl, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_rope_interleaved_batch_f32(bm_blk_qr, bm_blk_qrr, rope, nh, shape.rope_base, block_pos0, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_rope_interleaved_batch_f32(bm_blk_kr_raw, bm_blk_krr, rope, nh, shape.rope_base, block_pos0, batch_n));
+                for (uint32_t t = 0; t < batch_n; t++) {
+                    for (uint32_t h = 0; h < nh; h++) {
+                        memcpy(bm_blk_Q + ((size_t)t * nh + h) * qhd,
+                               bm_blk_q + (size_t)t * nh * qhd + (size_t)h * qhd,
+                               (size_t)nope * sizeof(float));
+                        memcpy(bm_blk_Q + ((size_t)t * nh + h) * qhd + nope,
+                               bm_blk_qrr + ((size_t)t * nh + h) * rope,
+                               (size_t)rope * sizeof(float));
+                    }
+                }
+                memcpy(bm_blk_Kn, K_nope_ref, (size_t)nh * seq_n * nope * sizeof(float));
+                memcpy(bm_blk_Kr, K_rope_ref, (size_t)nh * seq_n * rope * sizeof(float));
+                memcpy(bm_blk_Vc, V_ref, (size_t)nh * seq_n * vd * sizeof(float));
+                for (uint32_t t = 0; t < batch_n; t++) {
+                    const uint32_t p = block_pos0 + t;
+                    for (uint32_t h = 0; h < nh; h++) {
+                        memcpy(bm_blk_Kn + ((size_t)h * seq_n + p) * nope,
+                               bm_blk_k + ((size_t)t * nh + h) * nope,
+                               (size_t)nope * sizeof(float));
+                        memcpy(bm_blk_Kr + ((size_t)h * seq_n + p) * rope,
+                               bm_blk_krr + ((size_t)t * nh + h) * rope,
+                               (size_t)rope * sizeof(float));
+                        memcpy(bm_blk_Vc + ((size_t)h * seq_n + p) * vd,
+                               bm_blk_vproj + ((size_t)t * nh + h) * vd,
+                               (size_t)vd * sizeof(float));
+                    }
+                }
+                TEST_ASSERT(ds4_gpu_glm_attn_decode_batch_f32(bm_blk_Q, bm_blk_Kn, bm_blk_Kr, bm_blk_Vc,
+                                                              bm_blk_attn, nh, nope, rope, vd, qhd,
+                                                              seq_n, block_pos0, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(Wo, bm_blk_attn, bm_mla, H, nh * vd, batch_n));
+                for (uint32_t i = 0; i < batch_n * H; i++) bm_res1[i] = xb[i] + bm_mla[i];
+                TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(bm_res1, ones_h, bm_fn, H, batch_n, shape.rms_eps));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_gate, bm_fn, bm_blk_gh, ff, H, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_up, bm_fn, bm_blk_uh, ff, H, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_swiglu_f32(bm_blk_gh, bm_blk_uh, bm_blk_act, batch_n * ff));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_down, bm_blk_act, bm_ffn, H, ff, batch_n));
+                for (uint32_t i = 0; i < batch_n * H; i++) bm_block[i] = bm_res1[i] + bm_ffn[i];
+                glm_metal_cmp("dense block batch2 residual", bm_block, bc_block,
+                              (size_t)batch_n * H, tol_abs, tol_rel);
+
+                free(ones_h); free(bc_an); free(bm_an); free(bc_mla); free(bm_mla);
+                free(bc_res1); free(bm_res1); free(bc_fn); free(bm_fn); free(bc_ffn);
+                free(bm_ffn); free(bc_block); free(bm_block); free(bc_blk_kn);
+                free(bc_blk_kr); free(bc_blk_v); free(bm_blk_qa); free(bm_blk_qan);
+                free(bm_blk_q); free(bm_blk_kva); free(bm_blk_lat); free(bm_blk_kvln);
+                free(bm_blk_k); free(bm_blk_vproj); free(bm_blk_qr); free(bm_blk_qrr);
+                free(bm_blk_kr_raw); free(bm_blk_krr); free(bm_blk_Q); free(bm_blk_Kn);
+                free(bm_blk_Kr); free(bm_blk_Vc); free(bm_blk_attn); free(bm_blk_gh);
+                free(bm_blk_uh); free(bm_blk_act);
+            }
+
             /* Batch-2 routed MoE FFN composite: batch router logits -> batch
              * route -> per-expert batch gate/up/SwiGLU/down -> shared expert.
              * This is a small F32 layer-major oracle for the future real
@@ -3767,7 +3914,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},
     {"--glm-nextn-metal-synth", "glm-nextn-metal-synth", "GLM-5.2 Metal NextN/MTP path on a tiny synthetic block (no model needed)", test_glm_nextn_metal_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
-    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels and layer-major MLA/FFN/MoE batch composites vs CPU reference", test_glm_metal_components},
+    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels and layer-major MLA/FFN/block/MoE batch composites vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
     {"--glm-spec-metal-target-synth", "glm-spec-metal-target-synth", "GLM-5.2 NextN speculative accept/rollback through the real Metal target step (no model needed)", test_glm_spec_metal_target_synth},
