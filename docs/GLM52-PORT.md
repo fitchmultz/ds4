@@ -237,8 +237,10 @@ The core GLM port is complete and verified. The active work is usability/speed:
   parts stay isolated; defaults stay off. Validation: `DS4_GLM_FAST=1 DS4_GLM_EXPERT_PREAD=1
   DS4_GLM_EXPERT_CACHE_MIB=256 --glm-metal-ref -p Hello` keeps token `154820`
   and reports cache stores/evictions (`1776` stores, `1719` evictions for this
-  small smoke budget). Larger budgets can retain hot slabs across decode steps;
-  further tuning is still needed for the production default/prefetch policy.
+  small smoke budget). With `DS4_GLM_EXPERT_CACHE_GIB=8`, `--glm-raw -p
+  asdfqwer -n 2` emits `12345` and reports `2616/8880` slab-cache hits
+  (29.5%), proving hot slabs are retained across decode steps. Further tuning is
+  still needed for the production default/prefetch policy.
 - `DS4_GLM_H_NEXTN_OUT=<path>` dumps the post-output-norm hidden state that feeds
   the LM head. SGLang's NextN path uses this vector as the target-model hidden
   input to `nextn.hnorm`; CPU-vs-Metal on `Hello` matches at maxabs ~3.4e-5,
