@@ -249,7 +249,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--glm-chat-cpu", "GLM-5.2 only: same as --glm-chat on the CPU reference backend (identical greedy sequence).");
     opt(fp, c, "--glm-raw", "GLM-5.2 only: raw-tokenize -p/--prompt and greedy-decode without the chat template. Useful for low-prefill latency experiments while batched prefill is pending.");
     opt(fp, c, "--glm-raw-cpu", "GLM-5.2 only: same as --glm-raw on the CPU reference backend.");
-    opt(fp, c, "--glm-proj-bench", "GLM-5.2 Metal diagnostic: benchmark one real MLA projection tensor in isolation. Env: DS4_GLM_PROJ_BENCH_LAYER, DS4_GLM_PROJ_BENCH_ITERS.");
+    opt(fp, c, "--glm-proj-bench", "GLM-5.2 Metal diagnostic: benchmark one real MLA projection tensor in isolation. Env: DS4_GLM_PROJ_BENCH_LAYER, DS4_GLM_PROJ_BENCH_ITERS, DS4_GLM_PROJ_BENCH_TENSOR.");
     opt(fp, c, "--glm-nextn", "GLM-5.2 only (opt-in, default off, Metal target only): enable the correctness-first NextN/MTP speculative greedy scaffold for --glm-raw/--glm-chat. Uses the Metal blk.78 drafter by default; output stays byte-for-byte greedy-identical because every emitted token is the verified target argmax and drafts never touch the target KV cache. CPU target ignores it with a diagnostic.");
     opt(fp, c, "--glm-nextn-draft N", "GLM-5.2 only: recursive NextN draft depth for --glm-nextn, capped at 4 (default 4). Separate from DeepSeek --mtp-draft.");
     opt(fp, c, "DS4_GLM_NEXTN_DRAFT_BACKEND=cpu|metal", "GLM diagnostic: select the --glm-nextn drafter backend. Default is metal on Metal builds; cpu is for A/B/debug only.");
@@ -259,6 +259,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "DS4_GLM_MLA_DETAIL_TIME=1", "GLM diagnostic: with DS4_GLM_MLA_TIME=1, split decode MLA cost into host dequant, k_b reorder, and Metal MLA body.");
     opt(fp, c, "DS4_GLM_MLA_CACHE_OUT_F32=1", "GLM opt-in experiment: cache all MLA attn_output projections as host F32 (~29.25 GiB) inside DS4_GLM_FAST=1 live contexts; not default and competes with expert cache memory.");
     opt(fp, c, "DS4_GLM_MLA_DIRECT_OUT_QK=0/off", "GLM fast path: disable the default direct Q5_K/Q6_K MLA attn_output projection used by DS4_GLM_FAST=1. Set =1 to force it when testing env handling.");
+    opt(fp, c, "DS4_GLM_MLA_DIRECT_QB_Q8=1", "GLM opt-in experiment: in DS4_GLM_FAST=1 live contexts, compute Q8_0 MLA attn_q_b with the flat direct Q8 kernel instead of dequanting/uploading F32.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_FAST_MOE=1", "GLM diagnostic: with DS4_GLM_VERIFY_BATCH_F32=1 and DS4_GLM_FAST=1, let the batch verifier use production fast routed-MoE kernels; default keeps the pure F32 proof path.");
     opt(fp, c, "DS4_GLM_PREFILL_BATCH_CHECK=1", "GLM diagnostic: for short Metal prompts, compare sequential prefill and layer-major batch prefill final/continuation logits in scratch ctxs; does not affect output.");
     opt(fp, c, "DS4_GLM_PREFILL_BATCH_LIVE=0/off", "GLM fast path: disable the default short-prompt live batched prefill used by DS4_GLM_FAST=1. Set =1 to force the guarded scratch-copy prefill outside DS4_GLM_FAST.");

@@ -28489,7 +28489,8 @@ static bool glm_fused_q8_matvec(const void *model_map, uint64_t model_size,
  * uses the F32 `WkB` (dequanted + reordered by the caller). Returns true. */
 static bool glm_mla_forward_token_metal_pos(
         const float *x,
-        const ds4_model *m, uint32_t il, bool fast, bool direct_out_qk,
+        const ds4_model *m, uint32_t il, bool fast,
+        bool direct_out_qk, bool direct_qb_q8,
         const float *WqA, const float *WqB, const float *WkvA,
         const float *WkB, const float *WvB, const float *Wo,
         const float *w_q_a_norm, const float *w_kv_a_norm,
@@ -28514,7 +28515,7 @@ static bool glm_mla_forward_token_metal_pos(
      * from the mmap'd GGUF part -- no F32 dequant, no weight upload. k_b always
      * uses the F32 WkB below (its native layout needs glm_k_b_reorder). */
     const ds4_tensor *tq_a  = fast ? glm_layer_tensor(m, il, "attn_q_a")      : NULL;
-    const ds4_tensor *tq_b  = fast ? glm_layer_tensor(m, il, "attn_q_b")      : NULL;
+    const ds4_tensor *tq_b  = (fast || direct_qb_q8) ? glm_layer_tensor(m, il, "attn_q_b") : NULL;
     const ds4_tensor *tkv_a = fast ? glm_layer_tensor(m, il, "attn_kv_a_mqa") : NULL;
     const ds4_tensor *tv_b  = fast ? glm_layer_tensor(m, il, "attn_v_b")      : NULL;
 
@@ -28529,6 +28530,13 @@ static bool glm_mla_forward_token_metal_pos(
     if (fast) {
         if (!glm_fused_q8_matvec(m->parts[tq_b->part].map, m->parts[tq_b->part].size,
                                  tq_b->abs_offset, ql, nh * qhd, wqa_n, q_flat)) return false;
+    } else if (direct_qb_q8 && tq_b && tq_b->type == DS4_TENSOR_Q8_0) {
+        const bool prof = getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL;
+        const double t0 = prof ? now_sec() : 0.0;
+        const bool ok = ds4_gpu_glm_matvec_q8_0_f32(tensor_data(m, tq_b), tq_b->bytes,
+                                                    wqa_n, q_flat, nh * qhd, ql) != 0;
+        if (prof) { g_glm_qk_out_s += now_sec() - t0; g_glm_qk_out_calls++; }
+        if (!ok) return false;
     } else if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
                                             &g_glm_f32_qb_s, &g_glm_f32_qb_calls,
                                             WqB, wqa_n, q_flat, nh * qhd, ql)) return false;
@@ -28615,7 +28623,8 @@ static bool glm_mla_forward_token_metal_pos(
 
 static bool glm_mla_forward_token_metal(
         const float *x,
-        const ds4_model *m, uint32_t il, bool fast, bool direct_out_qk,
+        const ds4_model *m, uint32_t il, bool fast,
+        bool direct_out_qk, bool direct_qb_q8,
         const float *WqA, const float *WqB, const float *WkvA,
         const float *WkB, const float *WvB, const float *Wo,
         const float *w_q_a_norm, const float *w_kv_a_norm,
@@ -28626,7 +28635,7 @@ static bool glm_mla_forward_token_metal(
         float *wqa, float *wqa_n, float *q_flat, float *kva, float *kvln,
         float *k_nope, float *v, float *qrope, float *krope,
         float *attn_o, float *Q_combined) {
-    return glm_mla_forward_token_metal_pos(x, m, il, fast, direct_out_qk,
+    return glm_mla_forward_token_metal_pos(x, m, il, fast, direct_out_qk, direct_qb_q8,
                                            WqA, WqB, WkvA, WkB, WvB, Wo,
                                            w_q_a_norm, w_kv_a_norm,
                                            K_nope_cache, V_cache, K_rope_cache,
@@ -28834,7 +28843,7 @@ static bool glm_nextn_decoder_metal_layer_cached(const ds4_model *m,
     glm_k_b_reorder(WkB, WkBn, nope, kvl, nh);
     glm_dequant_weight(m, v_b, WvB);
     glm_dequant_weight(m, wop, Wo);
-    if (!glm_mla_forward_token_metal_pos(xn, m, il, false, false,
+    if (!glm_mla_forward_token_metal_pos(xn, m, il, false, false, false,
                                          WqA, WqB, WkvA, WkB, WvB, Wo,
                                          (const float *)tensor_data(m, qa_norm_t),
                                          (const float *)tensor_data(m, kv_norm_t),
@@ -29056,6 +29065,7 @@ typedef struct {
     /* Fast Metal path: routed MoE fusion (DS4_GLM_FAST=1). */
     bool fast;
     bool direct_out_qk;
+    bool direct_qb_q8;
     /* Batch helper fast MoE bridge. Defaults to the verifier env for existing
      * NextN diagnostics; live batched prefill can enable it per scratch ctx. */
     bool batch_fast_moe;
@@ -29186,6 +29196,7 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
      * via mmap exactly like the F32 oracle, so no weight is materialized. */
     c->fast = false;
     c->direct_out_qk = false;
+    c->direct_qb_q8 = false;
     c->batch_fast_moe = glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE");
     if (glm_fast_enabled()) {
         ds4_gpu_set_ssd_streaming(true);
@@ -29206,6 +29217,7 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
         if (ok && predequant_shared_experts) {
             const char *dqk = getenv("DS4_GLM_MLA_DIRECT_OUT_QK");
             c->direct_out_qk = dqk ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_OUT_QK") : true;
+            c->direct_qb_q8 = glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_QB_Q8");
         }
         if (ok) {
             const bool shexp_resident = predequant_shared_experts &&
@@ -29286,12 +29298,13 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
                             now_sec() - wo_t0);
                 }
             }
-            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s%s%s "
+            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s%s%s%s "
                                 "+ IQ3_XXS/IQ4_XS MoE down paths enabled (DS4_GLM_FAST=1; "
                                 "MLA stays F32 oracle on UD-IQ2_M)\n",
                     shexp_resident ? " + resident shared-expert" : "",
                     c->Wo_cache ? " + attn_output F32 cache" : "",
-                    c->direct_out_qk ? " + direct attn_output QK" : "");
+                    c->direct_out_qk ? " + direct attn_output QK" : "",
+                    c->direct_qb_q8 ? " + direct q_b Q8" : "");
         }
     }
     return true;
@@ -29368,7 +29381,7 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
                     (unsigned long long)g_glm_f32_kb_calls,
                     (unsigned long long)g_glm_f32_vb_calls,
                     (unsigned long long)g_glm_f32_out_calls);
-            fprintf(stderr, "ds4: glm-metal MLA direct qk out: %.3fs calls=%llu avg=%.6fs\n",
+            fprintf(stderr, "ds4: glm-metal MLA direct helpers: %.3fs calls=%llu avg=%.6fs\n",
                     g_glm_qk_out_s, (unsigned long long)g_glm_qk_out_calls,
                     g_glm_qk_out_calls ? g_glm_qk_out_s / (double)g_glm_qk_out_calls : 0.0);
         }
@@ -29465,9 +29478,10 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
         glm_dequant_weight(m, k_b, c->WkBn);
         const float *Wo_use = c->Wo;
         const bool direct_out_qk = c->direct_out_qk && wop && (wop->type == 13 || wop->type == 14);
+        const bool direct_qb_q8 = c->direct_qb_q8 && q_b && q_b->type == DS4_TENSOR_Q8_0;
         if (!fast_l) {
             glm_dequant_weight(m, q_a, c->WqA);
-            glm_dequant_weight(m, q_b, c->WqB);
+            if (!direct_qb_q8) glm_dequant_weight(m, q_b, c->WqB);
             glm_dequant_weight(m, kv_a, c->WkvA);
             glm_dequant_weight(m, v_b, c->WvB);
             if (direct_out_qk) {
@@ -29485,7 +29499,7 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
         const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
         const bool mla_time = getenv("DS4_GLM_MLA_TIME") != NULL;
         const double mla_t0 = (mla_time || dec_prof) ? now_sec() : 0.0;
-        if (!glm_mla_forward_token_metal(xn, m, il, fast_l, direct_out_qk,
+        if (!glm_mla_forward_token_metal(xn, m, il, fast_l, direct_out_qk, direct_qb_q8,
                                          c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, Wo_use,
                                          qa_norm, kv_norm,
                                          c->Knope[il], c->Vc[il], c->Krop[il],
@@ -31721,16 +31735,31 @@ int ds4_engine_glm_proj_bench(ds4_engine *e) {
     if (iters < 1) iters = 1;
     if (iters > 16) iters = 16;
 
-    const ds4_tensor *wop = glm_layer_tensor(m, il, "attn_output");
-    if (!wop) {
-        fprintf(stderr, "ds4: --glm-proj-bench missing blk.%u.attn_output\n", il);
+    const char *suffix = getenv("DS4_GLM_PROJ_BENCH_TENSOR");
+    if (!suffix || !suffix[0]) suffix = "attn_output";
+    uint32_t rows = 0, cols = 0;
+    if (!strcmp(suffix, "attn_q_a")) {
+        rows = shape.q_lora; cols = shape.hidden;
+    } else if (!strcmp(suffix, "attn_q_b")) {
+        rows = shape.n_head * (shape.qk_nope + shape.qk_rope); cols = shape.q_lora;
+    } else if (!strcmp(suffix, "attn_kv_a_mqa")) {
+        rows = shape.kv_lora + shape.qk_rope; cols = shape.hidden;
+    } else if (!strcmp(suffix, "attn_v_b")) {
+        rows = shape.n_head * shape.v_dim; cols = shape.kv_lora;
+    } else if (!strcmp(suffix, "attn_output")) {
+        rows = shape.hidden; cols = shape.n_head * shape.v_dim;
+    } else {
+        fprintf(stderr, "ds4: --glm-proj-bench unsupported tensor suffix '%s'\n", suffix);
         return 1;
     }
-    const uint32_t rows = shape.hidden;
-    const uint32_t cols = shape.n_head * shape.v_dim;
-    if (wop->elements != (uint64_t)rows * cols) {
-        fprintf(stderr, "ds4: --glm-proj-bench unexpected attn_output elements: got %llu want %llu\n",
-                (unsigned long long)wop->elements,
+    const ds4_tensor *wt = glm_layer_tensor(m, il, suffix);
+    if (!wt) {
+        fprintf(stderr, "ds4: --glm-proj-bench missing blk.%u.%s\n", il, suffix);
+        return 1;
+    }
+    if (wt->elements != (uint64_t)rows * cols) {
+        fprintf(stderr, "ds4: --glm-proj-bench unexpected blk.%u.%s elements: got %llu want %llu\n",
+                il, suffix, (unsigned long long)wt->elements,
                 (unsigned long long)((uint64_t)rows * cols));
         return 1;
     }
@@ -31744,23 +31773,27 @@ int ds4_engine_glm_proj_bench(ds4_engine *e) {
 
     const char *qk_kernel = NULL;
     uint32_t qk_nr0 = 0;
-    if (wop->type == 13) { qk_kernel = "kernel_glm_matvec_q5_k_f32"; qk_nr0 = 1; }
-    if (wop->type == 14) { qk_kernel = "kernel_glm_matvec_q6_k_f32"; qk_nr0 = 2; }
-    const uint64_t row_bytes = rows ? wop->bytes / rows : 0;
+    if (wt->type == 13) { qk_kernel = "kernel_glm_matvec_q5_k_f32"; qk_nr0 = 1; }
+    if (wt->type == 14) { qk_kernel = "kernel_glm_matvec_q6_k_f32"; qk_nr0 = 2; }
+    const bool q8_kernel = wt->type == DS4_TENSOR_Q8_0;
+    const uint64_t row_bytes = rows ? wt->bytes / rows : 0;
 
     double dequant_s = 0.0, matvec_s = 0.0, cached_s = 0.0, direct_s = 0.0;
     bool ok = true;
-    glm_dequant_weight(m, wop, W);
+    glm_dequant_weight(m, wt, W);
     ok = ds4_gpu_glm_matvec_f32(W, x, baseline, rows, cols) != 0;
     if (ok) ok = ds4_gpu_glm_matvec_f32(W, x, cached, rows, cols) != 0;
     if (ok && qk_kernel) {
-        ok = ds4_gpu_glm_matvec_qk_f32(tensor_data(m, wop), wop->bytes, x, direct,
+        ok = ds4_gpu_glm_matvec_qk_f32(tensor_data(m, wt), wt->bytes, x, direct,
                                        rows, cols, row_bytes, qk_nr0,
                                        qk_kernel) != 0;
+    } else if (ok && q8_kernel) {
+        ok = ds4_gpu_glm_matvec_q8_0_f32(tensor_data(m, wt), wt->bytes, x, direct,
+                                         rows, cols) != 0;
     }
     for (int it = 0; ok && it < iters; it++) {
         double t0 = now_sec();
-        glm_dequant_weight(m, wop, W);
+        glm_dequant_weight(m, wt, W);
         dequant_s += now_sec() - t0;
         t0 = now_sec();
         ok = ds4_gpu_glm_matvec_f32(W, x, baseline, rows, cols) != 0;
@@ -31774,20 +31807,29 @@ int ds4_engine_glm_proj_bench(ds4_engine *e) {
         }
     }
     if (ok && qk_kernel) {
-        const void *qdata = tensor_data(m, wop);
+        const void *qdata = tensor_data(m, wt);
         for (int it = 0; ok && it < iters; it++) {
             const double t0 = now_sec();
-            ok = ds4_gpu_glm_matvec_qk_f32(qdata, wop->bytes, x, direct,
+            ok = ds4_gpu_glm_matvec_qk_f32(qdata, wt->bytes, x, direct,
                                            rows, cols, row_bytes, qk_nr0,
                                            qk_kernel) != 0;
             direct_s += now_sec() - t0;
         }
+    } else if (ok && q8_kernel) {
+        const void *qdata = tensor_data(m, wt);
+        for (int it = 0; ok && it < iters; it++) {
+            const double t0 = now_sec();
+            ok = ds4_gpu_glm_matvec_q8_0_f32(qdata, wt->bytes, x, direct,
+                                             rows, cols) != 0;
+            direct_s += now_sec() - t0;
+        }
     }
     const float max_abs = ok ? max_abs_diff(baseline, cached, rows) : 1.0e30f;
-    const float direct_max_abs = (ok && qk_kernel) ? max_abs_diff(baseline, direct, rows) : 1.0e30f;
+    const bool has_direct = qk_kernel || q8_kernel;
+    const float direct_max_abs = (ok && has_direct) ? max_abs_diff(baseline, direct, rows) : 1.0e30f;
     fprintf(stderr,
-            "ds4: glm-proj-bench tensor=blk.%u.attn_output type=%s rows=%u cols=%u row_bytes=%llu iters=%d\n",
-            il, tensor_type_name(wop->type), rows, cols, (unsigned long long)row_bytes, iters);
+            "ds4: glm-proj-bench tensor=blk.%u.%s type=%s rows=%u cols=%u row_bytes=%llu iters=%d\n",
+            il, suffix, tensor_type_name(wt->type), rows, cols, (unsigned long long)row_bytes, iters);
     fprintf(stderr,
             "ds4: glm-proj-bench current dequant=%.3fs matvec=%.3fs total=%.3fs avg=%.3fs\n",
             dequant_s, matvec_s, dequant_s + matvec_s,
@@ -31799,11 +31841,15 @@ int ds4_engine_glm_proj_bench(ds4_engine *e) {
         fprintf(stderr,
                 "ds4: glm-proj-bench direct-qk kernel=%s total=%.3fs avg=%.3fs max_abs_vs_f32=%g\n",
                 qk_kernel, direct_s, direct_s / (double)iters, (double)direct_max_abs);
+    } else if (q8_kernel) {
+        fprintf(stderr,
+                "ds4: glm-proj-bench direct-q8 kernel=kernel_mul_mv_q8_0_f32 total=%.3fs avg=%.3fs max_abs_vs_f32=%g\n",
+                direct_s, direct_s / (double)iters, (double)direct_max_abs);
     }
-    printf("glm-proj-bench: layer=%u type=%s current_avg=%.6f cached_avg=%.6f direct_avg=%.6f max_abs=%g direct_max_abs=%g\n",
-           il, tensor_type_name(wop->type),
+    printf("glm-proj-bench: layer=%u tensor=%s type=%s current_avg=%.6f cached_avg=%.6f direct_avg=%.6f max_abs=%g direct_max_abs=%g\n",
+           il, suffix, tensor_type_name(wt->type),
            (dequant_s + matvec_s) / (double)iters,
-           cached_s / (double)iters, qk_kernel ? direct_s / (double)iters : -1.0,
+           cached_s / (double)iters, has_direct ? direct_s / (double)iters : -1.0,
            (double)max_abs, (double)direct_max_abs);
 
     free(direct);

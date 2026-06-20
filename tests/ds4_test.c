@@ -2599,10 +2599,12 @@ static void test_glm_qk_direct_matvec(void) {
         const char *name;
         const char *kernel;
         uint32_t block_bytes;
+        uint32_t block_elems;
         uint32_t nr0;
     } cases[] = {
-        {"Q5_K", "kernel_glm_matvec_q5_k_f32", 176, 1},
-        {"Q6_K", "kernel_glm_matvec_q6_k_f32", 210, 2},
+        {"Q5_K", "kernel_glm_matvec_q5_k_f32", 176, 256, 1},
+        {"Q6_K", "kernel_glm_matvec_q6_k_f32", 210, 256, 2},
+        {"Q8_0", NULL, 34, 32, 0},
     };
     float x[256];
     for (uint32_t i = 0; i < 256; i++) x[i] = ((float)((int)(i % 29u) - 14)) * (1.0f / 29.0f);
@@ -2615,7 +2617,8 @@ static void test_glm_qk_direct_matvec(void) {
         char *o = test_read_whole_file(oracle, &olen);
         TEST_ASSERT(b != NULL && o != NULL);
         const size_t rows = blen / cases[c].block_bytes;
-        const size_t n_elem = rows * 256u;
+        const uint32_t cols = cases[c].block_elems;
+        const size_t n_elem = rows * (size_t)cols;
         float *ref = malloc(sizeof(float) * n_elem);
         float *cpu = calloc(rows, sizeof(float));
         float *gpu = calloc(rows, sizeof(float));
@@ -2631,14 +2634,17 @@ static void test_glm_qk_direct_matvec(void) {
         TEST_ASSERT(nref == n_elem);
         for (size_t r = 0; r < rows; r++) {
             double acc = 0.0;
-            for (uint32_t k = 0; k < 256; k++) acc += (double)ref[r * 256u + k] * (double)x[k];
+            for (uint32_t k = 0; k < cols; k++) acc += (double)ref[r * (size_t)cols + k] * (double)x[k];
             cpu[r] = (float)acc;
         }
-        int gok = ds4_gpu_glm_matvec_qk_f32(b, blen, x, gpu,
-                                            (uint32_t)rows, 256,
-                                            cases[c].block_bytes,
-                                            cases[c].nr0,
-                                            cases[c].kernel);
+        int gok = cases[c].kernel
+            ? ds4_gpu_glm_matvec_qk_f32(b, blen, x, gpu,
+                                        (uint32_t)rows, cols,
+                                        cases[c].block_bytes,
+                                        cases[c].nr0,
+                                        cases[c].kernel)
+            : ds4_gpu_glm_matvec_q8_0_f32(b, blen, x, gpu,
+                                          (uint32_t)rows, cols);
         TEST_ASSERT(gok != 0);
         float maxabs = 0.0f, maxrel = 0.0f;
         for (size_t r = 0; r < rows; r++) {

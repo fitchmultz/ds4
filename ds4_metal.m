@@ -26992,6 +26992,53 @@ int ds4_gpu_glm_matvec_qk_f32(const void *Wq, uint64_t Wq_bytes,
     }
 }
 
+int ds4_gpu_glm_matvec_q8_0_f32(const void *Wq, uint64_t Wq_bytes,
+                                const float *x, float *out,
+                                uint32_t rows, uint32_t cols) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!Wq || !x || !out || !rows || !cols || (cols & 31u) != 0) return 0;
+    const uint64_t row_bytes = ((uint64_t)cols / 32u) * 34u;
+    if (Wq_bytes < (uint64_t)rows * row_bytes) return 0;
+    @autoreleasepool {
+        const uint64_t xb = (uint64_t)cols * sizeof(float);
+        const uint64_t ob = (uint64_t)rows * sizeof(float);
+        ds4_gpu_tensor *tW = ds4_gpu_tensor_alloc(Wq_bytes);
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(xb);
+        ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(ob);
+        if (!tW || !tx || !to) {
+            ds4_gpu_tensor_free(tW); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tW, 0, Wq, Wq_bytes);
+        ds4_gpu_tensor_write(tx, 0, x, xb);
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(cols, rows);
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        int ok = 0;
+        if (pipe) {
+            [enc setComputePipelineState:pipe];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            ds4_gpu_glm_bind(enc, tW, 1);
+            ds4_gpu_glm_bind(enc, tx, 2);
+            ds4_gpu_glm_bind(enc, to, 3);
+            [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows + (NSUInteger)dispatch.nr0 - 1u) / (NSUInteger)dispatch.nr0,
+                                                  1,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
+            ok = 1;
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm q8_0 matvec");
+        if (ok) ds4_gpu_tensor_read(to, 0, out, ob);
+        ds4_gpu_tensor_free(tW); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+        return ok;
+    }
+}
+
 int ds4_gpu_glm_matmul_f32(const float * W, const float * x, float * out,
                            uint32_t rows, uint32_t cols, uint32_t n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;

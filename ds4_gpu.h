@@ -1035,6 +1035,9 @@ int ds4_gpu_glm_matvec_qk_f32(const void *Wq, uint64_t Wq_bytes,
                               uint32_t rows, uint32_t cols,
                               uint64_t row_bytes, uint32_t nr0,
                               const char *kernel_name);
+int ds4_gpu_glm_matvec_q8_0_f32(const void *Wq, uint64_t Wq_bytes,
+                                const float *x, float *out,
+                                uint32_t rows, uint32_t cols);
 
 /* out[t*rows+r] = sum_c W[r*cols+c] * x[t*cols+c] for a tiny token batch.
  * Enabling primitive for future GLM layer-major verifier/prefill microbatches. */

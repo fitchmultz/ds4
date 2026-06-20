@@ -388,7 +388,14 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `40.61s -> 29.30s`; profiled `-n 3` improves decode `20.33s -> 15.00s`
   and MLA avg/call `0.0514s -> 0.0322s`. Direct QK supersedes the host-F32
   `attn_output` cache when both env flags are set. `./ds4_test --glm-qk-direct`
-  covers the Q5_K/Q6_K kernels against tiny dequant oracle fixtures. Rejected
+  covers the Q5_K/Q6_K kernels against tiny dequant oracle fixtures; it now also
+  covers the flat direct Q8_0 helper. `DS4_GLM_MLA_DIRECT_QB_Q8=1` is an opt-in
+  follow-up for `attn_q_b`: isolated real-tensor benchmark measured `blk.0.attn_q_b`
+  direct Q8_0 `0.0033s`/call versus cached F32 `0.0108s`, and a profiled
+  real `asdfqwer -n 3` run preserved ids/stdout while improving decode
+  `16.36s -> 13.17s` and MLA avg/call `0.0370s -> 0.0275s`; no-profile
+  `asdfqwer -n 5` was a smaller but positive `32.18s -> 31.13s`, so keep it
+  opt-in until a broader prompt sweep justifies defaulting. Rejected
   broader direct-MLA probe: direct `attn_q_a` alone benchmarks faster
   (`0.0011s` direct vs `0.0048s` cached F32 on `blk.0`), but trying to route
   Q8_0 `attn_q_b`/`attn_kv_a_mqa`/`attn_v_b` through the existing tensor-map
