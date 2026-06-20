@@ -317,17 +317,17 @@ The core GLM port is complete and verified. The active work is usability/speed:
 
 ## 8. Risks / blockers
 
-- NextN/MTP still needs graph wiring and fast kernels. CPU dequant now covers
-  blk.78 Q2_K/Q3_K and no-model wiring is tested, but no draft KV cache or
-  batched speculative target-verify loop is wired yet.
-- `DS4_MAX_*` cap bumps (DS4_MAX_LAYER>=79, DS4_MAX_VOCAB>=154880) for inference
-  must not change DeepSeek shapes/allocs — decide between bumping vs a GLM-specific
-  shape struct in Phase 4.
-- Global Metal `g_model_fd` pread is single-file; runtime per-tensor-part SSD
-  streaming wiring into Metal is Phase 4 work (Phase 3 did sizing + dry-run only).
-- The DeepSeek V4 graph assumes HC / compressed attention / grouped output /
-  top-6 routing / all-layers-routed. GLM breaks all of these — Phase 4 must add a
-  separate GLM graph path, not retrofit the DeepSeek graph.
-- DSA correctness (Phase 5) needs an external oracle (Transformers/vLLM/SGLang).
-- No official 128 GiB SSD recipe exists; runtime streaming throughput is
-  measurement-based once Phase 4 runs.
+- NextN/MTP has a correctness-first opt-in scaffold with Metal drafting and
+  traceable greedy verification, but current measured draft hit rate is 0 on the
+  recorded raw smokes. Real speed still needs better acceptance and/or batched
+  target verification; do not present the scaffold as a speed win.
+- Batched/persistent GLM graph work remains the largest speed risk: prefill still
+  runs one full per-token forward, and the NextN verifier still uses one target
+  forward per emitted token.
+- Runtime SSD streaming is validated through selected-expert pread and the
+  opt-in routed-expert slab cache, but production defaults/prefetch/concurrency
+  policy still needs more measurement.
+- DSA sparse-index correctness remains deferred because dense MLA matches the
+  llama.cpp oracle; revisit only with a long-context quality/perf oracle.
+- No official 128 GiB SSD recipe exists; throughput/prefetch policy remains
+  measurement-based on this Mac.
