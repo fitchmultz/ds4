@@ -410,7 +410,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   direct Q8_0 about `0.0011-0.0014s`/call versus current dequant+reorder+F32
   about `0.0062-0.0064s`, with exact F32-baseline outputs; prompt sweep
   preserved output while improving no-profile `-n 3` decode by about `0.9-3.6s`.
-  Rejected
+  After all direct MLA projection defaults, profiled `asdfqwer -n 5` preserves
+  ids/stdout, measures decode `16.95s`, MLA avg/call `0.01299s`, and reports all
+  MLA F32 helper counters at zero; remaining decode buckets are now shared expert,
+  routed MoE gate/up/down, MLA body/attention, and LM head, not per-token F32
+  projection dequant/reorder. Rejected
   broader direct-MLA probe: direct `attn_q_a` alone benchmarks faster
   (`0.0011s` direct vs `0.0048s` cached F32 on `blk.0`), but trying to route
   Q8_0 `attn_q_b`/`attn_kv_a_mqa`/`attn_v_b` through the existing tensor-map
