@@ -291,8 +291,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   one-token draft hit. A second raw smoke, `The answer is -n 4`, produces
   identical plain-vs-NextN ids `9829 13 758 2097` (` yes. In fact`) with
   one accepted draft (`13`) before fallback to `758` and final no-draft token
-  `2097`. `ds4_test --glm-spec-generate-synth` pins full/partial/miss cases to
-  the exact naive greedy sequence, and `--glm-spec-trace-synth` pins the CSV
+  `2097`. The single-step target verifier is now isolated in
+  `glm_spec_verify_after_bonus_single`, giving the future Metal verifier
+  microbatch a concrete contract to replace without changing accept/rollback
+  semantics. `ds4_test --glm-spec-generate-synth` pins full/partial/miss cases
+  to the exact naive greedy sequence, and `--glm-spec-trace-synth` pins the CSV
   trace shape, including the final no-draft row.
 - `--glm-raw` / `--glm-raw-cpu` bypass the GLM chat template and raw-tokenize
   `-p/--prompt`. This is a usability/benchmark mode, not chat: a one-token raw

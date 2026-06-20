@@ -29656,6 +29656,67 @@ static bool glm_nextn_draft_chain_metal_thunk(void *vc, int seed_token,
 }
 #endif
 
+/* Verify target tokens after the already-emitted EAGLE bonus token using the
+ * current single-token target step.  This is the exact contract the future
+ * Metal verifier microbatch must satisfy: mutate the target KV cache only for
+ * tokens that become part of the authoritative greedy path, return the target
+ * tokens to emit after the bonus, and leave `logits` holding the next round's
+ * distribution when another round is needed. */
+static bool glm_spec_verify_after_bonus_single(glm_gen_step_fn step,
+                                               void *ctx,
+                                               int bonus_token,
+                                               const int *draft,
+                                               int active_depth,
+                                               uint32_t *pos_io,
+                                               int remaining_after_bonus,
+                                               float *logits,
+                                               uint32_t vocab,
+                                               int eos_id,
+                                               int *emit_after,
+                                               int *emit_count,
+                                               int *accepted,
+                                               bool *fallback_emitted,
+                                               int *fallback_token,
+                                               int *next_out) {
+    *emit_count = 0;
+    *accepted = 0;
+    *fallback_emitted = false;
+    *fallback_token = -1;
+    if (next_out) *next_out = -1;
+    if (remaining_after_bonus <= 0) return true;
+
+    uint32_t pos = *pos_io;
+    if (!step(ctx, bonus_token, pos, true, logits)) return false;
+    pos++;
+    int next = sample_argmax(logits, vocab);
+
+    while (*emit_count < remaining_after_bonus && next != eos_id) {
+        if (*accepted < active_depth && draft[*accepted] == next) {
+            emit_after[(*emit_count)++] = next;
+            (*accepted)++;
+            if (*emit_count >= remaining_after_bonus) break;
+            if (!step(ctx, next, pos, true, logits)) return false;
+            pos++;
+            next = sample_argmax(logits, vocab);
+            continue;
+        }
+
+        emit_after[(*emit_count)++] = next;
+        *fallback_emitted = true;
+        *fallback_token = next;
+        if (*emit_count < remaining_after_bonus) {
+            if (!step(ctx, next, pos, true, logits)) return false;
+            pos++;
+            next = sample_argmax(logits, vocab);
+        }
+        break;
+    }
+
+    *pos_io = pos;
+    if (next_out) *next_out = next;
+    return true;
+}
+
 /* Opt-in GLM NextN speculative decode. Correctness-first, NOT a
  * speed claim: verification reuses the existing single-token target step; the
  * real-model drafter defaults to Metal with a CPU A/B fallback. Every emitted
@@ -29736,64 +29797,31 @@ static int glm_spec_decode(const char *label,
                 draft_s += now_sec() - d0;
             }
 
-            if (!step(ctx, bonus_token, pos, true, logits)) {
+            int emit_after[DS4_GLM_NEXTN_MAX_DEPTH + 1];
+            int emit_count = 0;
+            if (!glm_spec_verify_after_bonus_single(step, ctx, bonus_token, draft,
+                                                    active_depth, &pos,
+                                                    remaining_after_bonus,
+                                                    logits, vocab, eos_id,
+                                                    emit_after, &emit_count,
+                                                    &acc, &fallback_emitted,
+                                                    &fallback_token, &next)) {
                 if (trace) fclose(trace);
                 free(draft);
                 if (out_decode_s) *out_decode_s = now_sec() - dec0;
                 if (out_generated) *out_generated = generated;
                 return 1;
             }
-            pos++;
-            next = sample_argmax(logits, vocab);
 
-            /* Accept draft tokens only when they match the next target argmaxes.
-             * Drafts never touch the target KV cache; every emitted token still
-             * comes from target verification. */
-            while (acc < active_depth && draft[acc] == next &&
-                   generated < n_predict && next != eos_id) {
-                if (gen_ids_out) gen_ids_out[generated] = next;
+            for (int i = 0; i < emit_count; i++) {
+                const int tok = emit_after[i];
+                if (gen_ids_out) gen_ids_out[generated] = tok;
                 if (out) {
                     size_t pl = 0;
-                    char *piece = ds4_token_text(e, next, &pl);
+                    char *piece = ds4_token_text(e, tok, &pl);
                     fwrite(piece, 1, pl, out); fflush(out); free(piece);
                 }
                 generated++;
-                acc++;
-                if (generated >= n_predict) break;
-                if (!step(ctx, next, pos, true, logits)) {
-                    if (trace) fclose(trace);
-                    free(draft);
-                    if (out_decode_s) *out_decode_s = now_sec() - dec0;
-                    if (out_generated) *out_generated = generated;
-                    return 1;
-                }
-                pos++;
-                next = sample_argmax(logits, vocab);
-            }
-
-            /* Fallback emits the first target token not matched by the draft
-             * chain.  Rejected draft tail stays invisible. */
-            if (generated < n_predict && next != eos_id) {
-                if (gen_ids_out) gen_ids_out[generated] = next;
-                fallback_token = next;
-                fallback_emitted = true;
-                if (out) {
-                    size_t pl = 0;
-                    char *piece = ds4_token_text(e, next, &pl);
-                    fwrite(piece, 1, pl, out); fflush(out); free(piece);
-                }
-                generated++;
-                if (generated < n_predict) {
-                    if (!step(ctx, next, pos, true, logits)) {
-                        if (trace) fclose(trace);
-                        free(draft);
-                        if (out_decode_s) *out_decode_s = now_sec() - dec0;
-                        if (out_generated) *out_generated = generated;
-                        return 1;
-                    }
-                    pos++;
-                    next = sample_argmax(logits, vocab);
-                }
             }
         }
 
