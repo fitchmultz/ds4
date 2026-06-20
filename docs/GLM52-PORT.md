@@ -318,6 +318,9 @@ The core GLM port is complete and verified. The active work is usability/speed:
 - Next meaningful bar-movers: GLM-specific persistent/batched graph (especially
   batched prefill), NextN/MTP speculative decode, and controlled hot-expert SSD
   cache/prefetch. LM head is only ~0.5–0.6s/token and is not the next target.
+  A measured top-1-only verifier readback experiment was discarded: on
+  `asdfqwer -n 2` the full-logit path reported lm-head ~0.462s while the
+  top-1-only path reported ~0.474s, so full-vocab readback is not the blocker.
 
 ## 8. Risks / blockers
 
