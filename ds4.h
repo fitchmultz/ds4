@@ -423,6 +423,7 @@ int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
                                 int *out_miss);
 int ds4_glm_spec_batch_verify_synth(int n_steps, int *out_match,
                                     int *out_verify_calls);
+int ds4_glm_nextn_prefix_synth(int *out_commit, int *out_reset);
 
 /* Phase 4c-iv: tiny synthetic Metal forward self-check (no model needed).
  * Builds the same in-memory F32 layers as ds4_glm_cpu_forward_synth and runs

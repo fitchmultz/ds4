@@ -27925,35 +27925,53 @@ static bool glm_nextn_draft_cpu(const ds4_model *m,
  * is diagnostic-grade (CPU-vs-Metal NextN already match tightly) and is
  * deliberately decoupled from the target backend.  Returns true if all `depth`
  * drafts were produced; writes drafts to out[]. */
-static bool glm_nextn_draft_chain_cpu_layer(const ds4_model *m,
-                                            const glm_cpu_shape *shape,
-                                            uint32_t il,
-                                            int seed_token, uint32_t start_pos,
-                                            const float *seed_h,
-                                            int depth, uint32_t vocab,
-                                            int *out_drafts /*[depth]*/) {
+static bool glm_nextn_draft_chain_cpu_layer_cached(const ds4_model *m,
+                                                   const glm_cpu_shape *shape,
+                                                   uint32_t il,
+                                                   int seed_token,
+                                                   uint32_t start_pos,
+                                                   const float *seed_h,
+                                                   int depth, uint32_t vocab,
+                                                   bool persist_tail_row,
+                                                   int *out_drafts /*[depth]*/,
+                                                   float *Knope_cache,
+                                                   float *Vc_cache,
+                                                   float *Krop_cache,
+                                                   uint32_t cache_cap,
+                                                   uint32_t prefix_n,
+                                                   uint32_t *out_rows_written) {
     if (!m || !shape || !seed_h || !out_drafts || depth <= 0) return false;
     if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
     const uint32_t H = shape->hidden;
-    float *eh = xmalloc((size_t)H * sizeof(float));
-    float *draft_h = xmalloc((size_t)H * sizeof(float));
     const uint32_t nhead = shape->n_head, nope = shape->qk_nope;
     const uint32_t rope = shape->qk_rope, vd = shape->v_dim;
+    const uint32_t rows_needed = (uint32_t)depth + (persist_tail_row ? 1u : 0u);
+    const bool have_external = Knope_cache && Vc_cache && Krop_cache;
+    if (have_external && (cache_cap < prefix_n || cache_cap - prefix_n < rows_needed))
+        return false;
+    if (!have_external) { cache_cap = rows_needed; prefix_n = 0; }
+
+    float *eh = xmalloc((size_t)H * sizeof(float));
+    float *draft_h = xmalloc((size_t)H * sizeof(float));
     float *cur_h = xmalloc((size_t)H * sizeof(float));
     float *logits = xmalloc((size_t)vocab * sizeof(float));
-    float *Knope = xmalloc((size_t)nhead * (uint32_t)depth * nope * sizeof(float));
-    float *Vc = xmalloc((size_t)nhead * (uint32_t)depth * vd * sizeof(float));
-    float *Krop = xmalloc((size_t)nhead * (uint32_t)depth * rope * sizeof(float));
+    float *Knope = have_external ? Knope_cache : xmalloc((size_t)nhead * cache_cap * nope * sizeof(float));
+    float *Vc = have_external ? Vc_cache : xmalloc((size_t)nhead * cache_cap * vd * sizeof(float));
+    float *Krop = have_external ? Krop_cache : xmalloc((size_t)nhead * cache_cap * rope * sizeof(float));
     memcpy(cur_h, seed_h, (size_t)H * sizeof(float));
     int tok = seed_token;
     bool ok = true;
-    for (int j = 0; j < depth; j++) {
+    for (uint32_t j = 0; j < rows_needed; j++) {
+        const uint32_t slot = prefix_n + j;
         if (!glm_nextn_eh_project_cpu_layer(m, shape, il, tok, cur_h, eh) ||
             !glm_nextn_decoder_cpu_layer_cached(m, shape, il, eh, draft_h,
-                                                Knope, Vc, Krop,
-                                                (uint32_t)depth, (uint32_t)j,
-                                                start_pos + (uint32_t)j) ||
-            !glm_nextn_logits_cpu(m, shape, draft_h, logits, vocab)) {
+                                                Knope, Vc, Krop, cache_cap,
+                                                slot, start_pos + j)) {
+            ok = false;
+            break;
+        }
+        if ((int)j == depth) break; /* final hidden row is for persistence only */
+        if (!glm_nextn_logits_cpu(m, shape, draft_h, logits, vocab)) {
             ok = false;
             break;
         }
@@ -27965,9 +27983,23 @@ static bool glm_nextn_draft_chain_cpu_layer(const ds4_model *m,
         tok = arg;                       /* recurse on the draft token ...   */
         memcpy(cur_h, draft_h, (size_t)H * sizeof(float)); /* ... + draft hidden */
     }
-    free(Krop); free(Vc); free(Knope);
+    if (ok && out_rows_written) *out_rows_written = rows_needed;
+    if (!have_external) { free(Krop); free(Vc); free(Knope); }
     free(logits); free(cur_h); free(draft_h); free(eh);
     return ok;
+}
+
+static bool glm_nextn_draft_chain_cpu_layer(const ds4_model *m,
+                                            const glm_cpu_shape *shape,
+                                            uint32_t il,
+                                            int seed_token, uint32_t start_pos,
+                                            const float *seed_h,
+                                            int depth, uint32_t vocab,
+                                            int *out_drafts /*[depth]*/) {
+    return glm_nextn_draft_chain_cpu_layer_cached(m, shape, il, seed_token,
+                                                  start_pos, seed_h, depth,
+                                                  vocab, true, out_drafts,
+                                                  NULL, NULL, NULL, 0, 0, NULL);
 }
 
 static bool glm_nextn_draft_chain_cpu(const ds4_model *m,
@@ -28762,18 +28794,32 @@ static bool glm_nextn_decoder_metal_layer(const ds4_model *m,
                                                 NULL, NULL, NULL, 1, 0, 0);
 }
 
-static bool glm_nextn_draft_chain_metal_layer(const ds4_model *m,
-                                              const glm_cpu_shape *shape,
-                                              uint32_t il,
-                                              int seed_token, uint32_t start_pos,
-                                              const float *seed_h,
-                                              int depth, uint32_t vocab,
-                                              int *out_drafts /*[depth]*/) {
+static bool glm_nextn_draft_chain_metal_layer_cached(const ds4_model *m,
+                                                     const glm_cpu_shape *shape,
+                                                     uint32_t il,
+                                                     int seed_token,
+                                                     uint32_t start_pos,
+                                                     const float *seed_h,
+                                                     int depth, uint32_t vocab,
+                                                     bool persist_tail_row,
+                                                     int *out_drafts /*[depth]*/,
+                                                     float *Knope_cache,
+                                                     float *Vc_cache,
+                                                     float *Krop_cache,
+                                                     uint32_t cache_cap,
+                                                     uint32_t prefix_n,
+                                                     uint32_t *out_rows_written) {
     if (!m || !shape || !seed_h || !out_drafts || depth <= 0) return false;
     if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
     const uint32_t H = shape->hidden;
     const uint32_t nhead = shape->n_head, nope = shape->qk_nope;
     const uint32_t rope = shape->qk_rope, vd = shape->v_dim;
+    const uint32_t rows_needed = (uint32_t)depth + (persist_tail_row ? 1u : 0u);
+    const bool have_external = Knope_cache && Vc_cache && Krop_cache;
+    if (have_external && (cache_cap < prefix_n || cache_cap - prefix_n < rows_needed))
+        return false;
+    if (!have_external) { cache_cap = rows_needed; prefix_n = 0; }
+
     const uint32_t chunk_rows = vocab < 8192u ? vocab : 8192u;
     float *eh = xmalloc((size_t)H * sizeof(float));
     float *draft_h = xmalloc((size_t)H * sizeof(float));
@@ -28781,19 +28827,23 @@ static bool glm_nextn_draft_chain_metal_layer(const ds4_model *m,
     float *logits = xmalloc((size_t)vocab * sizeof(float));
     float *chunk_w = xmalloc((size_t)chunk_rows * H * sizeof(float));
     float *chunk_logits = xmalloc((size_t)chunk_rows * sizeof(float));
-    float *Knope = xmalloc((size_t)nhead * (uint32_t)depth * nope * sizeof(float));
-    float *Vc = xmalloc((size_t)nhead * (uint32_t)depth * vd * sizeof(float));
-    float *Krop = xmalloc((size_t)nhead * (uint32_t)depth * rope * sizeof(float));
+    float *Knope = have_external ? Knope_cache : xmalloc((size_t)nhead * cache_cap * nope * sizeof(float));
+    float *Vc = have_external ? Vc_cache : xmalloc((size_t)nhead * cache_cap * vd * sizeof(float));
+    float *Krop = have_external ? Krop_cache : xmalloc((size_t)nhead * cache_cap * rope * sizeof(float));
     memcpy(cur_h, seed_h, (size_t)H * sizeof(float));
     int tok = seed_token;
     bool ok = true;
-    for (int j = 0; j < depth; j++) {
+    for (uint32_t j = 0; j < rows_needed; j++) {
+        const uint32_t slot = prefix_n + j;
         if (!glm_nextn_eh_project_metal_layer(m, shape, il, tok, cur_h, eh) ||
             !glm_nextn_decoder_metal_layer_cached(m, shape, il, eh, draft_h,
-                                                  Knope, Vc, Krop,
-                                                  (uint32_t)depth, (uint32_t)j,
-                                                  start_pos + (uint32_t)j) ||
-            !glm_nextn_logits_metal(m, shape, draft_h, logits, vocab,
+                                                  Knope, Vc, Krop, cache_cap,
+                                                  slot, start_pos + j)) {
+            ok = false;
+            break;
+        }
+        if ((int)j == depth) break; /* final hidden row is for persistence only */
+        if (!glm_nextn_logits_metal(m, shape, draft_h, logits, vocab,
                                     chunk_w, chunk_logits, chunk_rows)) {
             ok = false;
             break;
@@ -28806,9 +28856,23 @@ static bool glm_nextn_draft_chain_metal_layer(const ds4_model *m,
         tok = arg;
         memcpy(cur_h, draft_h, (size_t)H * sizeof(float));
     }
-    free(Krop); free(Vc); free(Knope);
+    if (ok && out_rows_written) *out_rows_written = rows_needed;
+    if (!have_external) { free(Krop); free(Vc); free(Knope); }
     free(chunk_logits); free(chunk_w); free(logits); free(cur_h); free(draft_h); free(eh);
     return ok;
+}
+
+static bool glm_nextn_draft_chain_metal_layer(const ds4_model *m,
+                                              const glm_cpu_shape *shape,
+                                              uint32_t il,
+                                              int seed_token, uint32_t start_pos,
+                                              const float *seed_h,
+                                              int depth, uint32_t vocab,
+                                              int *out_drafts /*[depth]*/) {
+    return glm_nextn_draft_chain_metal_layer_cached(m, shape, il, seed_token,
+                                                    start_pos, seed_h, depth,
+                                                    vocab, true, out_drafts,
+                                                    NULL, NULL, NULL, 0, 0, NULL);
 }
 
 static bool glm_nextn_draft_chain_metal(const ds4_model *m,
@@ -29792,7 +29856,10 @@ static const float *glm_gen_metal_hnorm(void *ctx) {
 typedef bool (*glm_draft_chain_fn)(void *draft_ctx, int seed_token,
                                    uint32_t seed_pos,
                                    const float *seed_hidden, int depth,
+                                   bool persist_tail_row,
                                    int *out_drafts);
+typedef void (*glm_draft_commit_fn)(void *draft_ctx, int accepted,
+                                    bool fallback_emitted);
 typedef bool (*glm_verify_after_bonus_fn)(void *verify_ctx,
                                           int bonus_token,
                                           const int *draft,
@@ -29813,13 +29880,121 @@ typedef struct {
     const ds4_model *m;
     const glm_cpu_shape *shape;
     uint32_t vocab;
+    float *Knope;
+    float *Vc;
+    float *Krop;
+    uint32_t cache_cap;
+    uint32_t prefix_n;
+    uint32_t pending_base;
+    uint32_t pending_rows;
+    uint64_t prefix_commits;
+    uint64_t prefix_resets;
 } glm_nextn_draft_state;
+
+static void glm_nextn_draft_state_init(glm_nextn_draft_state *s,
+                                       const ds4_model *m,
+                                       const glm_cpu_shape *shape,
+                                       uint32_t vocab,
+                                       uint32_t max_rows) {
+    memset(s, 0, sizeof(*s));
+    s->m = m;
+    s->shape = shape;
+    s->vocab = vocab;
+    if (!shape || max_rows == 0) return;
+    if (max_rows < DS4_GLM_NEXTN_MAX_DEPTH + 2u)
+        max_rows = DS4_GLM_NEXTN_MAX_DEPTH + 2u;
+    if (max_rows > 4096u) max_rows = 4096u;
+    s->cache_cap = max_rows;
+    const uint32_t nh = shape->n_head;
+    s->Knope = xmalloc((size_t)nh * max_rows * shape->qk_nope * sizeof(float));
+    s->Vc    = xmalloc((size_t)nh * max_rows * shape->v_dim * sizeof(float));
+    s->Krop  = xmalloc((size_t)nh * max_rows * shape->qk_rope * sizeof(float));
+}
+
+static void glm_nextn_draft_state_free(glm_nextn_draft_state *s) {
+    if (!s) return;
+    free(s->Krop); free(s->Vc); free(s->Knope);
+    s->Krop = NULL; s->Vc = NULL; s->Knope = NULL;
+    s->cache_cap = s->prefix_n = s->pending_base = s->pending_rows = 0;
+}
+
+static void glm_nextn_draft_state_reset(glm_nextn_draft_state *s) {
+    if (!s) return;
+    s->prefix_n = 0;
+    s->pending_base = 0;
+    s->pending_rows = 0;
+    s->prefix_resets++;
+}
+
+static void glm_nextn_draft_commit(void *vc, int accepted,
+                                   bool fallback_emitted) {
+    glm_nextn_draft_state *s = (glm_nextn_draft_state *)vc;
+    if (!s || !s->Knope || !s->Vc || !s->Krop || s->cache_cap == 0) return;
+    if (fallback_emitted || accepted < 0 || s->pending_base != s->prefix_n) {
+        glm_nextn_draft_state_reset(s);
+        return;
+    }
+    const uint32_t commit_rows = 1u + (uint32_t)accepted; /* bonus + accepted drafts */
+    if (commit_rows > s->pending_rows || s->prefix_n + commit_rows > s->cache_cap) {
+        glm_nextn_draft_state_reset(s);
+        return;
+    }
+    s->prefix_n += commit_rows;
+    s->pending_rows = 0;
+    s->prefix_commits++;
+}
+
+int ds4_glm_nextn_prefix_synth(int *out_commit, int *out_reset) {
+    glm_nextn_draft_state s;
+    memset(&s, 0, sizeof(s));
+    s.Knope = xmalloc(sizeof(float));
+    s.Vc = xmalloc(sizeof(float));
+    s.Krop = xmalloc(sizeof(float));
+    s.cache_cap = 8;
+
+    s.prefix_n = 0;
+    s.pending_base = 0;
+    s.pending_rows = 5;
+    glm_nextn_draft_commit(&s, 2, false); /* bonus + two accepted drafts */
+    const int commit_ok = (s.prefix_n == 3 && s.prefix_commits == 1 &&
+                           s.prefix_resets == 0 && s.pending_rows == 0);
+
+    s.pending_base = s.prefix_n;
+    s.pending_rows = 4;
+    glm_nextn_draft_commit(&s, 1, true);  /* fallback invalidates prefix */
+    const int reset_ok = (s.prefix_n == 0 && s.prefix_resets == 1);
+
+    if (out_commit) *out_commit = commit_ok;
+    if (out_reset) *out_reset = reset_ok;
+    fprintf(stderr, "  glm-nextn-prefix-synth: commit=%s reset=%s\n",
+            commit_ok ? "PASS" : "FAIL", reset_ok ? "PASS" : "FAIL");
+    glm_nextn_draft_state_free(&s);
+    return commit_ok && reset_ok ? 0 : 1;
+}
 
 static bool glm_nextn_draft_chain_cpu_thunk(void *vc, int seed_token,
                                             uint32_t seed_pos,
                                             const float *seed_hidden, int depth,
+                                            bool persist_tail_row,
                                             int *out_drafts) {
     glm_nextn_draft_state *s = (glm_nextn_draft_state *)vc;
+    if (!s) return false;
+    if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
+    const uint32_t rows_needed = (uint32_t)depth + (persist_tail_row ? 1u : 0u);
+    if (s->Knope && s->Vc && s->Krop && s->cache_cap >= rows_needed) {
+        if (s->prefix_n > s->cache_cap || s->cache_cap - s->prefix_n < rows_needed)
+            glm_nextn_draft_state_reset(s);
+        s->pending_base = s->prefix_n;
+        s->pending_rows = 0;
+        uint32_t rows = 0;
+        const bool ok = glm_nextn_draft_chain_cpu_layer_cached(
+            s->m, s->shape, 78, seed_token, seed_pos, seed_hidden,
+            depth, s->vocab, persist_tail_row, out_drafts, s->Knope, s->Vc, s->Krop,
+            s->cache_cap, s->prefix_n, &rows);
+        if (ok) s->pending_rows = rows;
+        else glm_nextn_draft_state_reset(s);
+        return ok;
+    }
     return glm_nextn_draft_chain_cpu(s->m, s->shape, seed_token, seed_pos,
                                      seed_hidden, depth, s->vocab, out_drafts);
 }
@@ -29828,8 +30003,26 @@ static bool glm_nextn_draft_chain_cpu_thunk(void *vc, int seed_token,
 static bool glm_nextn_draft_chain_metal_thunk(void *vc, int seed_token,
                                               uint32_t seed_pos,
                                               const float *seed_hidden, int depth,
+                                              bool persist_tail_row,
                                               int *out_drafts) {
     glm_nextn_draft_state *s = (glm_nextn_draft_state *)vc;
+    if (!s) return false;
+    if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
+    const uint32_t rows_needed = (uint32_t)depth + (persist_tail_row ? 1u : 0u);
+    if (s->Knope && s->Vc && s->Krop && s->cache_cap >= rows_needed) {
+        if (s->prefix_n > s->cache_cap || s->cache_cap - s->prefix_n < rows_needed)
+            glm_nextn_draft_state_reset(s);
+        s->pending_base = s->prefix_n;
+        s->pending_rows = 0;
+        uint32_t rows = 0;
+        const bool ok = glm_nextn_draft_chain_metal_layer_cached(
+            s->m, s->shape, 78, seed_token, seed_pos, seed_hidden,
+            depth, s->vocab, persist_tail_row, out_drafts, s->Knope, s->Vc, s->Krop,
+            s->cache_cap, s->prefix_n, &rows);
+        if (ok) s->pending_rows = rows;
+        else glm_nextn_draft_state_reset(s);
+        return ok;
+    }
     return glm_nextn_draft_chain_metal(s->m, s->shape, seed_token, seed_pos,
                                        seed_hidden, depth, s->vocab, out_drafts);
 }
@@ -29877,6 +30070,7 @@ static bool glm_spec_verify_after_bonus_single(glm_gen_step_fn step,
             if (!step(ctx, next, pos, true, logits)) return false;
             pos++;
             next = sample_argmax(logits, vocab);
+            if (*accepted >= active_depth) break; /* full active-depth accept; next becomes next round's bonus */
             continue;
         }
 
@@ -29917,6 +30111,7 @@ static int glm_spec_decode(const char *label,
                            double *out_decode_s,
                            int draft_depth, glm_draft_chain_fn draft_fn,
                            void *draft_ctx,
+                           glm_draft_commit_fn draft_commit_fn,
                            glm_verify_after_bonus_fn verify_fn,
                            void *verify_ctx,
                            int *obs_generated) {
@@ -29973,9 +30168,11 @@ static int glm_spec_decode(const char *label,
         if (generated < n_predict) {
             const int remaining_after_bonus = n_predict - generated;
             active_depth = remaining_after_bonus < depth ? remaining_after_bonus : depth;
+            const bool persist_tail_row = remaining_after_bonus > active_depth;
             if (active_depth > 0 && draft_fn && seed_h) {
                 const double d0 = now_sec();
-                (void)draft_fn(draft_ctx, bonus_token, pos, seed_h, active_depth, draft);
+                (void)draft_fn(draft_ctx, bonus_token, pos, seed_h,
+                               active_depth, persist_tail_row, draft);
                 draft_s += now_sec() - d0;
             }
 
@@ -30000,6 +30197,9 @@ static int glm_spec_decode(const char *label,
                 if (out_generated) *out_generated = generated;
                 return 1;
             }
+            if (draft_commit_fn && active_depth > 0 &&
+                generated + emit_count < n_predict)
+                draft_commit_fn(draft_ctx, acc, fallback_emitted);
 
             for (int i = 0; i < emit_count; i++) {
                 const int tok = emit_after[i];
@@ -30072,7 +30272,10 @@ static int glm_generate_loop(const char *label,
      * plain greedy: every emitted token is the verified target argmax and
      * the draft never touches the target KV cache. */
     if (spec_enabled) {
-        glm_nextn_draft_state ds = { &e->model, shape, vocab };
+        glm_nextn_draft_state ds;
+        const uint32_t draft_cache_rows =
+            (n_predict > 0 && n_predict < 4090) ? (uint32_t)n_predict + 6u : 4096u;
+        glm_nextn_draft_state_init(&ds, &e->model, shape, vocab, draft_cache_rows);
         glm_draft_chain_fn draft_fn = glm_nextn_draft_chain_cpu_thunk;
         const char *draft_backend = "cpu";
 #ifndef DS4_NO_GPU
@@ -30085,12 +30288,20 @@ static int glm_generate_loop(const char *label,
                     label ? label : "glm-generate", draft_env);
         }
 #endif
-        fprintf(stderr, "ds4: %s: nextn draft backend=%s\n",
-                label ? label : "glm-generate", draft_backend);
+        fprintf(stderr, "ds4: %s: nextn draft backend=%s prefix_cache_rows=%u\n",
+                label ? label : "glm-generate", draft_backend, ds.cache_cap);
         int rc = glm_spec_decode(label, step, hnorm, ctx, prompt, prompt_len,
                                  n_predict, logits, vocab, e, eos_id, out,
                                  out_generated, gen_ids_out, out_decode_s,
-                                 spec_depth, draft_fn, &ds, NULL, NULL, NULL);
+                                 spec_depth, draft_fn, &ds, glm_nextn_draft_commit,
+                                 NULL, NULL, NULL);
+        fprintf(stderr,
+                "ds4: %s: nextn draft prefix commits=%llu resets=%llu live_rows=%u\n",
+                label ? label : "glm-generate",
+                (unsigned long long)ds.prefix_commits,
+                (unsigned long long)ds.prefix_resets,
+                ds.prefix_n);
+        glm_nextn_draft_state_free(&ds);
         fprintf(stderr, "ds4: %s: prefill %.2fs (%u tok)\n",
                 label ? label : "glm-generate", prefill_s, prompt_len);
         return rc;
@@ -30447,8 +30658,9 @@ typedef struct {
 } glm_spec_mock_ctx;
 
 static bool glm_spec_mock_draft(void *vc, int seed_token, uint32_t seed_pos,
-                                const float *seed_h, int depth, int *out_drafts) {
-    (void)seed_token; (void)seed_pos; (void)seed_h;
+                                const float *seed_h, int depth,
+                                bool persist_tail_row, int *out_drafts) {
+    (void)seed_token; (void)seed_pos; (void)seed_h; (void)persist_tail_row;
     glm_spec_mock_ctx *mc = (glm_spec_mock_ctx *)vc;
     const int g = *mc->generated_ptr;          /* tokens emitted before bonus */
     for (int j = 0; j < depth; j++) {
@@ -30506,6 +30718,7 @@ static bool glm_spec_mock_verify_after_bonus(void *vc,
             if (*emit_count >= remaining_after_bonus) break;
             next = (gi < mc->n_steps) ? mc->greedy[gi] : eos_id;
             pos++;                    /* target forward on accepted draft */
+            if (*accepted >= active_depth) break; /* full active-depth accept */
             continue;
         }
 
@@ -30570,7 +30783,7 @@ static bool glm_spec_run_mock_case(glm_synth_ctx *sc,
                              glm_gen_cpu_hnorm, &c, prompt, plen, n_steps,
                              li, sc->vocab, NULL, eos_id, NULL, &generated,
                              ids, NULL, depth, glm_spec_mock_draft, &mc,
-                             verify_fn, &mc, &live_generated);
+                             NULL, verify_fn, &mc, &live_generated);
     bool ok = (rc == 0) && (generated == n_steps);
     for (int s = 0; ok && s < n_steps; s++)
         if (ids[s] != greedy[s]) ok = false;
