@@ -29677,6 +29677,7 @@ static int glm_spec_decode(const char *label,
                            double *out_decode_s,
                            int draft_depth, glm_draft_chain_fn draft_fn,
                            void *draft_ctx, int *obs_generated) {
+    (void)prompt;
     int depth = draft_depth;
     if (depth < 1) depth = 1;
     if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
@@ -29696,7 +29697,6 @@ static int glm_spec_decode(const char *label,
     int next = sample_argmax(logits, vocab);   /* first verified target token */
     uint32_t pos = prompt_len;
     int generated = 0;
-    int last_committed = prompt_len ? prompt[prompt_len - 1] : -1;
     uint64_t rounds = 0, acc_full = 0, acc_partial = 0, acc_miss = 0;
     double draft_s = 0.0;
 
@@ -29704,38 +29704,39 @@ static int glm_spec_decode(const char *label,
     while (generated < n_predict && next != eos_id) {
         rounds++;
         const int round_generated = generated;
-        const int seed_token = last_committed;
-        const int first_target = next;
+        const int bonus_token = next;
+        const int seed_token = bonus_token;
+        const int first_target = bonus_token;
         int fallback_token = -1;
         bool fallback_emitted = false;
+        int active_depth = 0;
+        int acc = 0;
         const float *seed_h = hnorm ? hnorm(ctx) : NULL;
         if (obs_generated) *obs_generated = generated;
         for (int j = 0; j < depth; j++) draft[j] = -1;
-        const int remaining = n_predict - generated;
-        const int active_depth = remaining > 1 ? (remaining < depth ? remaining : depth) : 0;
-        if (active_depth > 0 && draft_fn && seed_h) {
-            const double d0 = now_sec();
-            (void)draft_fn(draft_ctx, last_committed, seed_h, active_depth, draft);
-            draft_s += now_sec() - d0;
-        }
 
-        /* Accept the contiguous prefix of drafts that match the authoritative
-         * target greedy token, emitting + stepping the target on each accepted
-         * token exactly as plain greedy would. */
-        int acc = 0;
-        while (acc < active_depth && draft[acc] == next &&
-               generated < n_predict && next != eos_id) {
-            if (gen_ids_out) gen_ids_out[generated] = next;
-            if (out) {
-                size_t pl = 0;
-                char *piece = ds4_token_text(e, next, &pl);
-                fwrite(piece, 1, pl, out); fflush(out); free(piece);
+        /* SGLang EAGLE V2 treats the current target argmax as the bonus token:
+         * it is already verified by the target model.  NextN is seeded with
+         * (bonus_token, hidden_that_predicted_bonus) and drafts the following
+         * tokens. */
+        if (gen_ids_out) gen_ids_out[generated] = bonus_token;
+        if (out) {
+            size_t pl = 0;
+            char *piece = ds4_token_text(e, bonus_token, &pl);
+            fwrite(piece, 1, pl, out); fflush(out); free(piece);
+        }
+        generated++;
+
+        if (generated < n_predict) {
+            const int remaining_after_bonus = n_predict - generated;
+            active_depth = remaining_after_bonus < depth ? remaining_after_bonus : depth;
+            if (active_depth > 0 && draft_fn && seed_h) {
+                const double d0 = now_sec();
+                (void)draft_fn(draft_ctx, bonus_token, seed_h, active_depth, draft);
+                draft_s += now_sec() - d0;
             }
-            last_committed = next;
-            generated++;
-            acc++;
-            if (generated >= n_predict) break;
-            if (!step(ctx, next, pos, true, logits)) {
+
+            if (!step(ctx, bonus_token, pos, true, logits)) {
                 if (trace) fclose(trace);
                 free(draft);
                 if (out_decode_s) *out_decode_s = now_sec() - dec0;
@@ -29744,25 +29745,21 @@ static int glm_spec_decode(const char *label,
             }
             pos++;
             next = sample_argmax(logits, vocab);
-        }
 
-        /* Fallback: emit the authoritative target token.  Covers miss at
-         * acc==0, the first rejected draft on a partial accept, and the
-         * boundary token after a full accept (which was never drafted).  The
-         * rejected draft tail draft[acc..depth-1] stays invisible: it never
-         * touched the target cache, so nothing is rolled back. */
-        if (generated < n_predict && next != eos_id) {
-            if (gen_ids_out) gen_ids_out[generated] = next;
-            fallback_token = next;
-            fallback_emitted = true;
-            if (out) {
-                size_t pl = 0;
-                char *piece = ds4_token_text(e, next, &pl);
-                fwrite(piece, 1, pl, out); fflush(out); free(piece);
-            }
-            last_committed = next;
-            generated++;
-            if (generated < n_predict) {
+            /* Accept draft tokens only when they match the next target argmaxes.
+             * Drafts never touch the target KV cache; every emitted token still
+             * comes from target verification. */
+            while (acc < active_depth && draft[acc] == next &&
+                   generated < n_predict && next != eos_id) {
+                if (gen_ids_out) gen_ids_out[generated] = next;
+                if (out) {
+                    size_t pl = 0;
+                    char *piece = ds4_token_text(e, next, &pl);
+                    fwrite(piece, 1, pl, out); fflush(out); free(piece);
+                }
+                generated++;
+                acc++;
+                if (generated >= n_predict) break;
                 if (!step(ctx, next, pos, true, logits)) {
                     if (trace) fclose(trace);
                     free(draft);
@@ -29772,6 +29769,31 @@ static int glm_spec_decode(const char *label,
                 }
                 pos++;
                 next = sample_argmax(logits, vocab);
+            }
+
+            /* Fallback emits the first target token not matched by the draft
+             * chain.  Rejected draft tail stays invisible. */
+            if (generated < n_predict && next != eos_id) {
+                if (gen_ids_out) gen_ids_out[generated] = next;
+                fallback_token = next;
+                fallback_emitted = true;
+                if (out) {
+                    size_t pl = 0;
+                    char *piece = ds4_token_text(e, next, &pl);
+                    fwrite(piece, 1, pl, out); fflush(out); free(piece);
+                }
+                generated++;
+                if (generated < n_predict) {
+                    if (!step(ctx, next, pos, true, logits)) {
+                        if (trace) fclose(trace);
+                        free(draft);
+                        if (out_decode_s) *out_decode_s = now_sec() - dec0;
+                        if (out_generated) *out_generated = generated;
+                        return 1;
+                    }
+                    pos++;
+                    next = sample_argmax(logits, vocab);
+                }
             }
         }
 
@@ -30188,8 +30210,9 @@ int ds4_glm_cpu_generate_synth(int n_steps, int *out_match) {
 /* No-model synthetic GLM NextN speculative accept/rollback harness.
  * Proves the opt-in speculative state machine (glm_spec_decode) emits EXACTLY
  * the naive greedy token sequence for full-accept, partial-accept, and miss
- * cases.  A controllable mock drafter forces each accept length against a
- * precomputed greedy reference; the real NextN drafter is exercised separately
+ * cases.  The verified target argmax is the EAGLE bonus token; a controllable
+ * mock drafter forces accept lengths for the tokens after that bonus against a
+ * precomputed greedy reference.  The real NextN drafter is exercised separately
  * by --glm-nextn-synth.  Sets each out_* to 1 if that mode matched the greedy
  * reference for all n_steps; returns 0 only if all three matched.  No model on
  * disk is required. */
@@ -30209,9 +30232,10 @@ static bool glm_spec_mock_draft(void *vc, int seed_token, const float *seed_h,
                                 int depth, int *out_drafts) {
     (void)seed_token; (void)seed_h;
     glm_spec_mock_ctx *mc = (glm_spec_mock_ctx *)vc;
-    const int g = *mc->generated_ptr;          /* tokens emitted so far */
+    const int g = *mc->generated_ptr;          /* tokens emitted before bonus */
     for (int j = 0; j < depth; j++) {
-        const int target = (g + j < mc->n_steps) ? mc->greedy[g + j] : 0;
+        const int gi = g + 1 + j;              /* drafts start after bonus */
+        const int target = (gi < mc->n_steps) ? mc->greedy[gi] : 0;
         const int wrong = (target + 1) % (int)mc->vocab;  /* guaranteed != target */
         if (mc->mode == GLM_SPEC_MOCK_FULL) {
             out_drafts[j] = target;

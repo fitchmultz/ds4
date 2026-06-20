@@ -213,7 +213,7 @@ coverage, including blk.78 NextN-only Q2_K/Q3_K. DSA deferred. DONE:
 llama.cpp on the current oracle prompts; sparse DSA/index sharing is a later
 long-context quality/perf task.
 
-**Phase 6 — NextN/MTP speculative.** Opt-in, default-off, correctness-first scaffold exists. `--glm-nextn` (Metal target only) + `--glm-nextn-draft N` (capped at 4, default 4) enable a top-k=1 greedy speculative decode for `--glm-raw`/`--glm-chat`: after each committed target token, `blk.78` drafts up to N tokens from `(last_committed_token, post-output-norm target hidden)`, and the shared verifier (`glm_spec_decode`) emits only the contiguous accepted prefix, falling back to the authoritative target argmax on miss/partial. Crucially, every emitted token is the verified target argmax and drafts NEVER enter the target KV cache, so output is byte-for-byte identical to plain greedy GLM generation and there is NO target-cache rollback; a rejected draft tail is simply discarded. CPU target ignores the flag with a diagnostic. This is correctness-first, NOT a speed claim: the real-model drafter now uses the validated Metal NextN path by default (`DS4_GLM_NEXTN_DRAFT_BACKEND=cpu` is an A/B fallback), but verification still reuses the existing single-token target step, so each emitted token still costs one target forward; the genuine speedup still needs batched/prefill-style target verification (SGLang NEXTN/EAGLE V2 batched tree verify). Current SGLang source confirms the NextN layer contract in `python/sglang/srt/models/deepseek_nextn.py`: `eh_proj(concat(enorm(embed(input_ids)), hnorm(spec_info.hidden_states))) -> decoder -> shared_head.norm -> lm_head`. `python/sglang/srt/speculative/eagle_worker_v2.py` also shows the production loop shape: draft-extend fills/updates the draft KV from target hidden states and target next tokens, top-k=1 draft degenerates to a chain, target verify runs as a batch/tree, then a draft-extend step prepares the next iteration from verified target output. No-model coverage: `ds4_test --glm-spec-generate-synth` pins full-accept, partial-accept, and miss/rollback cases to the exact naive greedy sequence via a controllable mock drafter, while `--glm-nextn-metal-synth` now also checks a recursive 4-token Metal draft chain against the CPU chain. The prior diagnostics remain: `blk.78.nextn.*` loads/dequants/runs through the CPU diagnostic path; `ds4_test --glm-nextn-synth`/`--glm-nextn-metal-synth` pin the no-model control/tensor wiring; `DS4_GLM_NEXTN_PROBE=1` measures one-draft agreement during generation without changing output. The remaining speed direction is batched target verify/rollback (draft KV state + tree verify), since single-token decode still costs ~9–12s/token.
+**Phase 6 — NextN/MTP speculative.** Opt-in, default-off, correctness-first scaffold exists. `--glm-nextn` (Metal target only) + `--glm-nextn-draft N` (capped at 4, default 4) enable a top-k=1 greedy speculative decode for `--glm-raw`/`--glm-chat`: the current verified target argmax is emitted as the SGLang/EAGLE bonus token, then `blk.78` drafts up to N following tokens from `(bonus_token, post-output-norm target hidden that predicted the bonus)`, and the shared verifier (`glm_spec_decode`) emits only the contiguous accepted draft prefix, falling back to the authoritative target argmax on miss/partial. Crucially, every emitted token is the verified target argmax and drafts NEVER enter the target KV cache, so output is byte-for-byte identical to plain greedy GLM generation and there is NO target-cache rollback; a rejected draft tail is simply discarded. CPU target ignores the flag with a diagnostic. This is correctness-first, NOT a speed claim: the real-model drafter now uses the validated Metal NextN path by default (`DS4_GLM_NEXTN_DRAFT_BACKEND=cpu` is an A/B fallback), but verification still reuses the existing single-token target step, so each emitted token still costs one target forward; the genuine speedup still needs batched/prefill-style target verification (SGLang NEXTN/EAGLE V2 batched tree verify). Current SGLang source confirms the NextN layer contract in `python/sglang/srt/models/deepseek_nextn.py`: `eh_proj(concat(enorm(embed(input_ids)), hnorm(spec_info.hidden_states))) -> decoder -> shared_head.norm -> lm_head`. `python/sglang/srt/speculative/eagle_worker_v2.py` also shows the production loop shape: draft-extend fills/updates the draft KV from target hidden states and target next tokens, top-k=1 draft degenerates to a chain, target verify runs as a batch/tree, then a draft-extend step prepares the next iteration from verified target output. No-model coverage: `ds4_test --glm-spec-generate-synth` pins full-accept, partial-accept, and miss/rollback cases to the exact naive greedy sequence via a controllable mock drafter, while `--glm-nextn-metal-synth` now also checks a recursive 4-token Metal draft chain against the CPU chain. The prior diagnostics remain: `blk.78.nextn.*` loads/dequants/runs through the CPU diagnostic path; `ds4_test --glm-nextn-synth`/`--glm-nextn-metal-synth` pin the no-model control/tensor wiring; `DS4_GLM_NEXTN_PROBE=1` measures one-draft agreement during generation without changing output. The remaining speed direction is batched target verify/rollback (draft KV state + tree verify), since single-token decode still costs ~9–12s/token.
 
 **Phase 7 — tests/eval/docs.** Tiered: always-on (metadata/cache-math/router
 microkernels), `DS4_TEST_GLM52_SHARD1`, `DS4_TEST_GLM52_GGUF`, `DS4_TEST_GLM52_LONG`.
@@ -272,10 +272,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   plumbing and CSV tracing; keep the probe for quick A/B diagnostics only.
 - `--glm-nextn` + `--glm-nextn-draft N` is the opt-in, default-off,
   Metal-target-only NextN speculative greedy scaffold for `--glm-raw`/`--glm-chat`.
-  `blk.78` drafts up to N tokens (capped at 4, default 4) from
-  `(last_committed_token, post-output-norm target hidden)`; the shared verifier
-  emits only the contiguous accepted prefix and falls back to the authoritative
-  target argmax on miss/partial. Every emitted token is the verified target
+  The current verified target argmax is emitted as the SGLang/EAGLE bonus token;
+  `blk.78` then drafts up to N following tokens (capped at 4, default 4) from
+  `(bonus_token, post-output-norm target hidden that predicted the bonus)`. The
+  shared verifier emits only the contiguous accepted draft prefix and falls back
+  to the authoritative target argmax on miss/partial. Every emitted token is the verified target
   argmax and drafts never enter the target KV cache, so output is byte-for-byte
   identical to plain greedy GLM and no target-cache rollback is needed. It is
   correctness-first, NOT a speed claim: the real-model drafter now defaults to
@@ -283,14 +284,16 @@ The core GLM port is complete and verified. The active work is usability/speed:
   A/B fallback), but verification still reuses the single-token target step
   (one target forward per emitted token), so the speedup still needs batched
   target verification. `DS4_GLM_NEXTN_TRACE_OUT=<path>` writes a per-round CSV
-  trace for acceptance-rate analysis; current real `asdfqwer -n 2` trace shows
-  round 1 target `108714`, draft `198`, accepted `0`, fallback `108714`, then
-  final target `100461`. A second raw smoke, `The answer is -n 4`, produces
+  trace for acceptance-rate analysis. After correcting the scaffold to SGLang's
+  bonus-token semantics (the current verified target token is always emitted,
+  and drafts are checked against following target tokens), real `asdfqwer -n 2`
+  emits identical ids `108714 100461` with `draft0=100461` accepted as a full
+  one-token draft hit. A second raw smoke, `The answer is -n 4`, produces
   identical plain-vs-NextN ids `9829 13 758 2097` (` yes. In fact`) with
-  0/3 draft hits before the final no-draft token. `ds4_test
-  --glm-spec-generate-synth` pins full/partial/miss cases to the exact naive
-  greedy sequence, and `--glm-spec-trace-synth` pins the CSV trace shape,
-  including the final no-draft row.
+  one accepted draft (`13`) before fallback to `758` and final no-draft token
+  `2097`. `ds4_test --glm-spec-generate-synth` pins full/partial/miss cases to
+  the exact naive greedy sequence, and `--glm-spec-trace-synth` pins the CSV
+  trace shape, including the final no-draft row.
 - `--glm-raw` / `--glm-raw-cpu` bypass the GLM chat template and raw-tokenize
   `-p/--prompt`. This is a usability/benchmark mode, not chat: a one-token raw
   prompt avoids the 13-token chat-template prefill while batched prefill is
@@ -316,9 +319,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
 ## 8. Risks / blockers
 
 - NextN/MTP has a correctness-first opt-in scaffold with Metal drafting and
-  traceable greedy verification, but current measured draft hit rate is 0 on the
-  recorded raw smokes. Real speed still needs better acceptance and/or batched
-  target verification; do not present the scaffold as a speed win.
+  traceable greedy verification. Current recorded raw smokes now show real draft
+  hits after the SGLang bonus-token semantics fix, but speed is still limited by
+  one target forward per emitted token. Real speed still needs batched target
+  verification and/or higher acceptance; do not present the scaffold alone as a
+  speed win.
 - Batched/persistent GLM graph work remains the largest speed risk: prefill still
   runs one full per-token forward, and the NextN verifier still uses one target
   forward per emitted token.

@@ -3034,7 +3034,8 @@ static void test_glm_spec_trace_synth(void) {
     remove(path);
     setenv("DS4_GLM_NEXTN_TRACE_OUT", path, 1);
     int full = 0, partial = 0, miss = 0;
-    int rc = ds4_glm_spec_generate_synth(8, &full, &partial, &miss);
+    const int n_steps = 7;
+    int rc = ds4_glm_spec_generate_synth(n_steps, &full, &partial, &miss);
     test_restore_env("DS4_GLM_NEXTN_TRACE_OUT", saved);
     TEST_ASSERT(rc == 0);
     TEST_ASSERT(full == 1 && partial == 1 && miss == 1);
@@ -3063,10 +3064,10 @@ static void test_glm_spec_trace_synth(void) {
     }
     fclose(f);
     remove(path);
-    TEST_ASSERT(rows == 8);
+    TEST_ASSERT(rows == 4);
     TEST_ASSERT(last_active_depth == 0);
-    TEST_ASSERT(last_generated_after == 8);
-    TEST_ASSERT(last_fallback == 1);
+    TEST_ASSERT(last_generated_after == n_steps);
+    TEST_ASSERT(last_fallback == 0);
     fprintf(stderr, "  glm-spec-trace-synth: PASS (%d rows, final active_depth=%d generated_after=%d)\n",
             rows, last_active_depth, last_generated_after);
 }
