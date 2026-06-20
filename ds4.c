@@ -31010,11 +31010,51 @@ static int glm_generate_loop(const char *label,
                              double *out_decode_s,
                              bool spec_enabled, int spec_depth) {
     const double pf0 = now_sec();
-    for (uint32_t t = 0; t < prompt_len; t++)
-        if (!step(ctx, prompt[t], t, t + 1 == prompt_len, logits)) return 1;
+    bool batch_prefill = false;
+#ifndef DS4_NO_GPU
+    if (step == glm_gen_metal_step && prompt_len > 0 &&
+        glm_env_flag_enabled("DS4_GLM_PREFILL_BATCH_LIVE")) {
+        if (prompt_len <= 16u) {
+            glm_metal_fwd_ctx *live = (glm_metal_fwd_ctx *)ctx;
+            glm_metal_fwd_ctx scratch;
+            memset(&scratch, 0, sizeof(scratch));
+            float *batch_logits = xmalloc((size_t)prompt_len * vocab * sizeof(float));
+            const double b0 = now_sec();
+            bool ok = glm_metal_fwd_init_ex(&scratch, live->m, live->shape,
+                                            live->n_layer, live->n_dense,
+                                            live->seq_n, false);
+            if (ok) (void)glm_metal_fwd_borrow_shared_experts(&scratch, live);
+            if (ok) ok = glm_metal_fwd_batch_f32(&scratch, prompt, 0, prompt_len,
+                                                 true, batch_logits, NULL, NULL);
+            if (ok) ok = glm_metal_fwd_copy_kv_slots(live, &scratch, 0, prompt_len);
+            if (ok) {
+                memcpy(live->x, scratch.x, (size_t)live->H * sizeof(float));
+                memcpy(live->xn, scratch.xn, (size_t)live->H * sizeof(float));
+                memcpy(logits, batch_logits + (size_t)(prompt_len - 1u) * vocab,
+                       (size_t)vocab * sizeof(float));
+                batch_prefill = true;
+            }
+            fprintf(stderr,
+                    "ds4: %s: prefill batch live rows=%u ok=%s time=%.3fs%s\n",
+                    label ? label : "glm-generate", prompt_len, ok ? "yes" : "no",
+                    now_sec() - b0,
+                    glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE") ? " fast-moe=on" : " fast-moe=off");
+            free(batch_logits);
+            if (scratch.m) glm_metal_fwd_free(&scratch);
+        } else {
+            fprintf(stderr,
+                    "ds4: %s: prefill batch live skipped (%u rows > max 16)\n",
+                    label ? label : "glm-generate", prompt_len);
+        }
+    }
+#endif
+    if (!batch_prefill) {
+        for (uint32_t t = 0; t < prompt_len; t++)
+            if (!step(ctx, prompt[t], t, t + 1 == prompt_len, logits)) return 1;
+    }
     const double prefill_s = now_sec() - pf0;
 #ifndef DS4_NO_GPU
-    if (step == glm_gen_metal_step)
+    if (!batch_prefill && step == glm_gen_metal_step)
         glm_metal_prefill_batch_check(label, (const glm_metal_fwd_ctx *)ctx,
                                       prompt, prompt_len, logits, vocab);
 #endif
@@ -31767,8 +31807,8 @@ int ds4_glm_metal_target_batch_synth(int *out_match, float *out_hidden_max,
 
     /* Dedicated prefill-shape checks: the production real-model probe showed
      * target-verifier correctness is not enough to expose all prefill issues.
-     * Keep zero-prefix and seeded-prefix synthetic comparisons here before any
-     * future batched-prefill flag is allowed. */
+     * Keep zero-prefix and seeded-prefix synthetic comparisons here before the
+     * opt-in live batched-prefill path can become default production behavior. */
     float pre_zero_hdiff = 1.0e30f, pre_zero_ldiff = 1.0e30f, pre_zero_cdiff = 1.0e30f;
     float pre_seed_hdiff = 1.0e30f, pre_seed_ldiff = 1.0e30f, pre_seed_cdiff = 1.0e30f;
     bool pre_zero_top = false, pre_seed_top = false;

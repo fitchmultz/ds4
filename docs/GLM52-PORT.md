@@ -408,9 +408,18 @@ The core GLM port is complete and verified. The active work is usability/speed:
   Current scratch checks pass on `asdfqwer` (`seq_top=batch_top=108714`, maxabs
   `6.63e-5`, or `0` with `DS4_GLM_VERIFY_BATCH_FAST_MOE=1`; fast-MoE continuation
   also matches `seq_next=batch_next=100461`, `cont_max_abs=0`) and
-  `The meaning of life is` (`seq_top=batch_top=264`, maxabs `3.96e-5`). No
-  batched-prefill flag is exposed yet; future prefill work still needs a guarded
-  live-state enablement path before it can be enabled.
+  `The meaning of life is` (`seq_top=batch_top=264`, maxabs `3.96e-5`).
+  `DS4_GLM_PREFILL_BATCH_LIVE=1` is now the guarded experimental live path for
+  short Metal prompts: it batch-prefills a fresh scratch ctx, copies KV/final
+  hidden/logits into the live ctx only after success, and falls back to sequential
+  prefill on failure. Real guarded-live smokes with `DS4_GLM_FAST=1
+  DS4_GLM_VERIFY_BATCH_FAST_MOE=1` match plain greedy ids/stdout: `asdfqwer -n 2`
+  stays `108714 100461` / `12345` while prefill drops `35.18s -> 12.31s`,
+  `The meaning of life is -n 2` stays `264 27066` / ` a profound` while prefill
+  drops `50.84s -> 14.59s`, and `asdfqwer --glm-nextn --glm-nextn-draft 1 -n 3`
+  still emits `108714 100461 21` / `123456` with `target_batches=1`. It is not
+  default and needs broader real-prompt validation before it can become production
+  behavior.
   LM head is only ~0.5–0.6s/token and is not the next target.
   A measured top-1-only verifier readback experiment was discarded: on
   `asdfqwer -n 2` the full-logit path reported lm-head ~0.462s while the
