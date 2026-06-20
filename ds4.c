@@ -29626,8 +29626,8 @@ static const float *glm_gen_metal_hnorm(void *ctx) {
  * committed target token + its post-output-norm hidden, propose up to `depth`
  * draft tokens into out[].  Production uses the recursive NextN chain; the
  * no-model synth harness injects a controllable mock to force full/partial/
- * miss cases.  The real-model path currently uses the CPU NextN drafter as a
- * correctness scaffold; the Metal NextN synth pins the Metal math separately. */
+ * miss cases.  The real-model path defaults to the Metal NextN drafter; the
+ * CPU drafter remains available as an A/B diagnostic fallback. */
 typedef bool (*glm_draft_chain_fn)(void *draft_ctx, int seed_token,
                                    const float *seed_hidden, int depth,
                                    int *out_drafts);
@@ -29695,9 +29695,11 @@ static int glm_spec_decode(const char *label,
         const float *seed_h = hnorm ? hnorm(ctx) : NULL;
         if (obs_generated) *obs_generated = generated;
         for (int j = 0; j < depth; j++) draft[j] = -1;
-        if (draft_fn && seed_h) {
+        const int remaining = n_predict - generated;
+        const int active_depth = remaining > 1 ? (remaining < depth ? remaining : depth) : 0;
+        if (active_depth > 0 && draft_fn && seed_h) {
             const double d0 = now_sec();
-            (void)draft_fn(draft_ctx, last_committed, seed_h, depth, draft);
+            (void)draft_fn(draft_ctx, last_committed, seed_h, active_depth, draft);
             draft_s += now_sec() - d0;
         }
 
@@ -29705,7 +29707,7 @@ static int glm_spec_decode(const char *label,
          * target greedy token, emitting + stepping the target on each accepted
          * token exactly as plain greedy would. */
         int acc = 0;
-        while (acc < depth && draft[acc] == next &&
+        while (acc < active_depth && draft[acc] == next &&
                generated < n_predict && next != eos_id) {
             if (gen_ids_out) gen_ids_out[generated] = next;
             if (out) {
@@ -29715,6 +29717,8 @@ static int glm_spec_decode(const char *label,
             }
             last_committed = next;
             generated++;
+            acc++;
+            if (generated >= n_predict) break;
             if (!step(ctx, next, pos, true, logits)) {
                 free(draft);
                 if (out_decode_s) *out_decode_s = now_sec() - dec0;
@@ -29723,7 +29727,6 @@ static int glm_spec_decode(const char *label,
             }
             pos++;
             next = sample_argmax(logits, vocab);
-            acc++;
         }
 
         /* Fallback: emit the authoritative target token.  Covers miss at
@@ -29740,6 +29743,7 @@ static int glm_spec_decode(const char *label,
             }
             last_committed = next;
             generated++;
+            if (generated >= n_predict) break;
             if (!step(ctx, next, pos, true, logits)) {
                 free(draft);
                 if (out_decode_s) *out_decode_s = now_sec() - dec0;
@@ -29750,8 +29754,10 @@ static int glm_spec_decode(const char *label,
             next = sample_argmax(logits, vocab);
         }
 
-        if (acc == 0) acc_miss++;
-        else if (acc < depth) acc_partial++;
+        if (active_depth == 0) {
+            /* Final token: no draft and no next-token target step needed. */
+        } else if (acc == 0) acc_miss++;
+        else if (acc < active_depth) acc_partial++;
         else acc_full++;
         if (obs_generated) *obs_generated = generated;
     }
@@ -29837,6 +29843,7 @@ static int glm_generate_loop(const char *label,
         free(piece);
         generated++;
         const int accepted = next;
+        if (generated >= n_predict) break;
         if (!step(ctx, accepted, pos, true, logits)) {
             if (out_decode_s) *out_decode_s = now_sec() - dec0;
             if (out_generated) *out_generated = generated;
