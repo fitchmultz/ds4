@@ -404,12 +404,13 @@ The core GLM port is complete and verified. The active work is usability/speed:
   zero-prefix and seeded-prefix synthetic prefill comparisons, and
   `DS4_GLM_PREFILL_BATCH_CHECK=1` is a safe real-model diagnostic that runs the
   batch helper in a scratch context after normal short Metal prefill and reports
-  final-logit top/max-diff without affecting output. Current scratch checks pass
-  on `asdfqwer` (`seq_top=batch_top=108714`, maxabs `6.63e-5`, or `0` with
-  `DS4_GLM_VERIFY_BATCH_FAST_MOE=1`) and `The meaning of life is`
-  (`seq_top=batch_top=264`, maxabs `3.96e-5`). No batched-prefill flag is
-  exposed yet; future prefill work still needs live-state mutation/continuation
-  proof before it can be enabled.
+  final-logit plus one-token-continuation top/max-diff without affecting output.
+  Current scratch checks pass on `asdfqwer` (`seq_top=batch_top=108714`, maxabs
+  `6.63e-5`, or `0` with `DS4_GLM_VERIFY_BATCH_FAST_MOE=1`; fast-MoE continuation
+  also matches `seq_next=batch_next=100461`, `cont_max_abs=0`) and
+  `The meaning of life is` (`seq_top=batch_top=264`, maxabs `3.96e-5`). No
+  batched-prefill flag is exposed yet; future prefill work still needs a guarded
+  live-state enablement path before it can be enabled.
   LM head is only ~0.5–0.6s/token and is not the next target.
   A measured top-1-only verifier readback experiment was discarded: on
   `asdfqwer -n 2` the full-logit path reported lm-head ~0.462s while the

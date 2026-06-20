@@ -30781,11 +30781,41 @@ static void glm_metal_prefill_batch_check(const char *label,
         const int seq_top = sample_argmax(seq_logits, vocab);
         const int batch_top = sample_argmax(last, vocab);
         const float max_abs = max_abs_diff(seq_logits, last, vocab);
+        bool cont_ok = false;
+        int seq_cont_top = -1, batch_cont_top = -1;
+        float cont_max_abs = 1.0e30f;
+        if (seq_top == batch_top && prompt_len < live->seq_n) {
+            glm_metal_fwd_ctx seq_cont;
+            memset(&seq_cont, 0, sizeof(seq_cont));
+            float *seq_next = xmalloc((size_t)vocab * sizeof(float));
+            float *batch_next = xmalloc((size_t)vocab * sizeof(float));
+            bool cok = glm_metal_fwd_init_ex(&seq_cont, live->m, live->shape,
+                                             live->n_layer, live->n_dense,
+                                             live->seq_n, false);
+            if (cok) (void)glm_metal_fwd_borrow_shared_experts(&seq_cont, live);
+            if (cok) cok = glm_metal_fwd_copy_kv(&seq_cont, live);
+            if (cok) {
+                memcpy(seq_cont.x, live->x, (size_t)live->H * sizeof(float));
+                memcpy(seq_cont.xn, live->xn, (size_t)live->H * sizeof(float));
+                cok = glm_metal_fwd_step(&seq_cont, seq_top, prompt_len, true, seq_next) &&
+                      glm_metal_fwd_step(&bat, batch_top, prompt_len, true, batch_next);
+            }
+            if (cok) {
+                seq_cont_top = sample_argmax(seq_next, vocab);
+                batch_cont_top = sample_argmax(batch_next, vocab);
+                cont_max_abs = max_abs_diff(seq_next, batch_next, vocab);
+                cont_ok = seq_cont_top == batch_cont_top;
+            }
+            free(batch_next);
+            free(seq_next);
+            if (seq_cont.m) glm_metal_fwd_free(&seq_cont);
+        }
         fprintf(stderr,
-                "ds4: %s: prefill batch check rows=%u ok=%s seq_top=%d batch_top=%d max_abs=%g time=%.3fs%s\n",
+                "ds4: %s: prefill batch check rows=%u ok=%s seq_top=%d batch_top=%d max_abs=%g cont_ok=%s seq_next=%d batch_next=%d cont_max_abs=%g time=%.3fs%s\n",
                 label ? label : "glm-generate", prompt_len,
                 seq_top == batch_top ? "yes" : "no", seq_top, batch_top,
-                (double)max_abs, elapsed,
+                (double)max_abs, cont_ok ? "yes" : "no",
+                seq_cont_top, batch_cont_top, (double)cont_max_abs, elapsed,
                 glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE") ? " fast-moe=on" : " fast-moe=off");
     } else {
         fprintf(stderr, "ds4: %s: prefill batch check failed rows=%u time=%.3fs\n",
