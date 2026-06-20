@@ -264,15 +264,12 @@ The core GLM port is complete and verified. The active work is usability/speed:
   same synthetic path with Metal leaf kernels and asserts full-logit agreement
   with the CPU synthetic oracle (current maxabs ~7.5e-9). These pin Phase 6
   control/tensor wiring in the default no-model test suite.
-- `DS4_GLM_NEXTN_PROBE=1` enables a non-mutating generation probe: after a
-  target token is accepted and the next target logits are already known, blk.78
+- `DS4_GLM_NEXTN_PROBE=1` remains as an older non-mutating diagnostic probe:
+  after a target token is accepted and the next target logits are known, blk.78
   drafts one token from `(accepted_token, target_hidden)` and compares it to the
-  next target argmax. `DS4_GLM_NEXTN_PROBE_LOG=1` prints per-step evidence. On
-  `DS4_GLM_FAST=1 --glm-raw -p asdfqwer -n 1`, output remains `123`; the probe
-  is finite and reports `0/1` hits (`draft=108714`, `target=100461`). This is
-  still diagnostic-only. Per SGLang NEXTN/EAGLE V2, production acceptance needs
-  draft KV extend/fill, recursive draft forward, and batched target verify before
-  committing accepted draft tokens.
+  next target argmax. `DS4_GLM_NEXTN_PROBE_LOG=1` prints per-step evidence. The
+  opt-in `--glm-nextn` scaffold below supersedes it for greedy-identical accept
+  plumbing and CSV tracing; keep the probe for quick A/B diagnostics only.
 - `--glm-nextn` + `--glm-nextn-draft N` is the opt-in, default-off,
   Metal-target-only NextN speculative greedy scaffold for `--glm-raw`/`--glm-chat`.
   `blk.78` drafts up to N tokens (capped at 4, default 4) from
