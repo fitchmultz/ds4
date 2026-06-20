@@ -27886,11 +27886,12 @@ static bool glm_nextn_draft_cpu(const ds4_model *m,
  * probe; the CPU drafter is diagnostic-grade (CPU-vs-Metal NextN already
  * match tightly) and is deliberately decoupled from the target backend.
  * Returns true if all `depth` drafts were produced; writes drafts to out[]. */
-static bool glm_nextn_draft_chain_cpu(const ds4_model *m,
-                                      const glm_cpu_shape *shape,
-                                      int seed_token, const float *seed_h,
-                                      int depth, uint32_t vocab,
-                                      int *out_drafts /*[depth]*/) {
+static bool glm_nextn_draft_chain_cpu_layer(const ds4_model *m,
+                                            const glm_cpu_shape *shape,
+                                            uint32_t il,
+                                            int seed_token, const float *seed_h,
+                                            int depth, uint32_t vocab,
+                                            int *out_drafts /*[depth]*/) {
     if (!m || !shape || !seed_h || !out_drafts || depth <= 0) return false;
     if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
     const uint32_t H = shape->hidden;
@@ -27902,8 +27903,8 @@ static bool glm_nextn_draft_chain_cpu(const ds4_model *m,
     int tok = seed_token;
     bool ok = true;
     for (int j = 0; j < depth; j++) {
-        if (!glm_nextn_eh_project_cpu(m, shape, tok, cur_h, eh) ||
-            !glm_nextn_decoder_cpu(m, shape, eh, nh) ||
+        if (!glm_nextn_eh_project_cpu_layer(m, shape, il, tok, cur_h, eh) ||
+            !glm_nextn_decoder_cpu_layer(m, shape, il, eh, nh) ||
             !glm_nextn_logits_cpu(m, shape, nh, logits, vocab)) {
             ok = false;
             break;
@@ -27918,6 +27919,15 @@ static bool glm_nextn_draft_chain_cpu(const ds4_model *m,
     }
     free(logits); free(cur_h); free(nh); free(eh);
     return ok;
+}
+
+static bool glm_nextn_draft_chain_cpu(const ds4_model *m,
+                                      const glm_cpu_shape *shape,
+                                      int seed_token, const float *seed_h,
+                                      int depth, uint32_t vocab,
+                                      int *out_drafts /*[depth]*/) {
+    return glm_nextn_draft_chain_cpu_layer(m, shape, 78, seed_token, seed_h,
+                                           depth, vocab, out_drafts);
 }
 
 static void glm_nextn_run_diagnostic(const char *label,
@@ -28607,6 +28617,54 @@ done:
     return ok;
 }
 
+static bool glm_nextn_draft_chain_metal_layer(const ds4_model *m,
+                                              const glm_cpu_shape *shape,
+                                              uint32_t il,
+                                              int seed_token, const float *seed_h,
+                                              int depth, uint32_t vocab,
+                                              int *out_drafts /*[depth]*/) {
+    if (!m || !shape || !seed_h || !out_drafts || depth <= 0) return false;
+    if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
+    const uint32_t H = shape->hidden;
+    const uint32_t chunk_rows = vocab < 8192u ? vocab : 8192u;
+    float *eh = xmalloc((size_t)H * sizeof(float));
+    float *nh = xmalloc((size_t)H * sizeof(float));
+    float *cur_h = xmalloc((size_t)H * sizeof(float));
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
+    float *chunk_w = xmalloc((size_t)chunk_rows * H * sizeof(float));
+    float *chunk_logits = xmalloc((size_t)chunk_rows * sizeof(float));
+    memcpy(cur_h, seed_h, (size_t)H * sizeof(float));
+    int tok = seed_token;
+    bool ok = true;
+    for (int j = 0; j < depth; j++) {
+        if (!glm_nextn_eh_project_metal_layer(m, shape, il, tok, cur_h, eh) ||
+            !glm_nextn_decoder_metal_layer(m, shape, il, eh, nh) ||
+            !glm_nextn_logits_metal(m, shape, nh, logits, vocab,
+                                    chunk_w, chunk_logits, chunk_rows)) {
+            ok = false;
+            break;
+        }
+        int arg = 0;
+        float top = logits[0];
+        for (uint32_t v = 1; v < vocab; v++)
+            if (logits[v] > top) { top = logits[v]; arg = (int)v; }
+        out_drafts[j] = arg;
+        tok = arg;
+        memcpy(cur_h, nh, (size_t)H * sizeof(float));
+    }
+    free(chunk_logits); free(chunk_w); free(logits); free(cur_h); free(nh); free(eh);
+    return ok;
+}
+
+static bool glm_nextn_draft_chain_metal(const ds4_model *m,
+                                        const glm_cpu_shape *shape,
+                                        int seed_token, const float *seed_h,
+                                        int depth, uint32_t vocab,
+                                        int *out_drafts /*[depth]*/) {
+    return glm_nextn_draft_chain_metal_layer(m, shape, 78, seed_token, seed_h,
+                                             depth, vocab, out_drafts);
+}
+
 /* Core Metal forward.  Same tensor binding/dequant/KV-cache growth as
  * glm_cpu_forward; the validated kernels replace the leaf math.  Returns true
  * on success.  seq_n = n_tokens (the caches are sized to the prompt length). */
@@ -29292,7 +29350,19 @@ int ds4_glm_nextn_metal_synth(int *out_token, float *out_top_logit, bool *out_fi
         const float d = fabsf(logits[v] - cpu_logits[v]);
         if (d > maxabs) maxabs = d;
     }
-    const bool ok = metal_ok && cpu_ok && maxabs < 1e-5f;
+    int metal_chain[DS4_GLM_NEXTN_MAX_DEPTH];
+    int cpu_chain[DS4_GLM_NEXTN_MAX_DEPTH];
+    const bool metal_chain_ok = glm_nextn_draft_chain_metal_layer(
+        &c.model, &c.shape, il, accepted, target_h, DS4_GLM_NEXTN_MAX_DEPTH,
+        c.vocab, metal_chain);
+    const bool cpu_chain_ok = glm_nextn_draft_chain_cpu_layer(
+        &c.model, &c.shape, il, accepted, target_h, DS4_GLM_NEXTN_MAX_DEPTH,
+        c.vocab, cpu_chain);
+    bool chain_match = metal_chain_ok && cpu_chain_ok;
+    for (int i = 0; chain_match && i < DS4_GLM_NEXTN_MAX_DEPTH; i++)
+        if (metal_chain[i] != cpu_chain[i]) chain_match = false;
+
+    const bool ok = metal_ok && cpu_ok && maxabs < 1e-5f && chain_match;
     int argmax = 0;
     float top = metal_ok ? logits[0] : 0.0f;
     bool finite = metal_ok && isfinite(logits[0]);
@@ -29303,8 +29373,9 @@ int ds4_glm_nextn_metal_synth(int *out_token, float *out_top_logit, bool *out_fi
     if (out_token) *out_token = argmax;
     if (out_top_logit) *out_top_logit = top;
     if (out_finite) *out_finite = finite;
-    fprintf(stderr, "  glm-nextn-metal-synth: token=%d top_logit=%.6f finite=%s maxabs_vs_cpu=%.3g (blk.%u)\n",
-            argmax, (double)top, finite ? "yes" : "no", (double)maxabs, il);
+    fprintf(stderr, "  glm-nextn-metal-synth: token=%d top_logit=%.6f finite=%s maxabs_vs_cpu=%.3g chain_match=%s (blk.%u)\n",
+            argmax, (double)top, finite ? "yes" : "no", (double)maxabs,
+            chain_match ? "yes" : "no", il);
     free(chunk_logits); free(chunk_w);
     free(cpu_logits); free(cpu_nh); free(cpu_eh);
     free(logits); free(nh); free(eh); free(target_h);
@@ -29567,18 +29638,29 @@ typedef struct {
     uint32_t vocab;
 } glm_nextn_draft_state;
 
-static bool glm_nextn_draft_chain_thunk(void *vc, int seed_token,
-                                        const float *seed_hidden, int depth,
-                                        int *out_drafts) {
+static bool glm_nextn_draft_chain_cpu_thunk(void *vc, int seed_token,
+                                            const float *seed_hidden, int depth,
+                                            int *out_drafts) {
     glm_nextn_draft_state *s = (glm_nextn_draft_state *)vc;
     return glm_nextn_draft_chain_cpu(s->m, s->shape, seed_token, seed_hidden,
                                      depth, s->vocab, out_drafts);
 }
 
-/* Opt-in GLM NextN speculative decode (Commit 2).  Correctness-first, NOT a
- * speed claim: verification reuses the existing single-token target step, and
- * the current real-model drafter is CPU-side. Every emitted token is the
- * authoritative target argmax verified against the real target. The draft chain never enters the target KV cache, so there is
+#ifndef DS4_NO_GPU
+static bool glm_nextn_draft_chain_metal_thunk(void *vc, int seed_token,
+                                              const float *seed_hidden, int depth,
+                                              int *out_drafts) {
+    glm_nextn_draft_state *s = (glm_nextn_draft_state *)vc;
+    return glm_nextn_draft_chain_metal(s->m, s->shape, seed_token, seed_hidden,
+                                       depth, s->vocab, out_drafts);
+}
+#endif
+
+/* Opt-in GLM NextN speculative decode. Correctness-first, NOT a
+ * speed claim: verification reuses the existing single-token target step; the
+ * real-model drafter defaults to Metal with a CPU A/B fallback. Every emitted
+ * token is the authoritative target argmax verified against the real target.
+ * The draft chain never enters the target KV cache, so there is
  * NO target-cache rollback: a rejected draft tail is simply discarded.  The
  * emitted sequence is therefore byte-for-byte identical to plain greedy GLM
  * generation regardless of draft agreement.  If obs_generated is non-NULL it is
@@ -29715,11 +29797,24 @@ static int glm_generate_loop(const char *label,
      * the draft never touches the target KV cache. */
     if (spec_enabled) {
         glm_nextn_draft_state ds = { &e->model, shape, vocab };
+        glm_draft_chain_fn draft_fn = glm_nextn_draft_chain_cpu_thunk;
+        const char *draft_backend = "cpu";
+#ifndef DS4_NO_GPU
+        const char *draft_env = getenv("DS4_GLM_NEXTN_DRAFT_BACKEND");
+        if (!draft_env || !draft_env[0] || strcmp(draft_env, "metal") == 0) {
+            draft_fn = glm_nextn_draft_chain_metal_thunk;
+            draft_backend = "metal";
+        } else if (strcmp(draft_env, "cpu") != 0) {
+            fprintf(stderr, "ds4: %s: unknown DS4_GLM_NEXTN_DRAFT_BACKEND=%s; using cpu\n",
+                    label ? label : "glm-generate", draft_env);
+        }
+#endif
+        fprintf(stderr, "ds4: %s: nextn draft backend=%s\n",
+                label ? label : "glm-generate", draft_backend);
         int rc = glm_spec_decode(label, step, hnorm, ctx, prompt, prompt_len,
                                  n_predict, logits, vocab, e, eos_id, out,
                                  out_generated, gen_ids_out, out_decode_s,
-                                 spec_depth, glm_nextn_draft_chain_thunk, &ds,
-                                 NULL);
+                                 spec_depth, draft_fn, &ds, NULL);
         fprintf(stderr, "ds4: %s: prefill %.2fs (%u tok)\n",
                 label ? label : "glm-generate", prefill_s, prompt_len);
         return rc;
