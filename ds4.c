@@ -29217,7 +29217,8 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
         if (ok && predequant_shared_experts) {
             const char *dqk = getenv("DS4_GLM_MLA_DIRECT_OUT_QK");
             c->direct_out_qk = dqk ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_OUT_QK") : true;
-            c->direct_qb_q8 = glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_QB_Q8");
+            const char *dqb = getenv("DS4_GLM_MLA_DIRECT_QB_Q8");
+            c->direct_qb_q8 = dqb ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_QB_Q8") : true;
         }
         if (ok) {
             const bool shexp_resident = predequant_shared_experts &&

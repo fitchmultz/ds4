@@ -389,28 +389,30 @@ The core GLM port is complete and verified. The active work is usability/speed:
   and MLA avg/call `0.0514s -> 0.0322s`. Direct QK supersedes the host-F32
   `attn_output` cache when both env flags are set. `./ds4_test --glm-qk-direct`
   covers the Q5_K/Q6_K kernels against tiny dequant oracle fixtures; it now also
-  covers the flat direct Q8_0 helper. `DS4_GLM_MLA_DIRECT_QB_Q8=1` is an opt-in
-  follow-up for `attn_q_b`: isolated real-tensor benchmark measured `blk.0.attn_q_b`
-  direct Q8_0 `0.0033s`/call versus cached F32 `0.0108s`, and a profiled
-  real `asdfqwer -n 3` run preserved ids/stdout while improving decode
-  `16.36s -> 13.17s` and MLA avg/call `0.0370s -> 0.0275s`; no-profile
-  `asdfqwer -n 5` was a smaller but positive `32.18s -> 31.13s`, so keep it
-  opt-in until a broader prompt sweep justifies defaulting. Rejected
+  covers the flat direct Q8_0 helper. Direct Q8_0 `attn_q_b` is also defaulted
+  inside `DS4_GLM_FAST=1` (`DS4_GLM_MLA_DIRECT_QB_Q8=0/off` opt-out): isolated
+  real-tensor benchmarks measured `blk.{0,8,32,77}.attn_q_b` direct Q8_0 at
+  about `0.0030s`/call versus cached F32 about `0.0104s`, and a prompt sweep
+  preserved ids/stdout while improving no-profile `-n 3` decode from about
+  `14.9-15.5s` to `12.1-12.6s`; no-profile `asdfqwer -n 5` was a smaller but
+  positive `32.18s -> 31.13s`. Rejected
   broader direct-MLA probe: direct `attn_q_a` alone benchmarks faster
   (`0.0011s` direct vs `0.0048s` cached F32 on `blk.0`), but trying to route
   Q8_0 `attn_q_b`/`attn_kv_a_mqa`/`attn_v_b` through the existing tensor-map
   Q8 helper made real decode much slower (`14.89s -> 68.16s` for profiled
   `asdfqwer -n 3`), so do not wire that path without a separate Q8 benchmark win.
-  After direct `attn_output` became the `DS4_GLM_FAST=1` default, a fresh
-  no-profile accepted-round run on `asdfqwer -n 3` measured plain greedy decode
-  `16.34s` and opt-in `--glm-nextn --glm-nextn-draft 1` with
-  `DS4_GLM_VERIFY_BATCH_F32=1 DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at decode
-  `13.82s`, with identical ids/stdout and `target_steps=2,target_batches=1`;
-  this is a narrow accepted-round opt-in measurement, not a default production
-  speed claim. A second prompt, `The meaning of life is -n 3`, kept identical
-  ids/stdout (`264 27066 323`, ` a profound and`) but missed the draft
-  (`target_steps=2,target_batches=2`) and measured NextN decode `21.45s` vs
-  plain greedy `16.23s`, confirming acceptance rate still gates speed. A naive adaptive miss-budget probe was rejected for now:
+  After direct `attn_output` and direct Q8_0 `attn_q_b` became
+  `DS4_GLM_FAST=1` defaults, a fresh no-profile accepted-round run on
+  `asdfqwer -n 3` measured plain greedy decode `12.77s` and opt-in
+  `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1
+  DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at decode `13.99s`, with identical
+  ids/stdout and `target_steps=2,target_batches=1`; the accepted round is no
+  longer a speed win after the plain path improvement, so NextN stays
+  correctness-first only. A second prompt, `The meaning of life is -n 3`, kept
+  identical ids/stdout (`264 27066 323`, ` a profound and`) but missed the draft
+  (`target_steps=2,target_batches=2`) and measured NextN decode `20.94s` vs
+  plain greedy about `12.46s`, confirming verifier cost and acceptance rate still
+  gate speed. A naive adaptive miss-budget probe was rejected for now:
   on `The meaning of life is -n 5`, disabling drafts after the first miss kept
   ids/stdout but slowed decode to `44.92s` versus `36.24s` with normal NextN,
   because the next round would have accepted. Default remains the pure F32 proof path,
