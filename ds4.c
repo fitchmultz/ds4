@@ -27648,16 +27648,17 @@ static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
  * This is a CPU diagnostic/prerequisite, not a generation path yet.  It avoids
  * materializing the full 302 MiB eh_proj as F32 by dequanting one output row at
  * a time into a bounded scratch row. */
-static bool glm_nextn_eh_project_cpu(const ds4_model *m,
-                                     const glm_cpu_shape *shape,
-                                     int accepted_token,
-                                     const float *target_h,
-                                     float *out) {
+static bool glm_nextn_eh_project_cpu_layer(const ds4_model *m,
+                                           const glm_cpu_shape *shape,
+                                           uint32_t il,
+                                           int accepted_token,
+                                           const float *target_h,
+                                           float *out) {
     const uint32_t H = shape->hidden;
     const ds4_tensor *t_embd = model_find_tensor(m, "token_embd.weight");
-    const ds4_tensor *t_enorm = glm_layer_tensor(m, 78, "nextn.enorm");
-    const ds4_tensor *t_hnorm = glm_layer_tensor(m, 78, "nextn.hnorm");
-    const ds4_tensor *t_eh = glm_layer_tensor(m, 78, "nextn.eh_proj");
+    const ds4_tensor *t_enorm = glm_layer_tensor(m, il, "nextn.enorm");
+    const ds4_tensor *t_hnorm = glm_layer_tensor(m, il, "nextn.hnorm");
+    const ds4_tensor *t_eh = glm_layer_tensor(m, il, "nextn.eh_proj");
     if (!t_embd || !t_enorm || !t_hnorm || !t_eh) return false;
     if (t_eh->dim[0] != (uint64_t)2 * H || t_eh->dim[1] != H) return false;
 
@@ -27680,16 +27681,22 @@ static bool glm_nextn_eh_project_cpu(const ds4_model *m,
     return true;
 }
 
-/* Run blk.78 as a one-token NextN decoder over the eh_proj seed and return the
- * post-`nextn.shared_head_norm` hidden vector.  This validates the complete
- * blk.78 tensor layout and CPU dequant path (Q5_K/Q8_0 attention, Q2_K gate/up,
- * Q3_K down, Q5_K/Q6_K shared expert) without yet implementing speculative
- * cache/accept semantics. */
-static bool glm_nextn_decoder_cpu(const ds4_model *m,
-                                  const glm_cpu_shape *shape,
-                                  const float *seed,
-                                  float *head_norm_out) {
-    const uint32_t il = 78;
+static bool glm_nextn_eh_project_cpu(const ds4_model *m,
+                                     const glm_cpu_shape *shape,
+                                     int accepted_token,
+                                     const float *target_h,
+                                     float *out) {
+    return glm_nextn_eh_project_cpu_layer(m, shape, 78, accepted_token, target_h, out);
+}
+
+/* Run one NextN decoder layer over the eh_proj seed and return the
+ * post-`nextn.shared_head_norm` hidden vector.  The real model uses blk.78;
+ * the tiny no-model regression uses the same code on a synthetic blk.4. */
+static bool glm_nextn_decoder_cpu_layer(const ds4_model *m,
+                                        const glm_cpu_shape *shape,
+                                        uint32_t il,
+                                        const float *seed,
+                                        float *head_norm_out) {
     const uint32_t H = shape->hidden, nh = shape->n_head, ql = shape->q_lora;
     const uint32_t kvl = shape->kv_lora, nope = shape->qk_nope, rope = shape->qk_rope;
     const uint32_t vd = shape->v_dim, E = shape->n_expert, K = shape->n_expert_used;
@@ -27802,6 +27809,13 @@ done:
     free(Wo); free(WvB); free(WkB); free(WkBn); free(WkvA); free(WqB); free(WqA);
     free(etmp); free(ffn_out); free(mla_out); free(res); free(xn); free(x);
     return ok;
+}
+
+static bool glm_nextn_decoder_cpu(const ds4_model *m,
+                                  const glm_cpu_shape *shape,
+                                  const float *seed,
+                                  float *head_norm_out) {
+    return glm_nextn_decoder_cpu_layer(m, shape, 78, seed, head_norm_out);
 }
 
 static bool glm_nextn_logits_cpu(const ds4_model *m,
@@ -29084,7 +29098,8 @@ static void glm_synth_build(glm_synth_ctx *c) {
     SYNTH_ADD("token_embd.weight", H, vocab);
     SYNTH_ADD("output_norm.weight", H);
     SYNTH_ADD("output.weight", H, vocab);
-    for (uint32_t il = 0; il < n_layer; il++) {
+    for (uint32_t il = 0; il <= n_layer; il++) {
+        const bool nextn_block = il == n_layer;
         char nm[96];
         snprintf(nm, sizeof(nm), "blk.%u.attn_norm.weight", il);        SYNTH_ADD(nm, H);
         snprintf(nm, sizeof(nm), "blk.%u.attn_q_a.weight", il);         SYNTH_ADD(nm, H, ql);
@@ -29096,7 +29111,7 @@ static void glm_synth_build(glm_synth_ctx *c) {
         snprintf(nm, sizeof(nm), "blk.%u.attn_v_b.weight", il);         SYNTH_ADD(nm, kvl, vd, nh);
         snprintf(nm, sizeof(nm), "blk.%u.attn_output.weight", il);      SYNTH_ADD(nm, nh * vd, H);
         snprintf(nm, sizeof(nm), "blk.%u.ffn_norm.weight", il);         SYNTH_ADD(nm, H);
-        if (il < n_dense) {
+        if (!nextn_block && il < n_dense) {
             snprintf(nm, sizeof(nm), "blk.%u.ffn_gate.weight", il);     SYNTH_ADD(nm, H, dense_inter);
             snprintf(nm, sizeof(nm), "blk.%u.ffn_up.weight", il);       SYNTH_ADD(nm, H, dense_inter);
             snprintf(nm, sizeof(nm), "blk.%u.ffn_down.weight", il);     SYNTH_ADD(nm, dense_inter, H);
@@ -29109,6 +29124,12 @@ static void glm_synth_build(glm_synth_ctx *c) {
             snprintf(nm, sizeof(nm), "blk.%u.ffn_gate_shexp.weight", il);SYNTH_ADD(nm, H, expert_inter);
             snprintf(nm, sizeof(nm), "blk.%u.ffn_up_shexp.weight", il); SYNTH_ADD(nm, H, expert_inter);
             snprintf(nm, sizeof(nm), "blk.%u.ffn_down_shexp.weight", il);SYNTH_ADD(nm, expert_inter, H);
+        }
+        if (nextn_block) {
+            snprintf(nm, sizeof(nm), "blk.%u.nextn.enorm.weight", il);  SYNTH_ADD(nm, H);
+            snprintf(nm, sizeof(nm), "blk.%u.nextn.hnorm.weight", il);  SYNTH_ADD(nm, H);
+            snprintf(nm, sizeof(nm), "blk.%u.nextn.eh_proj.weight", il);SYNTH_ADD(nm, 2 * H, H);
+            snprintf(nm, sizeof(nm), "blk.%u.nextn.shared_head_norm.weight", il); SYNTH_ADD(nm, H);
         }
     }
 #undef SYNTH_ADD
@@ -29164,6 +29185,40 @@ int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit, bool *out_fi
     free(logits);
     glm_synth_free(&c);
     return finite ? 0 : 1;
+}
+
+int ds4_glm_nextn_synth(int *out_token, float *out_top_logit, bool *out_finite) {
+    glm_synth_ctx c;
+    glm_synth_build(&c);
+    const uint32_t H = c.shape.hidden;
+    const uint32_t il = c.n_layer;  /* synthetic NextN block follows backbone */
+    const int accepted = 7;
+    float *target_h = xmalloc((size_t)H * sizeof(float));
+    float *eh = xmalloc((size_t)H * sizeof(float));
+    float *nh = xmalloc((size_t)H * sizeof(float));
+    float *logits = xmalloc((size_t)c.vocab * sizeof(float));
+    for (uint32_t i = 0; i < H; i++) target_h[i] = 0.01f * (float)((int)i - 7);
+
+    const bool ok =
+        glm_nextn_eh_project_cpu_layer(&c.model, &c.shape, il, accepted, target_h, eh) &&
+        glm_nextn_decoder_cpu_layer(&c.model, &c.shape, il, eh, nh) &&
+        glm_nextn_logits_cpu(&c.model, &c.shape, nh, logits, c.vocab);
+    int argmax = 0;
+    float top = ok ? logits[0] : 0.0f;
+    bool finite = ok && isfinite(logits[0]);
+    for (uint32_t v = 1; ok && v < c.vocab; v++) {
+        if (!isfinite(logits[v])) finite = false;
+        if (logits[v] > top) { top = logits[v]; argmax = (int)v; }
+    }
+    if (out_token) *out_token = argmax;
+    if (out_top_logit) *out_top_logit = top;
+    if (out_finite) *out_finite = finite;
+    fprintf(stderr, "  glm-nextn-synth: token=%d top_logit=%.6f finite=%s (blk.%u)\n",
+            argmax, (double)top, finite ? "yes" : "no", il);
+
+    free(logits); free(nh); free(eh); free(target_h);
+    glm_synth_free(&c);
+    return ok && finite ? 0 : 1;
 }
 
 

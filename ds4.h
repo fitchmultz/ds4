@@ -369,6 +369,13 @@ uint32_t glm_layer_bind(const void *engine_or_model, uint32_t layer_idx,
 int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit,
                               bool *out_finite);
 
+/* Tiny synthetic self-check for Phase 6 NextN/MTP wiring (no model needed).
+ * Builds a small backbone plus one NextN block, runs the same eh_proj ->
+ * decoder -> shared_head_norm -> LM-head path as the real blk.78 diagnostic,
+ * and reports a finite greedy token. */
+int ds4_glm_nextn_synth(int *out_token, float *out_top_logit,
+                        bool *out_finite);
+
 /* CLI driver: tokenize `prompt` with the loaded GLM vocab, run the full CPU
  * reference forward, and print the greedy token id + top logit + finiteness.
  * Returns 0 on success.  Slow (reference path). */

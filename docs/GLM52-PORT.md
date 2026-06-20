@@ -4,7 +4,7 @@ Status: **CORE PORT COMPLETE & WORKING; FAST PATH IN PROGRESS.** GLM-5.2 runs lo
 
 VERIFIED DONE: P0 scaffolding; P1 loader/split-GGUF/metadata/tensor-inventory (1809/1809); P2 glm4 BPE+chat (oracle); P3 SSD cache-plan (8359 experts); P4b all 10 quant dequant types bit-exact vs llama.cpp, including blk.78 NextN-only Q2_K/Q3_K and the IQ2_S full-tensor bugfix; P4a/P4a-full CPU forward (oracle-validated); P4c-i/ii Metal kernels (31/31); P4c-iv Metal forward (corr 1.0 vs CPU); P4e incremental-KV chat generation; routed MoE fast path (IQ2_XXS gate/up + IQ3_XXS/IQ4_XS down + resident shared expert) with decode improving from ~27s/token to ~9–12s/token on warm runs; env-gated selected-expert SSD pread staging (`DS4_GLM_EXPERT_PREAD=1`) validated on the real model. DeepSeek path byte-identical at every commit; full ds4_test green.
 
-REMAINING (usability/speed, not correctness): batched/persistent GLM graph or speculation to avoid one full model pass per token; smarter prefetch/concurrency tuning on top of the explicit selected-expert pread and opt-in LRU slab cache; MLA still uses the F32 materialization path on UD_IQ2_M because q_a/attn_output are Q5_K/Q6_K and tested one-off Q5/Q6/Q8 wrappers were slower; DSA sparse indexer (deferred — dense MLA matches llama.cpp); NextN/MTP blk.78 (loaded, Q2_K/Q3_K dequant covered, post-output-norm target hidden dump exposed by `DS4_GLM_H_NEXTN_OUT`, `nextn.eh_proj` CPU seed diagnostic exposed by `DS4_GLM_NEXTN_EH_OUT`, one-token blk.78 decoder diagnostic exposed by `DS4_GLM_NEXTN_H_OUT`/`DS4_GLM_NEXTN_LOGITS_OUT` and validated when fed by either CPU or Metal target hidden, non-mutating one-draft acceptance probe exposed by `DS4_GLM_NEXTN_PROBE=1`, full speculative cache/accept loop still unwired).
+REMAINING (usability/speed, not correctness): batched/persistent GLM graph or speculation to avoid one full model pass per token; smarter prefetch/concurrency tuning on top of the explicit selected-expert pread and opt-in LRU slab cache; MLA still uses the F32 materialization path on UD_IQ2_M because q_a/attn_output are Q5_K/Q6_K and tested one-off Q5/Q6/Q8 wrappers were slower; DSA sparse indexer (deferred — dense MLA matches llama.cpp); NextN/MTP blk.78 (loaded, Q2_K/Q3_K dequant covered, post-output-norm target hidden dump exposed by `DS4_GLM_H_NEXTN_OUT`, `nextn.eh_proj` CPU seed diagnostic exposed by `DS4_GLM_NEXTN_EH_OUT`, one-token blk.78 decoder diagnostic exposed by `DS4_GLM_NEXTN_H_OUT`/`DS4_GLM_NEXTN_LOGITS_OUT` and validated when fed by either CPU or Metal target hidden, no-model synthetic regression `--glm-nextn-synth`, non-mutating one-draft acceptance probe exposed by `DS4_GLM_NEXTN_PROBE=1`, full speculative cache/accept loop still unwired).
 Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
@@ -260,6 +260,10 @@ The core GLM port is complete and verified. The active work is usability/speed:
   the real blk.78 attention + MoE tensor layout and Q2_K/Q3_K path, producing
   finite logits with diagnostic top token 2. CPU-fed vs Metal-fed diagnostic
   outputs match tightly (hidden maxabs ~8.2e-6; logits maxabs ~2.7e-5).
+- `ds4_test --glm-nextn-synth` builds a tiny in-memory backbone plus one NextN
+  block and runs the same `eh_proj -> decoder -> shared_head_norm -> LM-head`
+  path without the 238 GiB model. This pins Phase 6 control/tensor wiring in the
+  default no-model test suite.
 - `DS4_GLM_NEXTN_PROBE=1` enables a non-mutating generation probe: after a
   target token is accepted and the next target logits are already known, blk.78
   drafts one token from `(accepted_token, target_hidden)` and compares it to the

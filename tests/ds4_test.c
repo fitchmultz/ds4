@@ -2871,6 +2871,17 @@ static void test_glm_cpu_forward_synth(void) {
             token, (double)top, finite ? "yes" : "no");
 }
 
+static void test_glm_nextn_synth(void) {
+    int token = -1; float top = 0.0f; bool finite = false;
+    int rc = ds4_glm_nextn_synth(&token, &top, &finite);
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(finite);
+    TEST_ASSERT(token == 13);
+    TEST_ASSERT(fabsf(top - 0.031084f) < 1e-5f);
+    fprintf(stderr, "  glm-nextn-synth: PASS (token=%d top=%.6f finite=%s)\n",
+            token, (double)top, finite ? "yes" : "no");
+}
+
 /* Phase 4c-iv: the full Metal forward assembly (glm_metal_forward) on the same
  * tiny synthetic model as the CPU synth.  Proves the end-to-end Metal path
  * (per-layer dequant -> GPU kernels -> GPU KV cache -> MLA/dense/MoE dispatch
@@ -3308,6 +3319,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-quant-dequant", "glm-quant-dequant", "GLM-5.2 K-quant CPU dequant vs llama.cpp oracle", test_glm_quant_dequant},
     {"--glm-cpu-ref-components", "glm-cpu-ref-components", "GLM-5.2 CPU reference components (RoPE/MLA/dense-FFN/MoE) vs numpy oracle", test_glm_cpu_ref_components},
     {"--glm-cpu-forward-synth", "glm-cpu-forward-synth", "GLM-5.2 full CPU forward assembly on a tiny synthetic model (no model needed)", test_glm_cpu_forward_synth},
+    {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
