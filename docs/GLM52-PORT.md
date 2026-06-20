@@ -337,10 +337,13 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `target_batches` for accepted rounds. `--glm-metal-target-batch-synth` proves a
   full F32 layer-major Metal target batch (attention/MLA, dense FFN, routed MoE,
   output norm, LM head) matches sequential Metal target rows on the tiny
-  synthetic GLM model and leaves KV cache state usable for the next decode row.
+  synthetic GLM model and leaves KV cache state usable for the next decode row;
+  the F32 routed/shared MoE verifier branch now batches expert projections over
+  rows by route rank/unique expert instead of calling the per-row SwiGLU helper.
   A real `asdfqwer -n 3` smoke with `DS4_GLM_VERIFY_BATCH_F32=1` keeps the known
   ids `108714 100461 21` / stdout `123456` and shows `target_steps=2,
-  target_batches=1` with `batch_f32 calls=1 fallbacks=0`,
+  target_batches=1` with `batch_f32 calls=1 fallbacks=0` (still correctness-first,
+  not a speed claim),
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and
