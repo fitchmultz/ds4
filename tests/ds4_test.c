@@ -3603,6 +3603,100 @@ static void test_glm_metal_components(void) {
             glm_metal_cmp("FFN batch2 dense composite", bmff, bcff,
                           (size_t)batch_n * H, tol_abs, tol_rel);
 
+            /* Batch-2 routed MoE FFN composite: batch router logits -> batch
+             * route -> per-expert batch gate/up/SwiGLU/down -> shared expert.
+             * This is a small F32 layer-major oracle for the future real
+             * verifier/prefill MoE batch, independent of quantized staging. */
+            if (gate && bias) {
+                float *egate = malloc((size_t)E * ff * H * sizeof(float));
+                float *eup = malloc((size_t)E * ff * H * sizeof(float));
+                float *edown = malloc((size_t)E * H * ff * sizeof(float));
+                float *mlog_b = malloc((size_t)batch_n * E * sizeof(float));
+                int *cidx_b = malloc((size_t)batch_n * K * sizeof(int));
+                int *midx_b = malloc((size_t)batch_n * K * sizeof(int));
+                float *cw_b = malloc((size_t)batch_n * K * sizeof(float));
+                float *mw_b = malloc((size_t)batch_n * K * sizeof(float));
+                float *scratch_b = malloc((size_t)E * sizeof(float));
+                float *cmoe = malloc((size_t)batch_n * H * sizeof(float));
+                float *mmoe = malloc((size_t)batch_n * H * sizeof(float));
+                float *cpg = malloc((size_t)batch_n * ff * sizeof(float));
+                float *mpg = malloc((size_t)batch_n * ff * sizeof(float));
+                float *cpu = malloc((size_t)batch_n * ff * sizeof(float));
+                float *mpu = malloc((size_t)batch_n * ff * sizeof(float));
+                float *cpa = malloc((size_t)batch_n * ff * sizeof(float));
+                float *mpa = malloc((size_t)batch_n * ff * sizeof(float));
+                float *cout_e = malloc((size_t)batch_n * H * sizeof(float));
+                float *mout_e = malloc((size_t)batch_n * H * sizeof(float));
+                TEST_ASSERT(egate && eup && edown && mlog_b && cidx_b && midx_b &&
+                            cw_b && mw_b && scratch_b && cmoe && mmoe && cpg && mpg &&
+                            cpu && mpu && cpa && mpa && cout_e && mout_e);
+
+                for (uint32_t e = 0; e < E; e++) {
+                    const float gf = 1.0f + 0.010f * (float)(e + 1u);
+                    const float uf = 1.0f - 0.006f * (float)(e + 1u);
+                    const float df = 1.0f + 0.004f * (float)(e + 1u);
+                    for (uint32_t r = 0; r < ff; r++) {
+                        for (uint32_t c = 0; c < H; c++) {
+                            const float wiggle = (float)((e + r + c) % 5u) - 2.0f;
+                            egate[((size_t)e * ff + r) * H + c] = ff_gate[(size_t)r * H + c] * gf + 0.0007f * wiggle;
+                            eup[((size_t)e * ff + r) * H + c] = ff_up[(size_t)r * H + c] * uf - 0.0005f * wiggle;
+                        }
+                    }
+                    for (uint32_t r = 0; r < H; r++) {
+                        for (uint32_t c = 0; c < ff; c++) {
+                            const float wiggle = (float)((e + r + c) % 7u) - 3.0f;
+                            edown[((size_t)e * H + r) * ff + c] = ff_down[(size_t)r * ff + c] * df + 0.0004f * wiggle;
+                        }
+                    }
+                }
+
+                for (uint32_t t = 0; t < batch_n; t++) {
+                    glm_moe_route_sigmoid(cidx_b + (size_t)t * K,
+                                          cw_b + (size_t)t * K,
+                                          gate, xb + (size_t)t * H,
+                                          bias, &shape, scratch_b);
+                }
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(gate, xb, mlog_b, E, H, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_moe_route_batch_f32(mlog_b, bias, midx_b, mw_b, E, K, batch_n, scale));
+                for (uint32_t i = 0; i < batch_n * K; i++) TEST_ASSERT(midx_b[i] == cidx_b[i]);
+
+                memcpy(cmoe, bcff, (size_t)batch_n * H * sizeof(float));
+                memcpy(mmoe, bmff, (size_t)batch_n * H * sizeof(float));
+                for (uint32_t e = 0; e < E; e++) {
+                    glm_matmul_f32(cpg, egate + (size_t)e * ff * H, xb, ff, H, batch_n);
+                    glm_matmul_f32(cpu, eup + (size_t)e * ff * H, xb, ff, H, batch_n);
+                    for (uint32_t t = 0; t < batch_n; t++) {
+                        float ew = 0.0f;
+                        for (uint32_t k = 0; k < K; k++)
+                            if ((uint32_t)cidx_b[(size_t)t * K + k] == e) ew = cw_b[(size_t)t * K + k];
+                        glm_silu_f32(cpa + (size_t)t * ff, cpg + (size_t)t * ff, ff);
+                        for (uint32_t i = 0; i < ff; i++)
+                            cpa[(size_t)t * ff + i] *= cpu[(size_t)t * ff + i] * ew;
+                    }
+                    glm_matmul_f32(cout_e, edown + (size_t)e * H * ff, cpa, H, ff, batch_n);
+                    for (uint32_t i = 0; i < batch_n * H; i++) cmoe[i] += cout_e[i];
+
+                    TEST_ASSERT(ds4_gpu_glm_matmul_f32(egate + (size_t)e * ff * H, xb, mpg, ff, H, batch_n));
+                    TEST_ASSERT(ds4_gpu_glm_matmul_f32(eup + (size_t)e * ff * H, xb, mpu, ff, H, batch_n));
+                    TEST_ASSERT(ds4_gpu_glm_swiglu_f32(mpg, mpu, mpa, batch_n * ff));
+                    for (uint32_t t = 0; t < batch_n; t++) {
+                        float ew = 0.0f;
+                        for (uint32_t k = 0; k < K; k++)
+                            if ((uint32_t)midx_b[(size_t)t * K + k] == e) ew = mw_b[(size_t)t * K + k];
+                        for (uint32_t i = 0; i < ff; i++) mpa[(size_t)t * ff + i] *= ew;
+                    }
+                    TEST_ASSERT(ds4_gpu_glm_matmul_f32(edown + (size_t)e * H * ff, mpa, mout_e, H, ff, batch_n));
+                    for (uint32_t i = 0; i < batch_n * H; i++) mmoe[i] += mout_e[i];
+                }
+                glm_metal_cmp("MoE batch2 F32 composite", mmoe, cmoe,
+                              (size_t)batch_n * H, tol_abs, tol_rel);
+
+                free(egate); free(eup); free(edown); free(mlog_b);
+                free(cidx_b); free(midx_b); free(cw_b); free(mw_b); free(scratch_b);
+                free(cmoe); free(mmoe); free(cpg); free(mpg); free(cpu); free(mpu);
+                free(cpa); free(mpa); free(cout_e); free(mout_e);
+            }
+
             free(cgh); free(mgh); free(cuh); free(muh); free(cact); free(mact);
             free(cff_out); free(mff_out); free(cff2);
             free(bcgh); free(bmgh); free(bcuh); free(bmuh); free(bcact); free(bmact);
@@ -3654,7 +3748,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},
     {"--glm-nextn-metal-synth", "glm-nextn-metal-synth", "GLM-5.2 Metal NextN/MTP path on a tiny synthetic block (no model needed)", test_glm_nextn_metal_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
-    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels and layer-major MLA batch composite vs CPU reference", test_glm_metal_components},
+    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels and layer-major MLA/FFN/MoE batch composites vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
     {"--glm-spec-batch-verify-synth", "glm-spec-batch-verify-synth", "GLM-5.2 NextN batched-verifier contract == naive greedy (no model needed)", test_glm_spec_batch_verify_synth},
