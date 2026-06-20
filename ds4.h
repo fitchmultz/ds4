@@ -421,6 +421,8 @@ int ds4_glm_metal_generate_synth(int n_steps, int *out_match);
  * for all n_steps; returns 0 only if all three matched.  No model on disk. */
 int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
                                 int *out_miss);
+int ds4_glm_spec_batch_verify_synth(int n_steps, int *out_match,
+                                    int *out_verify_calls);
 
 /* Phase 4c-iv: tiny synthetic Metal forward self-check (no model needed).
  * Builds the same in-memory F32 layers as ds4_glm_cpu_forward_synth and runs

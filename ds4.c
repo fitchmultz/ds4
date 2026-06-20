@@ -29730,6 +29730,21 @@ static const float *glm_gen_metal_hnorm(void *ctx) {
 typedef bool (*glm_draft_chain_fn)(void *draft_ctx, int seed_token,
                                    const float *seed_hidden, int depth,
                                    int *out_drafts);
+typedef bool (*glm_verify_after_bonus_fn)(void *verify_ctx,
+                                          int bonus_token,
+                                          const int *draft,
+                                          int active_depth,
+                                          uint32_t *pos_io,
+                                          int remaining_after_bonus,
+                                          float *logits,
+                                          uint32_t vocab,
+                                          int eos_id,
+                                          int *emit_after,
+                                          int *emit_count,
+                                          int *accepted,
+                                          bool *fallback_emitted,
+                                          int *fallback_token,
+                                          int *next_out);
 
 typedef struct {
     const ds4_model *m;
@@ -29836,7 +29851,10 @@ static int glm_spec_decode(const char *label,
                            int *out_generated, int *gen_ids_out,
                            double *out_decode_s,
                            int draft_depth, glm_draft_chain_fn draft_fn,
-                           void *draft_ctx, int *obs_generated) {
+                           void *draft_ctx,
+                           glm_verify_after_bonus_fn verify_fn,
+                           void *verify_ctx,
+                           int *obs_generated) {
     (void)prompt;
     int depth = draft_depth;
     if (depth < 1) depth = 1;
@@ -29898,13 +29916,19 @@ static int glm_spec_decode(const char *label,
 
             int emit_after[DS4_GLM_NEXTN_MAX_DEPTH + 1];
             int emit_count = 0;
-            if (!glm_spec_verify_after_bonus_single(step, ctx, bonus_token, draft,
-                                                    active_depth, &pos,
-                                                    remaining_after_bonus,
-                                                    logits, vocab, eos_id,
-                                                    emit_after, &emit_count,
-                                                    &acc, &fallback_emitted,
-                                                    &fallback_token, &next)) {
+            const bool verified = verify_fn
+                ? verify_fn(verify_ctx, bonus_token, draft, active_depth, &pos,
+                            remaining_after_bonus, logits, vocab, eos_id,
+                            emit_after, &emit_count, &acc, &fallback_emitted,
+                            &fallback_token, &next)
+                : glm_spec_verify_after_bonus_single(step, ctx, bonus_token, draft,
+                                                     active_depth, &pos,
+                                                     remaining_after_bonus,
+                                                     logits, vocab, eos_id,
+                                                     emit_after, &emit_count,
+                                                     &acc, &fallback_emitted,
+                                                     &fallback_token, &next);
+            if (!verified) {
                 if (trace) fclose(trace);
                 free(draft);
                 if (out_decode_s) *out_decode_s = now_sec() - dec0;
@@ -29942,7 +29966,8 @@ static int glm_spec_decode(const char *label,
     }
     if (trace) fclose(trace);
     free(draft);
-    const double decode_s = now_sec() - dec0;
+    double decode_s = now_sec() - dec0;
+    if (decode_s < 0.0000005) decode_s = 0.0;
     if (out_generated) *out_generated = generated;
     if (out_decode_s) *out_decode_s = decode_s;
     fprintf(stderr,
@@ -30000,7 +30025,7 @@ static int glm_generate_loop(const char *label,
         int rc = glm_spec_decode(label, step, hnorm, ctx, prompt, prompt_len,
                                  n_predict, logits, vocab, e, eos_id, out,
                                  out_generated, gen_ids_out, out_decode_s,
-                                 spec_depth, draft_fn, &ds, NULL);
+                                 spec_depth, draft_fn, &ds, NULL, NULL, NULL);
         fprintf(stderr, "ds4: %s: prefill %.2fs (%u tok)\n",
                 label ? label : "glm-generate", prefill_s, prompt_len);
         return rc;
@@ -30353,6 +30378,7 @@ typedef struct {
     uint32_t vocab;
     int partial_k;           /* accept length forced in PARTIAL mode         */
     glm_spec_mock_mode mode;
+    int *verify_calls;       /* optional batched-verifier call counter       */
 } glm_spec_mock_ctx;
 
 static bool glm_spec_mock_draft(void *vc, int seed_token, const float *seed_h,
@@ -30375,6 +30401,119 @@ static bool glm_spec_mock_draft(void *vc, int seed_token, const float *seed_h,
     return true;
 }
 
+static bool glm_spec_mock_verify_after_bonus(void *vc,
+                                             int bonus_token,
+                                             const int *draft,
+                                             int active_depth,
+                                             uint32_t *pos_io,
+                                             int remaining_after_bonus,
+                                             float *logits,
+                                             uint32_t vocab,
+                                             int eos_id,
+                                             int *emit_after,
+                                             int *emit_count,
+                                             int *accepted,
+                                             bool *fallback_emitted,
+                                             int *fallback_token,
+                                             int *next_out) {
+    (void)bonus_token; (void)logits; (void)vocab;
+    glm_spec_mock_ctx *mc = (glm_spec_mock_ctx *)vc;
+    if (!mc || !mc->greedy || !mc->generated_ptr || !pos_io ||
+        !emit_after || !emit_count || !accepted || !fallback_emitted ||
+        !fallback_token || !next_out) return false;
+    if (mc->verify_calls) (*mc->verify_calls)++;
+    *emit_count = 0;
+    *accepted = 0;
+    *fallback_emitted = false;
+    *fallback_token = -1;
+    *next_out = -1;
+    if (remaining_after_bonus <= 0) return true;
+
+    uint32_t pos = *pos_io;
+    int gi = *mc->generated_ptr + 1;   /* first target token after bonus */
+    int next = (gi < mc->n_steps) ? mc->greedy[gi] : eos_id;
+    pos++;                            /* target forward on bonus */
+    while (*emit_count < remaining_after_bonus && next != eos_id) {
+        if (*accepted < active_depth && draft[*accepted] == next) {
+            emit_after[(*emit_count)++] = next;
+            (*accepted)++;
+            gi++;
+            if (*emit_count >= remaining_after_bonus) break;
+            next = (gi < mc->n_steps) ? mc->greedy[gi] : eos_id;
+            pos++;                    /* target forward on accepted draft */
+            continue;
+        }
+
+        emit_after[(*emit_count)++] = next;
+        *fallback_emitted = true;
+        *fallback_token = next;
+        gi++;
+        if (*emit_count < remaining_after_bonus) {
+            next = (gi < mc->n_steps) ? mc->greedy[gi] : eos_id;
+            pos++;                    /* target forward on fallback */
+        }
+        break;
+    }
+    *pos_io = pos;
+    *next_out = next;
+    return true;
+}
+
+static int glm_spec_build_greedy_synth(glm_synth_ctx *sc,
+                                       const int *prompt,
+                                       uint32_t plen,
+                                       uint32_t cap,
+                                       int n_steps,
+                                       int *greedy) {
+    glm_cpu_fwd_ctx c;
+    glm_cpu_fwd_init(&c, &sc->model, &sc->shape, sc->n_layer, sc->n_dense, cap);
+    float *li = xmalloc((size_t)sc->vocab * sizeof(float));
+    for (uint32_t t = 0; t < plen; t++)
+        glm_cpu_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
+    for (int s = 0; s < n_steps; s++) {
+        greedy[s] = sample_argmax(li, sc->vocab);
+        glm_cpu_fwd_step(&c, greedy[s], plen + (uint32_t)s, true, li);
+    }
+    free(li);
+    glm_cpu_fwd_free(&c);
+    return 0;
+}
+
+static bool glm_spec_run_mock_case(glm_synth_ctx *sc,
+                                   const int *prompt,
+                                   uint32_t plen,
+                                   uint32_t cap,
+                                   const int *greedy,
+                                   int n_steps,
+                                   int depth,
+                                   glm_spec_mock_mode mode,
+                                   int partial_k,
+                                   glm_verify_after_bonus_fn verify_fn,
+                                   int *verify_calls) {
+    const int eos_id = -1;
+    glm_cpu_fwd_ctx c;
+    glm_cpu_fwd_init(&c, &sc->model, &sc->shape, sc->n_layer, sc->n_dense, cap);
+    float *li = xmalloc((size_t)sc->vocab * sizeof(float));
+    int *ids = xmalloc((size_t)n_steps * sizeof(int));
+    for (uint32_t t = 0; t < plen; t++)
+        glm_cpu_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
+    int live_generated = 0;
+    glm_spec_mock_ctx mc = { greedy, &live_generated, n_steps, sc->vocab,
+                             partial_k, mode, verify_calls };
+    int generated = 0;
+    int rc = glm_spec_decode("glm-spec-synth", glm_gen_cpu_step,
+                             glm_gen_cpu_hnorm, &c, prompt, plen, n_steps,
+                             li, sc->vocab, NULL, eos_id, NULL, &generated,
+                             ids, NULL, depth, glm_spec_mock_draft, &mc,
+                             verify_fn, &mc, &live_generated);
+    bool ok = (rc == 0) && (generated == n_steps);
+    for (int s = 0; ok && s < n_steps; s++)
+        if (ids[s] != greedy[s]) ok = false;
+    free(ids); free(li);
+    glm_cpu_fwd_free(&c);
+    return ok;
+}
+
 int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
                                 int *out_miss) {
     glm_synth_ctx sc;
@@ -30382,27 +30521,10 @@ int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
     int prompt[3] = { 1, 5, 9 };
     const uint32_t plen = 3;
     const uint32_t cap = plen + (uint32_t)n_steps + 4;
-    const int eos_id = -1;   /* never matches: run the full n_steps */
-
-    /* Naive greedy reference over the incremental ctx (same oracle policy as
-     * ds4_glm_cpu_generate_synth). */
     int *greedy = xmalloc((size_t)n_steps * sizeof(int));
-    {
-        glm_cpu_fwd_ctx c;
-        glm_cpu_fwd_init(&c, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap);
-        float *li = xmalloc((size_t)sc.vocab * sizeof(float));
-        for (uint32_t t = 0; t < plen; t++)
-            glm_cpu_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
-        for (int s = 0; s < n_steps; s++) {
-            greedy[s] = sample_argmax(li, sc.vocab);
-            glm_cpu_fwd_step(&c, greedy[s], plen + (uint32_t)s, true, li);
-        }
-        free(li);
-        glm_cpu_fwd_free(&c);
-    }
+    (void)glm_spec_build_greedy_synth(&sc, prompt, plen, cap, n_steps, greedy);
 
     const int depth = 4;   /* exercises the depth cap */
-    int live_generated = 0;
     struct { const char *name; glm_spec_mock_mode mode; int partial_k; int ok; }
             cases[3] = {
         {"full",   GLM_SPEC_MOCK_FULL,    depth, 0},
@@ -30410,31 +30532,14 @@ int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
         {"miss",   GLM_SPEC_MOCK_MISS,    0,    0},
     };
     for (int ci = 0; ci < 3; ci++) {
-        glm_cpu_fwd_ctx c;
-        glm_cpu_fwd_init(&c, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap);
-        float *li = xmalloc((size_t)sc.vocab * sizeof(float));
-        int *ids = xmalloc((size_t)n_steps * sizeof(int));
-        for (uint32_t t = 0; t < plen; t++)
-            glm_cpu_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
-        live_generated = 0;
-        glm_spec_mock_ctx mc = { greedy, &live_generated, n_steps, sc.vocab,
-                                 cases[ci].partial_k, cases[ci].mode };
-        int generated = 0;
-        int rc = glm_spec_decode("glm-spec-synth", glm_gen_cpu_step,
-                                 glm_gen_cpu_hnorm, &c, prompt, plen, n_steps,
-                                 li, sc.vocab, NULL, eos_id, NULL, &generated,
-                                 ids, NULL, depth, glm_spec_mock_draft, &mc,
-                                 &live_generated);
-        bool ok = (rc == 0) && (generated == n_steps);
-        for (int s = 0; ok && s < n_steps; s++)
-            if (ids[s] != greedy[s]) ok = false;
+        const bool ok = glm_spec_run_mock_case(&sc, prompt, plen, cap, greedy,
+                                               n_steps, depth, cases[ci].mode,
+                                               cases[ci].partial_k, NULL, NULL);
         cases[ci].ok = ok ? 1 : 0;
         fprintf(stderr,
                 "  glm-spec-generate-synth (%s): %s (generated %d/%d, "
                 "greedy-identical=%s)\n", cases[ci].name,
-                ok ? "PASS" : "FAIL", generated, n_steps, ok ? "yes" : "no");
-        free(ids); free(li);
-        glm_cpu_fwd_free(&c);
+                ok ? "PASS" : "FAIL", n_steps, n_steps, ok ? "yes" : "no");
     }
     free(greedy);
     glm_synth_free(&sc);
@@ -30443,6 +30548,32 @@ int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
     if (out_partial) *out_partial = cases[1].ok;
     if (out_miss)    *out_miss    = cases[2].ok;
     return all_ok ? 0 : 1;
+}
+
+int ds4_glm_spec_batch_verify_synth(int n_steps, int *out_match,
+                                    int *out_verify_calls) {
+    glm_synth_ctx sc;
+    glm_synth_build(&sc);
+    int prompt[3] = { 1, 5, 9 };
+    const uint32_t plen = 3;
+    const uint32_t cap = plen + (uint32_t)n_steps + 4;
+    int *greedy = xmalloc((size_t)n_steps * sizeof(int));
+    (void)glm_spec_build_greedy_synth(&sc, prompt, plen, cap, n_steps, greedy);
+    const int depth = 4;
+    int calls = 0;
+    const bool ok = glm_spec_run_mock_case(&sc, prompt, plen, cap, greedy,
+                                           n_steps, depth,
+                                           GLM_SPEC_MOCK_PARTIAL, 2,
+                                           glm_spec_mock_verify_after_bonus,
+                                           &calls);
+    if (out_match) *out_match = ok ? 1 : 0;
+    if (out_verify_calls) *out_verify_calls = calls;
+    fprintf(stderr,
+            "  glm-spec-batch-verify-synth: %s (greedy-identical=%s, verifier_calls=%d)\n",
+            ok ? "PASS" : "FAIL", ok ? "yes" : "no", calls);
+    free(greedy);
+    glm_synth_free(&sc);
+    return ok && calls > 0 ? 0 : 1;
 }
 
 /* Metal incremental generation synth self-check: the Metal incremental decode

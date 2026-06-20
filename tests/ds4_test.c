@@ -3028,6 +3028,15 @@ static void test_glm_spec_generate_synth(void) {
     TEST_ASSERT(miss == 1);
 }
 
+static void test_glm_spec_batch_verify_synth(void) {
+    const int n_steps = 8;
+    int match = 0, calls = 0;
+    int rc = ds4_glm_spec_batch_verify_synth(n_steps, &match, &calls);
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(match == 1);
+    TEST_ASSERT(calls > 0);
+}
+
 static void test_glm_spec_trace_synth(void) {
     const char *path = "/tmp/ds4_glm_spec_trace_synth.csv";
     char *saved = test_save_env("DS4_GLM_NEXTN_TRACE_OUT");
@@ -3407,6 +3416,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
+    {"--glm-spec-batch-verify-synth", "glm-spec-batch-verify-synth", "GLM-5.2 NextN batched-verifier contract == naive greedy (no model needed)", test_glm_spec_batch_verify_synth},
     {"--glm-spec-trace-synth", "glm-spec-trace-synth", "GLM-5.2 NextN speculative CSV trace includes every round including final no-draft row (no model needed)", test_glm_spec_trace_synth},
 };
 
