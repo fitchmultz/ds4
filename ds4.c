@@ -27031,6 +27031,13 @@ void glm_matvec_f32(float *out, const float *W, const float *x,
     }
 }
 
+void glm_matmul_f32(float *out, const float *W, const float *x,
+                    uint32_t rows, uint32_t cols, uint32_t n_tok) {
+    for (uint32_t t = 0; t < n_tok; t++)
+        glm_matvec_f32(out + (size_t)t * rows, W,
+                       x + (size_t)t * cols, rows, cols);
+}
+
 void glm_silu_f32(float *out, const float *x, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) {
         const float xi = x[i];

@@ -245,6 +245,8 @@ void glm_rmsnorm_f32(float *out, const float *x, const float *weight,
 /* F32 matvec: out[r] = sum_c W[r*cols + c] * x[c]  for r in [0,rows). */
 void glm_matvec_f32(float *out, const float *W, const float *x,
                     uint32_t rows, uint32_t cols);
+void glm_matmul_f32(float *out, const float *W, const float *x,
+                    uint32_t rows, uint32_t cols, uint32_t n_tok);
 
 /* SiLU: out[i] = x[i] / (1 + exp(-x[i])). */
 void glm_silu_f32(float *out, const float *x, uint32_t n);

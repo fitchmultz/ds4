@@ -24,6 +24,12 @@ struct ds4_metal_args_glm_matvec {
     uint32_t cols;   // input / reduction dim
 };
 
+struct ds4_metal_args_glm_matmul {
+    uint32_t rows;   // output rows per token
+    uint32_t cols;   // input / reduction dim
+    uint32_t n_tok;  // token batch
+};
+
 // out[r] = sum_c W[r*cols + c] * x[c].  Mirrors glm_matvec_f32.
 kernel void kernel_glm_matvec_f32(
         constant ds4_metal_args_glm_matvec & args,
@@ -36,6 +42,26 @@ kernel void kernel_glm_matvec_f32(
     float acc = 0.0f;
     for (uint32_t c = 0; c < args.cols; c++) acc += wr[c] * x[c];
     out[gid] = acc;
+}
+
+// out[t*rows + r] = dot(W[r], x[t]).  Same accumulation order as matvec.
+// This is the small GLM primitive needed by future layer-major verifier and
+// prefill microbatches; it deliberately stays F32/simple like the component
+// kernels instead of touching the DeepSeek graph.
+kernel void kernel_glm_matmul_f32(
+        constant ds4_metal_args_glm_matmul & args,
+        device const float * W,
+        device const float * x,
+        device       float * out,
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint32_t r = gid.x;
+    const uint32_t t = gid.y;
+    if (r >= args.rows || t >= args.n_tok) return;
+    device const float * wr = W + (uint64_t)r * args.cols;
+    device const float * xt = x + (uint64_t)t * args.cols;
+    float acc = 0.0f;
+    for (uint32_t c = 0; c < args.cols; c++) acc += wr[c] * xt[c];
+    out[(uint64_t)t * args.rows + r] = acc;
 }
 
 struct ds4_metal_args_glm_rmsnorm {

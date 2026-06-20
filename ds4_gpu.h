@@ -1031,6 +1031,11 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 int ds4_gpu_glm_matvec_f32(const float * W, const float * x, float * out,
                            uint32_t rows, uint32_t cols);
 
+/* out[t*rows+r] = sum_c W[r*cols+c] * x[t*cols+c] for a tiny token batch.
+ * Enabling primitive for future GLM layer-major verifier/prefill microbatches. */
+int ds4_gpu_glm_matmul_f32(const float * W, const float * x, float * out,
+                           uint32_t rows, uint32_t cols, uint32_t n_tok);
+
 /* RMSNorm over n elements with per-channel weight w.  Latent-only norm is
  * this with n = kv_lora on the latent slice (no masked variant needed). */
 int ds4_gpu_glm_rmsnorm_f32(const float * x, const float * w, float * out,

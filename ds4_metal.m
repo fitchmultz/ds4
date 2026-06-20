@@ -26877,6 +26877,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 
 /* Host-side mirror of metal/glm.metal ds4_metal_args_glm_matvec (same layout). */
 typedef struct { uint32_t rows; uint32_t cols; } ds4_gpu_glm_matvec_args;
+typedef struct { uint32_t rows; uint32_t cols; uint32_t n_tok; } ds4_gpu_glm_matmul_args;
 typedef struct { uint32_t n; float eps; }        ds4_gpu_glm_rmsnorm_args;
 typedef struct { uint32_t d; uint32_t n_head; float base; uint32_t t; } ds4_gpu_glm_rope_args;
 typedef struct {
@@ -26930,6 +26931,55 @@ int ds4_gpu_glm_matvec_f32(const float * W, const float * x, float * out,
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm matvec");
+        if (ok) ds4_gpu_tensor_read(to, 0, out, ob);
+        ds4_gpu_tensor_free(tW); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+        return ok;
+    }
+}
+
+int ds4_gpu_glm_matmul_f32(const float * W, const float * x, float * out,
+                           uint32_t rows, uint32_t cols, uint32_t n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_glm_matmul_args args = { rows, cols, n_tok };
+    @autoreleasepool {
+        const uint64_t wb = (uint64_t)rows * cols * sizeof(float);
+        const uint64_t xb = (uint64_t)n_tok * cols * sizeof(float);
+        const uint64_t ob = (uint64_t)n_tok * rows * sizeof(float);
+        ds4_gpu_tensor *tW = wb ? ds4_gpu_tensor_alloc(wb) : NULL;
+        ds4_gpu_tensor *tx = xb ? ds4_gpu_tensor_alloc(xb) : NULL;
+        ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(ob);
+        if ((wb && !tW) || (xb && !tx) || !to) {
+            ds4_gpu_tensor_free(tW); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+            return 0;
+        }
+        if (wb) ds4_gpu_tensor_write(tW, 0, W, wb);
+        if (xb) ds4_gpu_tensor_write(tx, 0, x, xb);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline("kernel_glm_matmul_f32");
+        int ok = 0;
+        if (pipe) {
+            [enc setComputePipelineState:pipe];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            if (tW) ds4_gpu_glm_bind(enc, tW, 1);
+            if (tx) ds4_gpu_glm_bind(enc, tx, 2);
+            ds4_gpu_glm_bind(enc, to, 3);
+            NSUInteger txg = 16, tyg = 16;
+            const NSUInteger maxt = pipe.maxTotalThreadsPerThreadgroup;
+            if (maxt && txg * tyg > maxt) {
+                txg = maxt < 16 ? maxt : 16;
+                tyg = maxt / txg;
+                if (tyg == 0) tyg = 1;
+            }
+            const NSUInteger gx = ((NSUInteger)rows + txg - 1u) / txg;
+            const NSUInteger gy = ((NSUInteger)n_tok + tyg - 1u) / tyg;
+            [enc dispatchThreadgroups:MTLSizeMake(gx ? gx : 1, gy ? gy : 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(txg, tyg, 1)];
+            ok = 1;
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm matmul");
         if (ok) ds4_gpu_tensor_read(to, 0, out, ob);
         ds4_gpu_tensor_free(tW); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
         return ok;
