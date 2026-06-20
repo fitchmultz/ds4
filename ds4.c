@@ -28305,6 +28305,12 @@ static void glm_synth_free(glm_synth_ctx *c);
  * DOWN experts use fused IQ3_XXS/IQ4_XS Metal kernels. blk.8 (IQ2_S gate/up)
  * still falls back to F32 for the whole routed expert branch.
  * ---------------------------------------------------------------------- */
+static bool glm_env_flag_enabled(const char *name) {
+    const char *v = getenv(name);
+    return v && v[0] && strcmp(v, "0") != 0 && strcmp(v, "off") != 0 &&
+           strcmp(v, "false") != 0 && strcmp(v, "no") != 0;
+}
+
 static bool glm_fast_enabled(void) {
     const char *e = getenv("DS4_GLM_FAST");
     return e && atoi(e) == 1;
@@ -29490,7 +29496,8 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
                                     uint32_t n_tok,
                                     bool want_logits,
                                     float *logits_rows,
-                                    float *hidden_rows) {
+                                    float *hidden_rows,
+                                    float *norm_rows) {
     if (!c || !tokens || n_tok == 0 || pos0 > c->seq_n || c->seq_n - pos0 < n_tok)
         return false;
     if (want_logits && !logits_rows) return false;
@@ -29535,7 +29542,7 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
     float *bg = xmalloc((size_t)n_tok * max_inter * sizeof(float));
     float *bu = xmalloc((size_t)n_tok * max_inter * sizeof(float));
     float *bact = xmalloc((size_t)n_tok * max_inter * sizeof(float));
-    float *head_norm = want_logits ? xmalloc(h_rows * sizeof(float)) : NULL;
+    float *head_norm = want_logits ? (norm_rows ? norm_rows : xmalloc(h_rows * sizeof(float))) : NULL;
     float *batch_chunk_logits = want_logits ? xmalloc((size_t)n_tok * c->chunk_rows * sizeof(float)) : NULL;
     bool ok = true;
 
@@ -29708,7 +29715,9 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
     }
     if (ok) memcpy(c->x, x + (size_t)(n_tok - 1u) * H, (size_t)H * sizeof(float));
 
-    free(batch_chunk_logits); free(head_norm); free(bact); free(bu); free(bg);
+    free(batch_chunk_logits);
+    if (head_norm && !norm_rows) free(head_norm);
+    free(bact); free(bu); free(bg);
     free(route_w); free(route_idx); free(router_logits); free(battn); free(bQ);
     free(bkr_r); free(bkr_raw); free(bqr_r); free(bqr); free(bv); free(bk);
     free(bkvln); free(bkv_lat); free(bkva); free(bq); free(bqa_n); free(bqa);
@@ -30432,15 +30441,19 @@ static bool glm_metal_fwd_copy_kv_slots(glm_metal_fwd_ctx *dst,
 typedef struct {
     glm_metal_fwd_ctx *live;
     glm_metal_fwd_ctx *scratch;
+    bool batch_f32;
+    uint64_t batch_f32_calls;
+    uint64_t batch_f32_fallbacks;
 } glm_metal_verify_ctx;
 
 /* Rollback-safe Metal verifier seam.  It runs the candidate after-bonus chain
  * against a scratch copy of the target KV cache, collects target hidden rows,
  * runs the GLM LM head for those rows as one batch, then reduces with Metal
- * batch-argmax.  It copies only the verified KV slots and matching hidden/logits
- * back into the live context.  The target layer rows are still produced by
- * single-token steps; this is a correctness seam for the future full-layer
- * batch graph, not a speed claim. */
+ * batch-argmax.  When requested, it can produce the full candidate row chain
+ * with the F32 layer-major Metal batch helper before reducing top-1.  It copies
+ * only the verified KV slots and matching hidden/logits back into the live
+ * context.  The batch path is opt-in until real-model policy/perf is proven; no
+ * default speed claim. */
 static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
                                                       int bonus_token,
                                                       const int *draft,
@@ -30484,19 +30497,36 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
     float *batch_chunk_logits = xmalloc((size_t)chain_rows * scratch->chunk_rows * sizeof(float));
     int *row_top = xmalloc((size_t)chain_rows * sizeof(int));
     float *row_val = xmalloc((size_t)chain_rows * sizeof(float));
+    int chain_tokens[DS4_GLM_NEXTN_MAX_DEPTH + 1];
+    for (uint32_t r = 0; r < chain_rows; r++)
+        chain_tokens[r] = (r == 0) ? bonus_token : draft[r - 1u];
+
     bool ok = true;
-    for (uint32_t r = 0; r < chain_rows && ok; r++) {
-        const int tok = (r == 0) ? bonus_token : draft[r - 1u];
-        ok = glm_gen_metal_step(scratch, tok, pos0 + r, false, NULL);
-        if (ok) memcpy(row_hidden + (size_t)r * live->H,
-                       scratch->x, (size_t)live->H * sizeof(float));
+    bool batched_rows = false;
+    if (vc->batch_f32 && chain_rows > 1u) {
+        batched_rows = glm_metal_fwd_batch_f32(scratch, chain_tokens, pos0,
+                                               chain_rows, true, row_logits,
+                                               row_hidden, row_norm);
+        if (batched_rows) vc->batch_f32_calls++;
+        else {
+            vc->batch_f32_fallbacks++;
+            ok = glm_metal_fwd_copy_kv(scratch, live);
+        }
     }
-    if (ok) ok = glm_lm_head_metal_batch_logits(live->m, row_hidden,
-                                                (const float *)tensor_data(live->m, live->t_onorm),
-                                                live->t_out, vocab, live->shape,
-                                                chain_rows, row_logits, row_norm,
-                                                scratch->chunk_w, batch_chunk_logits,
-                                                scratch->chunk_rows);
+    if (!batched_rows) {
+        for (uint32_t r = 0; r < chain_rows && ok; r++) {
+            const int tok = chain_tokens[r];
+            ok = glm_gen_metal_step(scratch, tok, pos0 + r, false, NULL);
+            if (ok) memcpy(row_hidden + (size_t)r * live->H,
+                           scratch->x, (size_t)live->H * sizeof(float));
+        }
+        if (ok) ok = glm_lm_head_metal_batch_logits(live->m, row_hidden,
+                                                    (const float *)tensor_data(live->m, live->t_onorm),
+                                                    live->t_out, vocab, live->shape,
+                                                    chain_rows, row_logits, row_norm,
+                                                    scratch->chunk_w, batch_chunk_logits,
+                                                    scratch->chunk_rows);
+    }
     if (ok) ok = ds4_gpu_glm_argmax_batch_f32(row_logits, row_top, row_val,
                                               vocab, chain_rows) != 0;
 
@@ -30562,9 +30592,8 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
         }
         if (ok) {
             *pos_io = pos0 + replay_steps;
-            /* Count scratch target rows, plus any sequential fallback-carry row.
-             * This intentionally does not claim a batch target-speed win yet. */
-            if (target_batches_out) *target_batches_out = chain_rows + fallback_extra;
+            if (target_batches_out)
+                *target_batches_out = (batched_rows ? 1u : chain_rows) + fallback_extra;
         }
     }
 
@@ -30803,10 +30832,12 @@ static int glm_generate_loop(const char *label,
             if (verify_scratch_ready) {
                 verify_pair.live = live;
                 verify_pair.scratch = &verify_scratch;
+                verify_pair.batch_f32 = glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_F32");
                 verify_fn = glm_spec_verify_after_bonus_metal_scratch;
                 verify_ctx = &verify_pair;
-                fprintf(stderr, "ds4: %s: nextn verifier=metal-scratch-batch-head\n",
-                        label ? label : "glm-generate");
+                fprintf(stderr, "ds4: %s: nextn verifier=%s\n",
+                        label ? label : "glm-generate",
+                        verify_pair.batch_f32 ? "metal-batch-f32" : "metal-scratch-batch-head");
             } else {
                 fprintf(stderr, "ds4: %s: nextn verifier scratch init failed; using single-step verifier\n",
                         label ? label : "glm-generate");
@@ -30821,6 +30852,12 @@ static int glm_generate_loop(const char *label,
                                  spec_depth, draft_fn, &ds, glm_nextn_draft_commit,
                                  verify_fn, verify_ctx, NULL);
 #ifndef DS4_NO_GPU
+        if (verify_scratch_ready && verify_pair.batch_f32)
+            fprintf(stderr,
+                    "ds4: %s: nextn verifier batch_f32 calls=%llu fallbacks=%llu\n",
+                    label ? label : "glm-generate",
+                    (unsigned long long)verify_pair.batch_f32_calls,
+                    (unsigned long long)verify_pair.batch_f32_fallbacks);
         if (verify_scratch_ready) glm_metal_fwd_free(&verify_scratch);
 #endif
         fprintf(stderr,
@@ -31400,7 +31437,7 @@ int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
                                  cases[ci].partial_k, cases[ci].mode, NULL };
         int generated = 0;
         const int eos_id = -1;
-        glm_metal_verify_ctx vc = { &c, &scratch };
+        glm_metal_verify_ctx vc = { &c, &scratch, true, 0, 0 };
         int rc = ok ? glm_spec_decode("glm-spec-metal-synth", glm_gen_metal_step,
                                       glm_gen_metal_hnorm, &c, prompt, plen,
                                       n_steps, li, sc.vocab, NULL, eos_id, NULL,
@@ -31409,14 +31446,17 @@ int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
                                       glm_spec_verify_after_bonus_metal_scratch,
                                       &vc, &live_generated)
                     : 1;
-        ok = ok && rc == 0 && generated == n_steps;
+        ok = ok && rc == 0 && generated == n_steps &&
+             vc.batch_f32_calls > 0 && vc.batch_f32_fallbacks == 0;
         for (int s = 0; ok && s < n_steps; s++)
             if (ids[s] != greedy[s]) ok = false;
         cases[ci].ok = ok ? 1 : 0;
         fprintf(stderr,
                 "  glm-spec-metal-target-synth (%s): %s (generated %d/%d, "
-                "greedy-identical=%s)\n", cases[ci].name,
-                ok ? "PASS" : "FAIL", generated, n_steps, ok ? "yes" : "no");
+                "greedy-identical=%s, batch_f32_calls=%llu fallbacks=%llu)\n",
+                cases[ci].name, ok ? "PASS" : "FAIL", generated, n_steps,
+                ok ? "yes" : "no", (unsigned long long)vc.batch_f32_calls,
+                (unsigned long long)vc.batch_f32_fallbacks);
         free(ids);
         free(li);
         if (scratch.m) glm_metal_fwd_free(&scratch);
@@ -31475,7 +31515,7 @@ int ds4_glm_metal_target_batch_synth(int *out_match, float *out_hidden_max,
         }
     }
     if (ok) ok = glm_metal_fwd_batch_f32(&bat, chain, plen, n_batch, true,
-                                         bat_logits, bat_hidden);
+                                         bat_logits, bat_hidden, NULL);
     if (ok) ok = glm_metal_fwd_step(&seq, 13, plen + n_batch, true, seq_cont_logits) &&
                  glm_metal_fwd_step(&bat, 13, plen + n_batch, true, bat_cont_logits);
     const float hdiff = ok ? max_abs_diff(seq_hidden, bat_hidden,
