@@ -30044,6 +30044,15 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
         return 1;
     }
     const uint32_t prompt_len = (uint32_t)toks.len;
+    const char *pids = getenv("DS4_GLM_RAW_PROMPT_IDS_OUT");
+    if (pids && pids[0]) {
+        FILE *pf = fopen(pids, "w");
+        if (pf) {
+            for (uint32_t i = 0; i < prompt_len; i++) fprintf(pf, "%d\n", toks.v[i]);
+            fclose(pf);
+            fprintf(stderr, "ds4: glm-raw: wrote %u prompt ids to %s\n", prompt_len, pids);
+        }
+    }
     const ds4_tensor *t_out = model_find_tensor(m, "output.weight");
     const uint32_t vocab = (uint32_t)t_out->dim[1];
     float *logits = xmalloc((size_t)vocab * sizeof(float));

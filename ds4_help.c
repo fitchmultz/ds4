@@ -257,6 +257,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "DS4_GLM_EXPERT_CACHE_PRESET=decode|plan", "GLM fast path: enable bounded LRU routed-expert slab cache; decode is conservative, plan is the documented ~88 GiB cache plan.");
     opt(fp, c, "DS4_GLM_EXPERT_CACHE_MIB/GIB=N", "GLM fast path: explicit slab-cache budget; overrides cache presets.");
     opt(fp, c, "DS4_GLM_NEXTN_PROBE=1", "GLM diagnostic: compare blk.78 NextN one-token draft with the next target argmax without changing output.");
+    opt(fp, c, "DS4_GLM_RAW_PROMPT_IDS_OUT=FILE", "GLM diagnostic: write raw-mode prompt token ids from --glm-raw / --glm-raw-cpu, one id per line.");
     opt(fp, c, "DS4_GLM_RAW_GEN_IDS_OUT=FILE", "GLM diagnostic: write generated token ids from --glm-raw / --glm-raw-cpu, one id per line.");
     opt(fp, c, "--dump-tokens", "Tokenize the prompt exactly as written, then exit.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
