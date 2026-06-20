@@ -3859,6 +3859,69 @@ static void test_glm_metal_components(void) {
                 glm_metal_cmp("MoE batch2 F32 composite", mmoe, cmoe,
                               (size_t)batch_n * H, tol_abs, tol_rel);
 
+                /* Batch-2 routed FFN residual sublayer: ffn RMSNorm -> router
+                 * -> shared+routed experts -> residual add.  The attention
+                 * residual block above already pins the MLA half; this pins the
+                 * production MoE half that dominates real GLM layers. */
+                float *ones_h = malloc((size_t)H * sizeof(float));
+                float *cfn_b = malloc((size_t)batch_n * H * sizeof(float));
+                float *mfn_b = malloc((size_t)batch_n * H * sizeof(float));
+                float *cblock = malloc((size_t)batch_n * H * sizeof(float));
+                float *mblock = malloc((size_t)batch_n * H * sizeof(float));
+                TEST_ASSERT(ones_h && cfn_b && mfn_b && cblock && mblock);
+                for (uint32_t i = 0; i < H; i++) ones_h[i] = 1.0f;
+                for (uint32_t t = 0; t < batch_n; t++) {
+                    glm_rmsnorm_f32(cfn_b + (size_t)t * H, xb + (size_t)t * H,
+                                    ones_h, H, shape.rms_eps);
+                    glm_moe_route_sigmoid(cidx_b + (size_t)t * K,
+                                          cw_b + (size_t)t * K,
+                                          gate, cfn_b + (size_t)t * H,
+                                          bias, &shape, scratch_b);
+                    glm_swiglu_dense_f32(cmoe + (size_t)t * H,
+                                         cfn_b + (size_t)t * H,
+                                         ff_gate, ff_up, ff_down, &shape,
+                                         cpg + (size_t)t * ff, cpu + (size_t)t * ff);
+                }
+                TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(xb, ones_h, mfn_b, H, batch_n, shape.rms_eps));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(gate, mfn_b, mlog_b, E, H, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_moe_route_batch_f32(mlog_b, bias, midx_b, mw_b, E, K, batch_n, scale));
+                for (uint32_t i = 0; i < batch_n * K; i++) TEST_ASSERT(midx_b[i] == cidx_b[i]);
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_gate, mfn_b, mpg, ff, H, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_up, mfn_b, mpu, ff, H, batch_n));
+                TEST_ASSERT(ds4_gpu_glm_swiglu_f32(mpg, mpu, mpa, batch_n * ff));
+                TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_down, mpa, mmoe, H, ff, batch_n));
+                for (uint32_t e = 0; e < E; e++) {
+                    glm_matmul_f32(cpg, egate + (size_t)e * ff * H, cfn_b, ff, H, batch_n);
+                    glm_matmul_f32(cpu, eup + (size_t)e * ff * H, cfn_b, ff, H, batch_n);
+                    for (uint32_t t = 0; t < batch_n; t++) {
+                        float ew = 0.0f;
+                        for (uint32_t k = 0; k < K; k++)
+                            if ((uint32_t)cidx_b[(size_t)t * K + k] == e) ew = cw_b[(size_t)t * K + k];
+                        glm_silu_f32(cpa + (size_t)t * ff, cpg + (size_t)t * ff, ff);
+                        for (uint32_t i = 0; i < ff; i++)
+                            cpa[(size_t)t * ff + i] *= cpu[(size_t)t * ff + i] * ew;
+                    }
+                    glm_matmul_f32(cout_e, edown + (size_t)e * H * ff, cpa, H, ff, batch_n);
+                    for (uint32_t i = 0; i < batch_n * H; i++) cmoe[i] += cout_e[i];
+
+                    TEST_ASSERT(ds4_gpu_glm_matmul_f32(egate + (size_t)e * ff * H, mfn_b, mpg, ff, H, batch_n));
+                    TEST_ASSERT(ds4_gpu_glm_matmul_f32(eup + (size_t)e * ff * H, mfn_b, mpu, ff, H, batch_n));
+                    TEST_ASSERT(ds4_gpu_glm_swiglu_f32(mpg, mpu, mpa, batch_n * ff));
+                    for (uint32_t t = 0; t < batch_n; t++) {
+                        float ew = 0.0f;
+                        for (uint32_t k = 0; k < K; k++)
+                            if ((uint32_t)midx_b[(size_t)t * K + k] == e) ew = mw_b[(size_t)t * K + k];
+                        for (uint32_t i = 0; i < ff; i++) mpa[(size_t)t * ff + i] *= ew;
+                    }
+                    TEST_ASSERT(ds4_gpu_glm_matmul_f32(edown + (size_t)e * H * ff, mpa, mout_e, H, ff, batch_n));
+                    for (uint32_t i = 0; i < batch_n * H; i++) mmoe[i] += mout_e[i];
+                }
+                for (uint32_t i = 0; i < batch_n * H; i++) cblock[i] = xb[i] + cmoe[i];
+                TEST_ASSERT(ds4_gpu_glm_add_batch_f32(xb, mmoe, mblock, H, batch_n));
+                glm_metal_cmp("MoE FFN residual batch2", mblock, cblock,
+                              (size_t)batch_n * H, tol_abs, tol_rel);
+                free(ones_h); free(cfn_b); free(mfn_b); free(cblock); free(mblock);
+
                 free(egate); free(eup); free(edown); free(mlog_b);
                 free(cidx_b); free(midx_b); free(cw_b); free(mw_b); free(scratch_b);
                 free(cmoe); free(mmoe); free(cpg); free(mpg); free(cpu); free(mpu);
