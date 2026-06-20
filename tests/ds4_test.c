@@ -3034,7 +3034,7 @@ static void test_glm_spec_batch_verify_synth(void) {
     int rc = ds4_glm_spec_batch_verify_synth(n_steps, &match, &calls);
     TEST_ASSERT(rc == 0);
     TEST_ASSERT(match == 1);
-    TEST_ASSERT(calls > 0);
+    TEST_ASSERT(calls == 2);
 }
 
 static void test_glm_nextn_prefix_synth(void) {
@@ -3063,23 +3063,26 @@ static void test_glm_spec_trace_synth(void) {
     TEST_ASSERT(fgets(line, sizeof(line), f) != NULL);
     TEST_ASSERT(strstr(line, "round,generated_before,seed_token,active_depth") != NULL);
     TEST_ASSERT(strstr(line, "target_steps") != NULL);
+    TEST_ASSERT(strstr(line, "target_batches") != NULL);
     int rows = 0;
     int total_target_steps = 0;
+    int total_target_batches = 0;
     int last_active_depth = -1, last_generated_after = -1, last_fallback = -1;
     while (fgets(line, sizeof(line), f)) {
         unsigned long long round = 0;
         int generated_before = 0, seed_token = 0, active_depth = 0, first_target = 0;
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0, accepted = 0;
         int fallback_emitted = 0, fallback_token = 0, generated_after = 0;
-        int target_steps = 0;
-        int n = sscanf(line, "%llu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+        int target_steps = 0, target_batches = 0;
+        int n = sscanf(line, "%llu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
                        &round, &generated_before, &seed_token, &active_depth,
                        &first_target, &d0, &d1, &d2, &d3, &accepted,
                        &fallback_emitted, &fallback_token, &generated_after,
-                       &target_steps);
-        TEST_ASSERT(n == 14);
+                       &target_steps, &target_batches);
+        TEST_ASSERT(n == 15);
         rows++;
         total_target_steps += target_steps;
+        total_target_batches += target_batches;
         last_active_depth = active_depth;
         last_generated_after = generated_after;
         last_fallback = fallback_emitted;
@@ -3091,8 +3094,10 @@ static void test_glm_spec_trace_synth(void) {
     TEST_ASSERT(last_generated_after == n_steps);
     TEST_ASSERT(last_fallback == 0);
     TEST_ASSERT(total_target_steps == n_steps - 1);
-    fprintf(stderr, "  glm-spec-trace-synth: PASS (%d rows, final active_depth=%d generated_after=%d target_steps=%d)\n",
-            rows, last_active_depth, last_generated_after, total_target_steps);
+    TEST_ASSERT(total_target_batches == total_target_steps); /* default verifier is single-step */
+    fprintf(stderr, "  glm-spec-trace-synth: PASS (%d rows, final active_depth=%d generated_after=%d target_steps=%d target_batches=%d)\n",
+            rows, last_active_depth, last_generated_after, total_target_steps,
+            total_target_batches);
 }
 
 static void test_glm_metal_components(void) {

@@ -30152,7 +30152,7 @@ static int glm_spec_decode(const char *label,
             fprintf(trace,
                     "round,generated_before,seed_token,active_depth,first_target,"
                     "draft0,draft1,draft2,draft3,accepted,fallback_emitted,"
-                    "fallback_token,generated_after,target_steps\n");
+                    "fallback_token,generated_after,target_steps,target_batches\n");
         }
     }
 
@@ -30161,6 +30161,7 @@ static int glm_spec_decode(const char *label,
     int generated = 0;
     uint64_t rounds = 0, acc_full = 0, acc_partial = 0, acc_miss = 0;
     uint64_t target_steps_total = 0;
+    uint64_t target_batches_total = 0;
     double draft_s = 0.0;
 
     const double dec0 = now_sec();
@@ -30175,6 +30176,7 @@ static int glm_spec_decode(const char *label,
         int active_depth = 0;
         int acc = 0;
         uint32_t round_target_steps = 0;
+        uint32_t round_target_batches = 0;
         const float *seed_h = hnorm ? hnorm(ctx) : NULL;
         if (obs_generated) *obs_generated = generated;
         for (int j = 0; j < depth; j++) draft[j] = -1;
@@ -30225,7 +30227,9 @@ static int glm_spec_decode(const char *label,
                 return 1;
             }
             round_target_steps = pos - verify_pos0;
+            round_target_batches = round_target_steps ? (verify_fn ? 1u : round_target_steps) : 0u;
             target_steps_total += round_target_steps;
+            target_batches_total += round_target_batches;
             if (draft_commit_fn && active_depth > 0 &&
                 generated + emit_count < n_predict)
                 draft_commit_fn(draft_ctx, acc, fallback_emitted);
@@ -30253,9 +30257,9 @@ static int glm_spec_decode(const char *label,
                     active_depth, first_target);
             for (int j = 0; j < DS4_GLM_NEXTN_MAX_DEPTH; j++)
                 fprintf(trace, ",%d", j < active_depth ? draft[j] : -1);
-            fprintf(trace, ",%d,%d,%d,%d,%u\n", acc,
+            fprintf(trace, ",%d,%d,%d,%d,%u,%u\n", acc,
                     fallback_emitted ? 1 : 0, fallback_token, generated,
-                    round_target_steps);
+                    round_target_steps, round_target_batches);
         }
         if (obs_generated) *obs_generated = generated;
     }
@@ -30267,13 +30271,14 @@ static int glm_spec_decode(const char *label,
     if (out_decode_s) *out_decode_s = decode_s;
     fprintf(stderr,
             "ds4: %s: nextn spec decode %d tok in %.2fs (%.2f tok/s), "
-            "%llu rounds [full %llu / partial %llu / miss %llu], target_steps %llu, draft %.2fs "
-            "(correctness-first; not a speed claim)\n",
+            "%llu rounds [full %llu / partial %llu / miss %llu], target_steps %llu, "
+            "target_batches %llu, draft %.2fs (correctness-first; not a speed claim)\n",
             label ? label : "glm-generate", generated, decode_s,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0,
             (unsigned long long)rounds, (unsigned long long)acc_full,
             (unsigned long long)acc_partial, (unsigned long long)acc_miss,
-            (unsigned long long)target_steps_total, draft_s);
+            (unsigned long long)target_steps_total,
+            (unsigned long long)target_batches_total, draft_s);
     return 0;
 }
 
