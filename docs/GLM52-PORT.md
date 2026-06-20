@@ -293,7 +293,13 @@ The core GLM port is complete and verified. The active work is usability/speed:
   one-token draft hit. A second raw smoke, `The answer is -n 4`, produces
   identical plain-vs-NextN ids `9829 13 758 2097` (` yes. In fact`) with
   one accepted draft (`13`) before fallback to `758` and final no-draft token
-  `2097`. The single-step target verifier is now isolated in
+  `2097`. A small post-fix real sweep with `--glm-nextn-draft 4 -n 6` shows
+  shallow but nonzero acceptance: `The answer is` accepted 2/6 active drafts,
+  `Once upon a time` accepted 1/7, and `2+2=` accepted 2/6. All accepted real
+  sweeps were partial rounds (mostly first-draft hits); this means target
+  batched/tree verify can reduce overhead, but deeper speedup likely also needs
+  better acceptance from fuller draft-worker state/prefix handling. The
+  single-step target verifier is now isolated in
   `glm_spec_verify_after_bonus_single`, giving the future Metal verifier
   microbatch a concrete contract to replace without changing accept/rollback
   semantics. `ds4_test --glm-spec-generate-synth` pins full/partial/miss cases
