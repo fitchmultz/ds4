@@ -1041,6 +1041,12 @@ int ds4_gpu_glm_matmul_f32(const float * W, const float * x, float * out,
 int ds4_gpu_glm_add_batch_f32(const float * a, const float * b, float * out,
                               uint32_t n, uint32_t n_tok);
 
+/* Row-wise top-1 over [n_tok,n_vocab] logits.  Tie-break: lower index wins.
+ * This is the verifier-facing surface for batch target rows. */
+int ds4_gpu_glm_argmax_batch_f32(const float * logits, int * out_idx,
+                                 float * out_val, uint32_t n_vocab,
+                                 uint32_t n_tok);
+
 /* RMSNorm over n elements with per-channel weight w.  Latent-only norm is
  * this with n = kv_lora on the latent slice (no masked variant needed). */
 int ds4_gpu_glm_rmsnorm_f32(const float * x, const float * w, float * out,

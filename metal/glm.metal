@@ -83,6 +83,34 @@ kernel void kernel_glm_add_batch_f32(
     out[gid] = a[gid] + b[gid];
 }
 
+struct ds4_metal_args_glm_argmax_batch {
+    uint32_t n_vocab; // row width
+    uint32_t n_tok;   // row count
+};
+
+// Row-wise top-1 over [n_tok,n_vocab] logits.  One thread scans one row;
+// lower-index tie break matches sample_argmax / CPU greedy verification.
+kernel void kernel_glm_argmax_batch_f32(
+        constant ds4_metal_args_glm_argmax_batch & args,
+        device const float * logits,
+        device       int   * out_idx,
+        device       float * out_val,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_tok || args.n_vocab == 0) return;
+    device const float * row = logits + (uint64_t)gid * args.n_vocab;
+    float best = row[0];
+    uint32_t best_i = 0;
+    for (uint32_t i = 1; i < args.n_vocab; i++) {
+        const float v = row[i];
+        if (v > best) {
+            best = v;
+            best_i = i;
+        }
+    }
+    out_idx[gid] = (int)best_i;
+    out_val[gid] = best;
+}
+
 struct ds4_metal_args_glm_rmsnorm {
     uint32_t n;     // elements to normalize over
     float    eps;   // 1e-5

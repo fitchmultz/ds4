@@ -26879,6 +26879,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 typedef struct { uint32_t rows; uint32_t cols; } ds4_gpu_glm_matvec_args;
 typedef struct { uint32_t rows; uint32_t cols; uint32_t n_tok; } ds4_gpu_glm_matmul_args;
 typedef struct { uint32_t n; uint32_t n_tok; } ds4_gpu_glm_add_batch_args;
+typedef struct { uint32_t n_vocab; uint32_t n_tok; } ds4_gpu_glm_argmax_batch_args;
 typedef struct { uint32_t n; float eps; }        ds4_gpu_glm_rmsnorm_args;
 typedef struct { uint32_t n; uint32_t n_tok; float eps; } ds4_gpu_glm_rmsnorm_batch_args;
 typedef struct { uint32_t d; uint32_t n_head; float base; uint32_t t; } ds4_gpu_glm_rope_args;
@@ -27034,6 +27035,50 @@ int ds4_gpu_glm_add_batch_f32(const float * a, const float * b, float * out,
         if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm add batch");
         if (ok) ds4_gpu_tensor_read(to, 0, out, nb);
         ds4_gpu_tensor_free(ta); ds4_gpu_tensor_free(tb); ds4_gpu_tensor_free(to);
+        return ok;
+    }
+}
+
+int ds4_gpu_glm_argmax_batch_f32(const float * logits, int * out_idx,
+                                 float * out_val, uint32_t n_vocab,
+                                 uint32_t n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_vocab == 0 || n_tok == 0) return 1;
+    ds4_gpu_glm_argmax_batch_args args = { n_vocab, n_tok };
+    @autoreleasepool {
+        const uint64_t lb = (uint64_t)n_tok * n_vocab * sizeof(float);
+        const uint64_t ib = (uint64_t)n_tok * sizeof(int);
+        const uint64_t vb = (uint64_t)n_tok * sizeof(float);
+        ds4_gpu_tensor *tl = ds4_gpu_tensor_alloc(lb);
+        ds4_gpu_tensor *ti = ds4_gpu_tensor_alloc(ib);
+        ds4_gpu_tensor *tv = ds4_gpu_tensor_alloc(vb);
+        if (!tl || !ti || !tv) {
+            ds4_gpu_tensor_free(tl); ds4_gpu_tensor_free(ti); ds4_gpu_tensor_free(tv);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tl, 0, logits, lb);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline("kernel_glm_argmax_batch_f32");
+        int ok = 0;
+        if (pipe) {
+            [enc setComputePipelineState:pipe];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            ds4_gpu_glm_bind(enc, tl, 1);
+            ds4_gpu_glm_bind(enc, ti, 2);
+            ds4_gpu_glm_bind(enc, tv, 3);
+            [enc dispatchThreadgroups:MTLSizeMake(n_tok, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            ok = 1;
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm argmax batch");
+        if (ok) {
+            ds4_gpu_tensor_read(ti, 0, out_idx, ib);
+            ds4_gpu_tensor_read(tv, 0, out_val, vb);
+        }
+        ds4_gpu_tensor_free(tl); ds4_gpu_tensor_free(ti); ds4_gpu_tensor_free(tv);
         return ok;
     }
 }

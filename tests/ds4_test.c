@@ -3542,6 +3542,57 @@ static void test_glm_metal_components(void) {
                 TEST_ASSERT(idx_ok);
             }
             glm_metal_cmp("MoE route batch2 weights", bmw, bcw, (size_t)batch_n * K, tol_abs, tol_rel);
+
+            /* LM-head-shaped batch verifier surface: output RMSNorm -> row
+             * matmul over a small vocab surrogate -> row-wise top-1.  The real
+             * verifier needs exactly this top-1 result for each target row. */
+            float *ones_h = malloc((size_t)H * sizeof(float));
+            float *c_head_norm = malloc((size_t)batch_n * H * sizeof(float));
+            float *m_head_norm = malloc((size_t)batch_n * H * sizeof(float));
+            float *c_head_logits = malloc((size_t)batch_n * E * sizeof(float));
+            float *m_head_logits = malloc((size_t)batch_n * E * sizeof(float));
+            int *c_head_idx = malloc((size_t)batch_n * sizeof(int));
+            int *m_head_idx = malloc((size_t)batch_n * sizeof(int));
+            float *c_head_val = malloc((size_t)batch_n * sizeof(float));
+            float *m_head_val = malloc((size_t)batch_n * sizeof(float));
+            TEST_ASSERT(ones_h && c_head_norm && m_head_norm && c_head_logits &&
+                        m_head_logits && c_head_idx && m_head_idx &&
+                        c_head_val && m_head_val);
+            for (uint32_t i = 0; i < H; i++) ones_h[i] = 1.0f;
+            glm_rmsnorm_batch_f32(c_head_norm, xb, ones_h, H, batch_n, shape.rms_eps);
+            TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(xb, ones_h, m_head_norm, H, batch_n, shape.rms_eps));
+            glm_matmul_f32(c_head_logits, gate, c_head_norm, E, H, batch_n);
+            TEST_ASSERT(ds4_gpu_glm_matmul_f32(gate, m_head_norm, m_head_logits, E, H, batch_n));
+            glm_metal_cmp("LM head batch2 logits", m_head_logits, c_head_logits,
+                          (size_t)batch_n * E, tol_abs, tol_rel);
+            for (uint32_t t = 0; t < batch_n; t++) {
+                const float *row = c_head_logits + (size_t)t * E;
+                int best_i = 0;
+                float best = row[0];
+                for (uint32_t i = 1; i < E; i++) {
+                    if (row[i] > best) { best = row[i]; best_i = (int)i; }
+                }
+                c_head_idx[t] = best_i;
+                c_head_val[t] = best;
+            }
+            TEST_ASSERT(ds4_gpu_glm_argmax_batch_f32(m_head_logits, m_head_idx, m_head_val, E, batch_n));
+            {
+                bool idx_ok = true;
+                for (uint32_t t = 0; t < batch_n; t++)
+                    if (m_head_idx[t] != c_head_idx[t]) { idx_ok = false; break; }
+                fprintf(stderr, "  glm-metal: %-30s %s (idx=[%d,%d] cpu=[%d,%d])\n",
+                        "LM head batch2 top1 idx", idx_ok ? "PASS" : "FAIL",
+                        batch_n >= 1 ? m_head_idx[0] : -1, batch_n >= 2 ? m_head_idx[1] : -1,
+                        batch_n >= 1 ? c_head_idx[0] : -1, batch_n >= 2 ? c_head_idx[1] : -1);
+                g_glm_metal_total++;
+                if (idx_ok) g_glm_metal_pass++;
+                TEST_ASSERT(idx_ok);
+            }
+            glm_metal_cmp("LM head batch2 top1 logit", m_head_val, c_head_val,
+                          batch_n, tol_abs, tol_rel);
+            free(ones_h); free(c_head_norm); free(m_head_norm);
+            free(c_head_logits); free(m_head_logits); free(c_head_idx);
+            free(m_head_idx); free(c_head_val); free(m_head_val);
             free(blogits); free(bcidx); free(bmidx); free(bcw); free(bmw);
 
             free(clogits); free(mlogits);
@@ -3979,7 +4030,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},
     {"--glm-nextn-metal-synth", "glm-nextn-metal-synth", "GLM-5.2 Metal NextN/MTP path on a tiny synthetic block (no model needed)", test_glm_nextn_metal_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
-    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels and layer-major MLA/FFN/block/MoE batch composites vs CPU reference", test_glm_metal_components},
+    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels and layer-major MLA/FFN/block/MoE/LM-head batch composites vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
     {"--glm-spec-metal-target-synth", "glm-spec-metal-target-synth", "GLM-5.2 NextN speculative accept/rollback through the real Metal target step (no model needed)", test_glm_spec_metal_target_synth},
