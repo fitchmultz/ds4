@@ -255,6 +255,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "DS4_GLM_NEXTN_TRACE_OUT=FILE", "GLM diagnostic: write --glm-nextn per-round CSV trace with drafts, accepted count, fallback token, and generated count.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_F32=1", "GLM diagnostic: opt --glm-nextn verification into the full F32 layer-major Metal target-batch path; 0/off/false/no disable. Correctness/proof path, not a default speed claim.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_TIME=1", "GLM diagnostic: time the GLM batch helper by alloc/embed/attention/FFN/head plus attention dequant/proj/cache/decode/out detail; 0/off/false/no disable.");
+    opt(fp, c, "DS4_GLM_MLA_DETAIL_TIME=1", "GLM diagnostic: with DS4_GLM_MLA_TIME=1, split decode MLA cost into host dequant, k_b reorder, and Metal MLA body.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_FAST_MOE=1", "GLM diagnostic: with DS4_GLM_VERIFY_BATCH_F32=1 and DS4_GLM_FAST=1, let the batch verifier use production fast routed-MoE kernels; default keeps the pure F32 proof path.");
     opt(fp, c, "DS4_GLM_PREFILL_BATCH_CHECK=1", "GLM diagnostic: for short Metal prompts, compare sequential prefill and layer-major batch prefill final/continuation logits in scratch ctxs; does not affect output.");
     opt(fp, c, "DS4_GLM_PREFILL_BATCH_LIVE=0/off", "GLM fast path: disable the default short-prompt live batched prefill used by DS4_GLM_FAST=1. Set =1 to force the guarded scratch-copy prefill outside DS4_GLM_FAST.");

@@ -28431,6 +28431,24 @@ static void glm_down_verify_report(uint32_t il, int type,
  * math, no new kernel, just no per-token dequant.  Eligible when the layer's
  * pre-dequanted buffers are present (set at init when fast is on). */
 
+static double g_glm_q8_alloc_s, g_glm_q8_write_s, g_glm_q8_kernel_s, g_glm_q8_read_s;
+static uint64_t g_glm_q8_calls;
+static double g_glm_f32_qa_s, g_glm_f32_qb_s, g_glm_f32_kva_s;
+static double g_glm_f32_kb_s, g_glm_f32_vb_s, g_glm_f32_out_s;
+static uint64_t g_glm_f32_qa_calls, g_glm_f32_qb_calls, g_glm_f32_kva_calls;
+static uint64_t g_glm_f32_kb_calls, g_glm_f32_vb_calls, g_glm_f32_out_calls;
+
+static bool glm_mla_matvec_f32_profiled(bool prof, double *total, uint64_t *calls,
+                                        const float *W, const float *x, float *out,
+                                        uint32_t rows, uint32_t cols) {
+    if (!prof) return ds4_gpu_glm_matvec_f32(W, x, out, rows, cols) != 0;
+    const double t0 = now_sec();
+    const bool ok = ds4_gpu_glm_matvec_f32(W, x, out, rows, cols) != 0;
+    *total += now_sec() - t0;
+    (*calls)++;
+    return ok;
+}
+
 /* One fused Q8_0 decode matvec: out[out_dim] = W_q8_0[out_dim,in_dim] @ x[in_dim]
  * via ds4_gpu_matmul_q8_0_tensor, where W stays quantized in the mmap'd GGUF
  * range (GPU-addressable through the registered model view). Only the small F32
@@ -28441,13 +28459,19 @@ static bool glm_fused_q8_matvec(const void *model_map, uint64_t model_size,
                                 uint64_t weight_offset,
                                 uint32_t in_dim, uint32_t out_dim,
                                 const float *x, float *out) {
+    const bool prof = getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL;
+    double t0 = prof ? now_sec() : 0.0;
     ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
     ds4_gpu_tensor *to = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    if (prof) { g_glm_q8_alloc_s += now_sec() - t0; t0 = now_sec(); }
     if (!tx || !to) { ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to); return false; }
     ds4_gpu_tensor_write(tx, 0, x, (uint64_t)in_dim * sizeof(float));
+    if (prof) { g_glm_q8_write_s += now_sec() - t0; t0 = now_sec(); }
     const int ok = ds4_gpu_matmul_q8_0_tensor(to, model_map, model_size,
                                               weight_offset, in_dim, out_dim, tx, 1);
+    if (prof) { g_glm_q8_kernel_s += now_sec() - t0; t0 = now_sec(); }
     if (ok) ds4_gpu_tensor_read(to, 0, out, (uint64_t)out_dim * sizeof(float));
+    if (prof) { g_glm_q8_read_s += now_sec() - t0; g_glm_q8_calls++; }
     ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
     return ok != 0;
 }
@@ -28496,26 +28520,36 @@ static bool glm_mla_forward_token_metal_pos(
     if (fast) {
         if (!glm_fused_q8_matvec(m->parts[tq_a->part].map, m->parts[tq_a->part].size,
                                  tq_a->abs_offset, H, ql, x, wqa)) return false;
-    } else if (!ds4_gpu_glm_matvec_f32(WqA, x, wqa, ql, H)) return false;
+    } else if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
+                                            &g_glm_f32_qa_s, &g_glm_f32_qa_calls,
+                                            WqA, x, wqa, ql, H)) return false;
     if (!ds4_gpu_glm_rmsnorm_f32(wqa, w_q_a_norm, wqa_n, ql, shape->rms_eps)) return false;
     if (fast) {
         if (!glm_fused_q8_matvec(m->parts[tq_b->part].map, m->parts[tq_b->part].size,
                                  tq_b->abs_offset, ql, nh * qhd, wqa_n, q_flat)) return false;
-    } else if (!ds4_gpu_glm_matvec_f32(WqB, wqa_n, q_flat, nh * qhd, ql)) return false;
+    } else if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
+                                            &g_glm_f32_qb_s, &g_glm_f32_qb_calls,
+                                            WqB, wqa_n, q_flat, nh * qhd, ql)) return false;
 
     /* kv path: WkvA@x -> split latent/rope -> RMSNorm(latent) -> k_b/v_b. */
     if (fast) {
         if (!glm_fused_q8_matvec(m->parts[tkv_a->part].map, m->parts[tkv_a->part].size,
                                  tkv_a->abs_offset, H, kvl + rope, x, kva)) return false;
-    } else if (!ds4_gpu_glm_matvec_f32(WkvA, x, kva, kvl + rope, H)) return false;
+    } else if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
+                                            &g_glm_f32_kva_s, &g_glm_f32_kva_calls,
+                                            WkvA, x, kva, kvl + rope, H)) return false;
     const float *latent     = kva;
     const float *k_rope_raw = kva + kvl;
     if (!ds4_gpu_glm_rmsnorm_f32(latent, w_kv_a_norm, kvln, kvl, shape->rms_eps)) return false;
-    if (!ds4_gpu_glm_matvec_f32(WkB, kvln, k_nope, nh * nope, kvl)) return false;  /* k_b: F32 oracle */
+    if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
+                                     &g_glm_f32_kb_s, &g_glm_f32_kb_calls,
+                                     WkB, kvln, k_nope, nh * nope, kvl)) return false;  /* k_b: F32 oracle */
     if (fast) {
         if (!glm_fused_q8_matvec(m->parts[tv_b->part].map, m->parts[tv_b->part].size,
                                  tv_b->abs_offset, kvl, nh * vd, kvln, v)) return false;
-    } else if (!ds4_gpu_glm_matvec_f32(WvB, kvln, v, nh * vd, kvl)) return false;
+    } else if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
+                                            &g_glm_f32_vb_s, &g_glm_f32_vb_calls,
+                                            WvB, kvln, v, nh * vd, kvl)) return false;
 
     /* Insert current token k/v into host-side caches (rope unrotated first,
      * overwritten with rotated rope below -- mirrors the CPU composite). */
@@ -28553,7 +28587,9 @@ static bool glm_mla_forward_token_metal_pos(
         const ds4_tensor *twop = glm_layer_tensor(m, il, "attn_output");
         if (!twop || !glm_fused_q8_matvec(m->parts[twop->part].map, m->parts[twop->part].size,
                                           twop->abs_offset, nh * vd, H, attn_o, out)) return false;
-    } else if (!ds4_gpu_glm_matvec_f32(Wo, attn_o, out, H, nh * vd)) return false;
+    } else if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
+                                            &g_glm_f32_out_s, &g_glm_f32_out_calls,
+                                            Wo, attn_o, out, H, nh * vd)) return false;
     return true;
 }
 
@@ -29002,6 +29038,7 @@ typedef struct {
      * (the 6 MLA projections + rmsnorm/rope/attn/cache), for isolating the
      * fused-Q8_0 MLA speedup from SSD-streaming / LM-head / MoE noise. */
     double mla_total_s;
+    double mla_dequant_s, mla_reorder_s, mla_gpu_s;
     uint64_t mla_calls;
     /* DS4_GLM_MOE_TIME: cumulative time in the MoE fast-path sub-stages
      * (gate/up fused dispatch, down fallback, shared expert). */
@@ -29232,12 +29269,40 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
         if (c->sh_d) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_d[l]); free(c->sh_d); }
     }
     free(c->chunk_w); free(c->chunk_logits);
-    if (c->mla_calls && getenv("DS4_GLM_MLA_TIME"))
+    if (c->mla_calls && getenv("DS4_GLM_MLA_TIME")) {
         fprintf(stderr, "ds4: glm-metal MLA-block: %.3fs total, %.6fs avg/call "
                         "(%llu calls, %s)\n",
                 c->mla_total_s, c->mla_total_s / (double)c->mla_calls,
                 (unsigned long long)c->mla_calls,
                 c->fast ? "fast=fused-Q8_0" : "fast=off-F32-oracle");
+        if (getenv("DS4_GLM_MLA_DETAIL_TIME")) {
+            const double q8_total = g_glm_q8_alloc_s + g_glm_q8_write_s +
+                                    g_glm_q8_kernel_s + g_glm_q8_read_s;
+            fprintf(stderr, "ds4: glm-metal MLA detail: dequant=%.3fs reorder=%.3fs gpu=%.3fs "
+                            "avg/call dequant=%.6fs reorder=%.6fs gpu=%.6fs\n",
+                    c->mla_dequant_s, c->mla_reorder_s, c->mla_gpu_s,
+                    c->mla_dequant_s / (double)c->mla_calls,
+                    c->mla_reorder_s / (double)c->mla_calls,
+                    c->mla_gpu_s / (double)c->mla_calls);
+            fprintf(stderr, "ds4: glm-metal MLA q8 helpers: calls=%llu alloc=%.3fs write=%.3fs kernel_wait=%.3fs read=%.3fs total=%.3fs avg=%.6fs\n",
+                    (unsigned long long)g_glm_q8_calls,
+                    g_glm_q8_alloc_s, g_glm_q8_write_s, g_glm_q8_kernel_s,
+                    g_glm_q8_read_s, q8_total,
+                    g_glm_q8_calls ? q8_total / (double)g_glm_q8_calls : 0.0);
+            const double f32_total = g_glm_f32_qa_s + g_glm_f32_qb_s + g_glm_f32_kva_s +
+                                     g_glm_f32_kb_s + g_glm_f32_vb_s + g_glm_f32_out_s;
+            fprintf(stderr, "ds4: glm-metal MLA f32 helpers: q_a=%.3fs q_b=%.3fs kv_a=%.3fs k_b=%.3fs v_b=%.3fs out=%.3fs total=%.3fs calls=%llu/%llu/%llu/%llu/%llu/%llu\n",
+                    g_glm_f32_qa_s, g_glm_f32_qb_s, g_glm_f32_kva_s,
+                    g_glm_f32_kb_s, g_glm_f32_vb_s, g_glm_f32_out_s,
+                    f32_total,
+                    (unsigned long long)g_glm_f32_qa_calls,
+                    (unsigned long long)g_glm_f32_qb_calls,
+                    (unsigned long long)g_glm_f32_kva_calls,
+                    (unsigned long long)g_glm_f32_kb_calls,
+                    (unsigned long long)g_glm_f32_vb_calls,
+                    (unsigned long long)g_glm_f32_out_calls);
+        }
+    }
     if (c->moe_calls && getenv("DS4_GLM_MOE_TIME"))
         fprintf(stderr, "ds4: glm-metal MoE fast-path: %.3fs gate/up, %.3fs down, "
                         "%.3fs shared (%llu MoE-layer calls, %.6fs avg gu/call)\n",
@@ -29325,8 +29390,9 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
          * [out,in] Q8_0 weight). The other five MLA projections are skipped
          * here when this layer runs the fused Q8_0 fast path. */
         const bool fast_l = c->fast && glm_mla_fast_eligible(m, il);
+        const bool mla_detail = getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL;
+        double mla_detail_t0 = mla_detail ? now_sec() : 0.0;
         glm_dequant_weight(m, k_b, c->WkBn);
-        glm_k_b_reorder(c->WkB, c->WkBn, nope, kvl, nh);   /* real k_b is nope-contiguous */
         if (!fast_l) {
             glm_dequant_weight(m, q_a, c->WqA);
             glm_dequant_weight(m, q_b, c->WqB);
@@ -29334,6 +29400,12 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
             glm_dequant_weight(m, v_b, c->WvB);
             glm_dequant_weight(m, wop, c->Wo);
         }
+        if (mla_detail) {
+            c->mla_dequant_s += now_sec() - mla_detail_t0;
+            mla_detail_t0 = now_sec();
+        }
+        glm_k_b_reorder(c->WkB, c->WkBn, nope, kvl, nh);   /* real k_b is nope-contiguous */
+        if (mla_detail) c->mla_reorder_s += now_sec() - mla_detail_t0;
         const float *qa_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_q_a_norm"));
         const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
         const bool mla_time = getenv("DS4_GLM_MLA_TIME") != NULL;
@@ -29348,7 +29420,11 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
             return false;
         if (mla_time || dec_prof) {
             const double dt = now_sec() - mla_t0;
-            if (mla_time) { c->mla_total_s += dt; c->mla_calls++; }
+            if (mla_time) {
+                c->mla_total_s += dt;
+                if (mla_detail) c->mla_gpu_s += dt;
+                c->mla_calls++;
+            }
             if (dec_prof) c->dec_mla_s += dt;
         }
         if (il == 3 && pos == 0 && getenv("DS4_GLM_ATTN3_OUT")) {

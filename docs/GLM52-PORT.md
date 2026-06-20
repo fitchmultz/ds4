@@ -362,7 +362,14 @@ The core GLM port is complete and verified. The active work is usability/speed:
   run after live batched prefill, the 2-row verifier attention split was
   `dequant=2.248s proj=2.247s cache=0.002s decode=0.137s out=2.362s`
   (`attn=6.998s`), so raw attention decode is not the bottleneck; weight
-  dequant/reorder plus Q/KV and output projections are. A fair no-profile run on the same prompt
+  dequant/reorder plus Q/KV and output projections are. A decode MLA detail
+  profile (`DS4_GLM_MLA_DETAIL_TIME=1`, `asdfqwer -n 3`) confirms the same root
+  cause in the default path: the current UD_IQ2_M quant is not Q8-eligible for
+  the MLA fast path (`q8 helpers: calls=0`), so each decode step still dequants
+  and calls the generic F32 projection helpers. For two decode steps, MLA spent
+  `dequant=4.747s`, `reorder=0.414s`, `gpu=8.806s`; inside the F32 helpers
+  `attn_output` alone cost `4.478s`, followed by `q_b=1.527s`, `q_a=0.785s`,
+  `kv_a=0.482s`, `v_b=0.428s`, `k_b=0.344s`. A fair no-profile run on the same prompt
   measured plain greedy `DS4_GLM_FAST=1 --glm-raw -n 3` at decode `21.21s` and
   opt-in `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1
   DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at decode `12.30s`, with identical ids/stdout
