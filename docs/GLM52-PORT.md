@@ -394,16 +394,16 @@ The core GLM port is complete and verified. The active work is usability/speed:
   Q8_0 `attn_q_b`/`attn_kv_a_mqa`/`attn_v_b` through the existing tensor-map
   Q8 helper made real decode much slower (`14.89s -> 68.16s` for profiled
   `asdfqwer -n 3`), so do not wire that path without a separate Q8 benchmark win.
-  A fair no-profile run on the same prompt
-  measured plain greedy `DS4_GLM_FAST=1 --glm-raw -n 3` at decode `21.21s` and
-  opt-in `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1
-  DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at decode `12.30s`, with identical ids/stdout
-  and `target_steps=2,target_batches=1`; this is a narrow accepted-round opt-in
-  measurement, not a default production speed claim. A second prompt,
-  `The meaning of life is -n 3`, kept identical ids/stdout (`264 27066 323`,
-  ` a profound and`) but missed the draft (`target_steps=2,target_batches=2`) and
-  measured NextN decode `22.55s` vs plain greedy `20.36s`, confirming acceptance
-  rate still gates speed. A naive adaptive miss-budget probe was rejected for now:
+  After direct `attn_output` became the `DS4_GLM_FAST=1` default, a fresh
+  no-profile accepted-round run on `asdfqwer -n 3` measured plain greedy decode
+  `16.34s` and opt-in `--glm-nextn --glm-nextn-draft 1` with
+  `DS4_GLM_VERIFY_BATCH_F32=1 DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at decode
+  `13.82s`, with identical ids/stdout and `target_steps=2,target_batches=1`;
+  this is a narrow accepted-round opt-in measurement, not a default production
+  speed claim. A second prompt, `The meaning of life is -n 3`, kept identical
+  ids/stdout (`264 27066 323`, ` a profound and`) but missed the draft
+  (`target_steps=2,target_batches=2`) and measured NextN decode `21.45s` vs
+  plain greedy `16.23s`, confirming acceptance rate still gates speed. A naive adaptive miss-budget probe was rejected for now:
   on `The meaning of life is -n 5`, disabling drafts after the first miss kept
   ids/stdout but slowed decode to `44.92s` versus `36.24s` with normal NextN,
   because the next round would have accepted. Default remains the pure F32 proof path,
