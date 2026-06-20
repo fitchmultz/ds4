@@ -27633,12 +27633,51 @@ static void glm_cpu_fwd_step(glm_cpu_fwd_ctx *c, int token, uint32_t pos,
 static void glm_cpu_forward(const ds4_model *m, const glm_cpu_shape *shape,
                             uint32_t n_layer, uint32_t n_dense,
                             const int *tokens, uint32_t n_tokens,
-                            float *logits) {
+                            float *logits, float *h_norm_out) {
     glm_cpu_fwd_ctx c;
     glm_cpu_fwd_init(&c, m, shape, n_layer, n_dense, n_tokens);
     for (uint32_t t = 0; t < n_tokens; t++)
         glm_cpu_fwd_step(&c, tokens[t], t, t + 1 == n_tokens, logits);
+    if (h_norm_out) memcpy(h_norm_out, c.xn, (size_t)shape->hidden * sizeof(float));
     glm_cpu_fwd_free(&c);
+}
+
+/* Compute the first GLM NextN/MTP operation from the SGLang contract:
+ *   eh_proj([enorm(accepted_token_embedding), hnorm(target_hidden)])
+ * where target_hidden is the post-output-norm vector from the target model.
+ * This is a CPU diagnostic/prerequisite, not a generation path yet.  It avoids
+ * materializing the full 302 MiB eh_proj as F32 by dequanting one output row at
+ * a time into a bounded scratch row. */
+static bool glm_nextn_eh_project_cpu(const ds4_model *m,
+                                     const glm_cpu_shape *shape,
+                                     int accepted_token,
+                                     const float *target_h,
+                                     float *out) {
+    const uint32_t H = shape->hidden;
+    const ds4_tensor *t_embd = model_find_tensor(m, "token_embd.weight");
+    const ds4_tensor *t_enorm = glm_layer_tensor(m, 78, "nextn.enorm");
+    const ds4_tensor *t_hnorm = glm_layer_tensor(m, 78, "nextn.hnorm");
+    const ds4_tensor *t_eh = glm_layer_tensor(m, 78, "nextn.eh_proj");
+    if (!t_embd || !t_enorm || !t_hnorm || !t_eh) return false;
+    if (t_eh->dim[0] != (uint64_t)2 * H || t_eh->dim[1] != H) return false;
+
+    const uint64_t embd_row_bytes = t_embd->bytes / t_embd->dim[1];
+    float *tok = xmalloc((size_t)H * sizeof(float));
+    float *concat = xmalloc((size_t)2 * H * sizeof(float));
+    float *row = xmalloc((size_t)2 * H * sizeof(float));
+    glm_dequant_count(m, t_embd, (uint64_t)accepted_token * embd_row_bytes, H, tok);
+    glm_rmsnorm_f32(concat, tok, (const float *)tensor_data(m, t_enorm), H, shape->rms_eps);
+    glm_rmsnorm_f32(concat + H, target_h, (const float *)tensor_data(m, t_hnorm), H, shape->rms_eps);
+
+    const uint64_t row_bytes = t_eh->bytes / H;
+    for (uint32_t r = 0; r < H; r++) {
+        glm_dequant_count(m, t_eh, (uint64_t)r * row_bytes, (size_t)2 * H, row);
+        float s = 0.0f;
+        for (uint32_t i = 0; i < 2 * H; i++) s += row[i] * concat[i];
+        out[r] = s;
+    }
+    free(row); free(concat); free(tok);
+    return true;
 }
 
 void ds4_glm_cpu_forward_UNUSED(void) {}  /* placeholder removed below */
@@ -27678,7 +27717,8 @@ int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict) {
     const double t0 = now_sec();
     fprintf(stderr, "ds4: glm-cpu-ref: %u tokens, %u backbone layers (%u dense + %u MoE), vocab %u\n",
             toks.len, n_layer, n_dense, n_layer - n_dense, vocab);
-    glm_cpu_forward(m, &shape, n_layer, n_dense, toks.v, (uint32_t)toks.len, logits);
+    float *h_nextn = xmalloc((size_t)shape.hidden * sizeof(float));
+    glm_cpu_forward(m, &shape, n_layer, n_dense, toks.v, (uint32_t)toks.len, logits, h_nextn);
     fprintf(stderr, "ds4: glm-cpu-ref: forward done in %.2fs\n", now_sec() - t0);
 
     /* Greedy argmax + finiteness over logits. */
@@ -27691,6 +27731,27 @@ int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict) {
     }
     printf("glm-cpu-ref: token=%d top_logit=%.6f logits_finite=%s vocab=%u prompt_tokens=%u\n",
            argmax, (double)top, finite ? "yes" : "no", vocab, toks.len);
+
+    const char *eh_path = getenv("DS4_GLM_NEXTN_EH_OUT");
+    if (eh_path && eh_path[0]) {
+        float *eh = xmalloc((size_t)shape.hidden * sizeof(float));
+        if (glm_nextn_eh_project_cpu(m, &shape, argmax, h_nextn, eh)) {
+            FILE *ef = fopen(eh_path, "wb");
+            if (ef) {
+                fwrite(eh, sizeof(float), shape.hidden, ef);
+                fclose(ef);
+                fprintf(stderr, "ds4: glm-cpu-ref: dumped NextN eh_proj seed (%u floats) to %s\n",
+                        shape.hidden, eh_path);
+            } else {
+                fprintf(stderr, "ds4: glm-cpu-ref: failed to open DS4_GLM_NEXTN_EH_OUT=%s: %s\n",
+                        eh_path, strerror(errno));
+            }
+        } else {
+            fprintf(stderr, "ds4: glm-cpu-ref: failed to compute NextN eh_proj seed\n");
+        }
+        free(eh);
+    }
+
     /* Optional full-logit dump for the strong full-vector comparison vs the
      * llama.cpp oracle (DS4_GLM_LOGITS_OUT=<path>).  Raw F32, vocab entries. */
     const char *lpath = getenv("DS4_GLM_LOGITS_OUT");
@@ -27703,6 +27764,7 @@ int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict) {
         }
     }
 
+    free(h_nextn);
     free(logits);
     free(toks.v);
     return finite ? 0 : 1;
@@ -28837,7 +28899,7 @@ int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit, bool *out_fi
     int tokens[3] = { 1, 5, 9 };
     const uint32_t n_tokens = 3;
     float *logits = xmalloc((size_t)c.vocab * sizeof(float));
-    glm_cpu_forward(&c.model, &c.shape, c.n_layer, c.n_dense, tokens, n_tokens, logits);
+    glm_cpu_forward(&c.model, &c.shape, c.n_layer, c.n_dense, tokens, n_tokens, logits, NULL);
 
     int argmax = 0; float top = logits[0]; bool finite = isfinite(logits[0]);
     for (uint32_t v = 1; v < c.vocab; v++) {
@@ -29136,7 +29198,7 @@ int ds4_glm_cpu_generate_synth(int n_steps, int *out_match) {
         glm_cpu_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
     int match = 0;
     for (int s = 0; s < n_steps; s++) {
-        glm_cpu_forward(&sc.model, &sc.shape, sc.n_layer, sc.n_dense, prefix, preflen, ln);
+        glm_cpu_forward(&sc.model, &sc.shape, sc.n_layer, sc.n_dense, prefix, preflen, ln, NULL);
         int ai = sample_argmax(li, sc.vocab);
         int an = sample_argmax(ln, sc.vocab);
         if (ai != an) break;
@@ -29182,7 +29244,7 @@ int ds4_glm_metal_generate_synth(int n_steps, int *out_match) {
         ok = glm_metal_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
     int match = 0;
     for (int s = 0; ok && s < n_steps; s++) {
-        glm_cpu_forward(&sc.model, &sc.shape, sc.n_layer, sc.n_dense, prefix, preflen, ln);
+        glm_cpu_forward(&sc.model, &sc.shape, sc.n_layer, sc.n_dense, prefix, preflen, ln, NULL);
         int ai = sample_argmax(li, sc.vocab);
         int an = sample_argmax(ln, sc.vocab);
         if (ai != an) break;
