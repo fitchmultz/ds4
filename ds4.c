@@ -27824,6 +27824,91 @@ static bool glm_nextn_logits_cpu(const ds4_model *m,
     return true;
 }
 
+static void glm_nextn_run_diagnostic(const char *label,
+                                     const ds4_model *m,
+                                     const glm_cpu_shape *shape,
+                                     int accepted_token,
+                                     const float *target_h,
+                                     uint32_t vocab) {
+    const char *eh_path = getenv("DS4_GLM_NEXTN_EH_OUT");
+    const char *nh_path = getenv("DS4_GLM_NEXTN_H_OUT");
+    const char *nl_path = getenv("DS4_GLM_NEXTN_LOGITS_OUT");
+    const bool need_eh = eh_path && eh_path[0];
+    const bool need_dec = (nh_path && nh_path[0]) || (nl_path && nl_path[0]);
+    if (!need_eh && !need_dec) return;
+
+    const char *who = label ? label : "glm";
+    const char *mode = (label && strstr(label, "metal")) ? "metal" : "cpu";
+    float *eh = xmalloc((size_t)shape->hidden * sizeof(float));
+    if (!glm_nextn_eh_project_cpu(m, shape, accepted_token, target_h, eh)) {
+        fprintf(stderr, "ds4: %s: failed to compute NextN eh_proj seed\n", who);
+        free(eh);
+        return;
+    }
+
+    if (need_eh) {
+        FILE *ef = fopen(eh_path, "wb");
+        if (ef) {
+            fwrite(eh, sizeof(float), shape->hidden, ef);
+            fclose(ef);
+            fprintf(stderr, "ds4: %s: dumped NextN eh_proj seed (%u floats) to %s\n",
+                    who, shape->hidden, eh_path);
+        } else {
+            fprintf(stderr, "ds4: %s: failed to open DS4_GLM_NEXTN_EH_OUT=%s: %s\n",
+                    who, eh_path, strerror(errno));
+        }
+    }
+
+    if (need_dec) {
+        float *nh = xmalloc((size_t)shape->hidden * sizeof(float));
+        if (glm_nextn_decoder_cpu(m, shape, eh, nh)) {
+            if (nh_path && nh_path[0]) {
+                FILE *hf = fopen(nh_path, "wb");
+                if (hf) {
+                    fwrite(nh, sizeof(float), shape->hidden, hf);
+                    fclose(hf);
+                    fprintf(stderr, "ds4: %s: dumped NextN decoder hidden (%u floats) to %s\n",
+                            who, shape->hidden, nh_path);
+                } else {
+                    fprintf(stderr, "ds4: %s: failed to open DS4_GLM_NEXTN_H_OUT=%s: %s\n",
+                            who, nh_path, strerror(errno));
+                }
+            }
+            if (nl_path && nl_path[0]) {
+                float *nlogits = xmalloc((size_t)vocab * sizeof(float));
+                if (glm_nextn_logits_cpu(m, shape, nh, nlogits, vocab)) {
+                    int narg = 0;
+                    float ntop = nlogits[0];
+                    bool nfinite = isfinite(nlogits[0]);
+                    for (uint32_t v = 1; v < vocab; v++) {
+                        if (!isfinite(nlogits[v])) nfinite = false;
+                        if (nlogits[v] > ntop) { ntop = nlogits[v]; narg = (int)v; }
+                    }
+                    printf("glm-nextn-%s: token=%d top_logit=%.6f logits_finite=%s vocab=%u\n",
+                           mode, narg, (double)ntop, nfinite ? "yes" : "no", vocab);
+                    FILE *nf = fopen(nl_path, "wb");
+                    if (nf) {
+                        fwrite(nlogits, sizeof(float), vocab, nf);
+                        fclose(nf);
+                        fprintf(stderr, "ds4: %s: dumped NextN logits (%u floats) to %s\n",
+                                who, vocab, nl_path);
+                    } else {
+                        fprintf(stderr, "ds4: %s: failed to open DS4_GLM_NEXTN_LOGITS_OUT=%s: %s\n",
+                                who, nl_path, strerror(errno));
+                    }
+                } else {
+                    fprintf(stderr, "ds4: %s: failed to compute NextN logits\n", who);
+                }
+                free(nlogits);
+            }
+        } else {
+            fprintf(stderr, "ds4: %s: failed to run NextN decoder diagnostic\n", who);
+        }
+        free(nh);
+    }
+    free(eh);
+}
+
 void ds4_glm_cpu_forward_UNUSED(void) {}  /* placeholder removed below */
 
 /* CLI driver: tokenize the prompt with the loaded GLM vocab, run the full CPU
@@ -27876,77 +27961,7 @@ int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict) {
     printf("glm-cpu-ref: token=%d top_logit=%.6f logits_finite=%s vocab=%u prompt_tokens=%u\n",
            argmax, (double)top, finite ? "yes" : "no", vocab, toks.len);
 
-    const char *eh_path = getenv("DS4_GLM_NEXTN_EH_OUT");
-    if (eh_path && eh_path[0]) {
-        float *eh = xmalloc((size_t)shape.hidden * sizeof(float));
-        if (glm_nextn_eh_project_cpu(m, &shape, argmax, h_nextn, eh)) {
-            FILE *ef = fopen(eh_path, "wb");
-            if (ef) {
-                fwrite(eh, sizeof(float), shape.hidden, ef);
-                fclose(ef);
-                fprintf(stderr, "ds4: glm-cpu-ref: dumped NextN eh_proj seed (%u floats) to %s\n",
-                        shape.hidden, eh_path);
-            } else {
-                fprintf(stderr, "ds4: glm-cpu-ref: failed to open DS4_GLM_NEXTN_EH_OUT=%s: %s\n",
-                        eh_path, strerror(errno));
-            }
-        } else {
-            fprintf(stderr, "ds4: glm-cpu-ref: failed to compute NextN eh_proj seed\n");
-        }
-        free(eh);
-    }
-
-    const char *nh_path = getenv("DS4_GLM_NEXTN_H_OUT");
-    const char *nl_path = getenv("DS4_GLM_NEXTN_LOGITS_OUT");
-    if ((nh_path && nh_path[0]) || (nl_path && nl_path[0])) {
-        float *eh = xmalloc((size_t)shape.hidden * sizeof(float));
-        float *nh = xmalloc((size_t)shape.hidden * sizeof(float));
-        if (glm_nextn_eh_project_cpu(m, &shape, argmax, h_nextn, eh) &&
-            glm_nextn_decoder_cpu(m, &shape, eh, nh)) {
-            if (nh_path && nh_path[0]) {
-                FILE *hf = fopen(nh_path, "wb");
-                if (hf) {
-                    fwrite(nh, sizeof(float), shape.hidden, hf);
-                    fclose(hf);
-                    fprintf(stderr, "ds4: glm-cpu-ref: dumped NextN decoder hidden (%u floats) to %s\n",
-                            shape.hidden, nh_path);
-                } else {
-                    fprintf(stderr, "ds4: glm-cpu-ref: failed to open DS4_GLM_NEXTN_H_OUT=%s: %s\n",
-                            nh_path, strerror(errno));
-                }
-            }
-            if (nl_path && nl_path[0]) {
-                float *nlogits = xmalloc((size_t)vocab * sizeof(float));
-                if (glm_nextn_logits_cpu(m, &shape, nh, nlogits, vocab)) {
-                    int narg = 0;
-                    float ntop = nlogits[0];
-                    bool nfinite = isfinite(nlogits[0]);
-                    for (uint32_t v = 1; v < vocab; v++) {
-                        if (!isfinite(nlogits[v])) nfinite = false;
-                        if (nlogits[v] > ntop) { ntop = nlogits[v]; narg = (int)v; }
-                    }
-                    printf("glm-nextn-cpu: token=%d top_logit=%.6f logits_finite=%s vocab=%u\n",
-                           narg, (double)ntop, nfinite ? "yes" : "no", vocab);
-                    FILE *nf = fopen(nl_path, "wb");
-                    if (nf) {
-                        fwrite(nlogits, sizeof(float), vocab, nf);
-                        fclose(nf);
-                        fprintf(stderr, "ds4: glm-cpu-ref: dumped NextN logits (%u floats) to %s\n",
-                                vocab, nl_path);
-                    } else {
-                        fprintf(stderr, "ds4: glm-cpu-ref: failed to open DS4_GLM_NEXTN_LOGITS_OUT=%s: %s\n",
-                                nl_path, strerror(errno));
-                    }
-                } else {
-                    fprintf(stderr, "ds4: glm-cpu-ref: failed to compute NextN logits\n");
-                }
-                free(nlogits);
-            }
-        } else {
-            fprintf(stderr, "ds4: glm-cpu-ref: failed to run NextN decoder diagnostic\n");
-        }
-        free(nh); free(eh);
-    }
+    glm_nextn_run_diagnostic("glm-cpu-ref", m, &shape, argmax, h_nextn, vocab);
 
     /* Optional full-logit dump for the strong full-vector comparison vs the
      * llama.cpp oracle (DS4_GLM_LOGITS_OUT=<path>).  Raw F32, vocab entries. */
@@ -28859,12 +28874,13 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
 static bool glm_metal_forward(const ds4_model *m, const glm_cpu_shape *shape,
                               uint32_t n_layer, uint32_t n_dense,
                               const int *tokens, uint32_t n_tokens,
-                              float *logits) {
+                              float *logits, float *h_norm_out) {
     glm_metal_fwd_ctx c;
     if (!glm_metal_fwd_init(&c, m, shape, n_layer, n_dense, n_tokens)) return false;
     bool ok = true;
     for (uint32_t t = 0; t < n_tokens && ok; t++)
         ok = glm_metal_fwd_step(&c, tokens[t], t, t + 1 == n_tokens, logits);
+    if (ok && h_norm_out) memcpy(h_norm_out, c.xn, (size_t)shape->hidden * sizeof(float));
     glm_metal_fwd_free(&c);
     return ok;
 }
@@ -28902,10 +28918,12 @@ int ds4_engine_glm_metal_ref(ds4_engine *e, const char *prompt, int n_predict) {
     const double t0 = now_sec();
     fprintf(stderr, "ds4: glm-metal-ref: %u tokens, %u backbone layers (%u dense + %u MoE), vocab %u\n",
             toks.len, n_layer, n_dense, n_layer - n_dense, vocab);
-    const bool ok = glm_metal_forward(m, &shape, n_layer, n_dense, toks.v, (uint32_t)toks.len, logits);
+    float *h_nextn = xmalloc((size_t)shape.hidden * sizeof(float));
+    const bool ok = glm_metal_forward(m, &shape, n_layer, n_dense,
+                                      toks.v, (uint32_t)toks.len, logits, h_nextn);
     fprintf(stderr, "ds4: glm-metal-ref: forward done in %.2fs (%s)\n",
             now_sec() - t0, ok ? "ok" : "KERNEL FAILED");
-    if (!ok) { free(logits); free(toks.v); return 1; }
+    if (!ok) { free(h_nextn); free(logits); free(toks.v); return 1; }
 
     int argmax = 0;
     float top = logits[0];
@@ -28917,6 +28935,8 @@ int ds4_engine_glm_metal_ref(ds4_engine *e, const char *prompt, int n_predict) {
     printf("glm-metal-ref: token=%d top_logit=%.6f logits_finite=%s vocab=%u prompt_tokens=%u\n",
            argmax, (double)top, finite ? "yes" : "no", vocab, toks.len);
 
+    glm_nextn_run_diagnostic("glm-metal-ref", m, &shape, argmax, h_nextn, vocab);
+
     const char *lpath = getenv("DS4_GLM_LOGITS_OUT");
     if (lpath && lpath[0]) {
         FILE *lf = fopen(lpath, "wb");
@@ -28926,6 +28946,7 @@ int ds4_engine_glm_metal_ref(ds4_engine *e, const char *prompt, int n_predict) {
             fprintf(stderr, "ds4: glm-metal-ref: dumped %u logits to %s\n", vocab, lpath);
         }
     }
+    free(h_nextn);
     free(logits);
     free(toks.v);
     return finite ? 0 : 1;
@@ -28942,7 +28963,7 @@ int ds4_glm_metal_forward_synth(int *out_token, float *out_top_logit, bool *out_
     const uint32_t n_tokens = 3;
     float *logits = xmalloc((size_t)c.vocab * sizeof(float));
     const bool ok = glm_metal_forward(&c.model, &c.shape, c.n_layer, c.n_dense,
-                                      tokens, n_tokens, logits);
+                                      tokens, n_tokens, logits, NULL);
     int argmax = 0; float top = logits[0]; bool finite = isfinite(logits[0]) && ok;
     for (uint32_t v = 1; v < c.vocab; v++) {
         if (!isfinite(logits[v])) finite = false;
