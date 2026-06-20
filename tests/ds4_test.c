@@ -3028,6 +3028,25 @@ static void test_glm_spec_generate_synth(void) {
     TEST_ASSERT(miss == 1);
 }
 
+static void test_glm_spec_metal_target_synth(void) {
+#ifdef DS4_NO_GPU
+    fprintf(stderr, "  glm-spec-metal-target-synth: SKIP (built without GPU/Metal)\n");
+    return;
+#else
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "  glm-spec-metal-target-synth: SKIP (no Metal device)\n");
+        return;
+    }
+    const int n_steps = 8;
+    int full = 0, partial = 0, miss = 0;
+    int rc = ds4_glm_spec_metal_target_synth(n_steps, &full, &partial, &miss);
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(full == 1);
+    TEST_ASSERT(partial == 1);
+    TEST_ASSERT(miss == 1);
+#endif
+}
+
 static void test_glm_spec_batch_verify_synth(void) {
     const int n_steps = 8;
     int match = 0, calls = 0;
@@ -3751,6 +3770,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels and layer-major MLA/FFN/MoE batch composites vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
+    {"--glm-spec-metal-target-synth", "glm-spec-metal-target-synth", "GLM-5.2 NextN speculative accept/rollback through the real Metal target step (no model needed)", test_glm_spec_metal_target_synth},
     {"--glm-spec-batch-verify-synth", "glm-spec-batch-verify-synth", "GLM-5.2 NextN batched-verifier contract == naive greedy (no model needed)", test_glm_spec_batch_verify_synth},
     {"--glm-nextn-prefix-synth", "glm-nextn-prefix-synth", "GLM-5.2 NextN persistent draft-prefix commit/reset bookkeeping (no model needed)", test_glm_nextn_prefix_synth},
     {"--glm-spec-trace-synth", "glm-spec-trace-synth", "GLM-5.2 NextN speculative CSV trace includes every round including final no-draft row (no model needed)", test_glm_spec_trace_synth},

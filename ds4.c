@@ -30871,6 +30871,73 @@ int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
     return all_ok ? 0 : 1;
 }
 
+int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
+                                    int *out_partial, int *out_miss) {
+#ifdef DS4_NO_GPU
+    (void)n_steps;
+    if (out_full) *out_full = 0;
+    if (out_partial) *out_partial = 0;
+    if (out_miss) *out_miss = 0;
+    return 1;
+#else
+    glm_synth_ctx sc;
+    glm_synth_build(&sc);
+    int prompt[3] = { 1, 5, 9 };
+    const uint32_t plen = 3;
+    const uint32_t cap = plen + (uint32_t)n_steps + 4;
+    int *greedy = xmalloc((size_t)n_steps * sizeof(int));
+    (void)glm_spec_build_greedy_synth(&sc, prompt, plen, cap, n_steps, greedy);
+
+    const int depth = 4;
+    struct { const char *name; glm_spec_mock_mode mode; int partial_k; int ok; }
+            cases[3] = {
+        {"full",    GLM_SPEC_MOCK_FULL,    depth, 0},
+        {"partial", GLM_SPEC_MOCK_PARTIAL, 2,     0},
+        {"miss",    GLM_SPEC_MOCK_MISS,    0,     0},
+    };
+    for (int ci = 0; ci < 3; ci++) {
+        glm_metal_fwd_ctx c;
+        memset(&c, 0, sizeof(c));
+        float *li = xmalloc((size_t)sc.vocab * sizeof(float));
+        int *ids = xmalloc((size_t)n_steps * sizeof(int));
+        bool ok = glm_metal_fwd_init(&c, &sc.model, &sc.shape,
+                                     sc.n_layer, sc.n_dense, cap);
+        for (uint32_t t = 0; ok && t < plen; t++)
+            ok = glm_metal_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
+        int live_generated = 0;
+        glm_spec_mock_ctx mc = { greedy, &live_generated, n_steps, sc.vocab,
+                                 cases[ci].partial_k, cases[ci].mode, NULL };
+        int generated = 0;
+        const int eos_id = -1;
+        int rc = ok ? glm_spec_decode("glm-spec-metal-synth", glm_gen_metal_step,
+                                      glm_gen_metal_hnorm, &c, prompt, plen,
+                                      n_steps, li, sc.vocab, NULL, eos_id, NULL,
+                                      &generated, ids, NULL, depth,
+                                      glm_spec_mock_draft, &mc, NULL, NULL, NULL,
+                                      &live_generated)
+                    : 1;
+        ok = ok && rc == 0 && generated == n_steps;
+        for (int s = 0; ok && s < n_steps; s++)
+            if (ids[s] != greedy[s]) ok = false;
+        cases[ci].ok = ok ? 1 : 0;
+        fprintf(stderr,
+                "  glm-spec-metal-target-synth (%s): %s (generated %d/%d, "
+                "greedy-identical=%s)\n", cases[ci].name,
+                ok ? "PASS" : "FAIL", generated, n_steps, ok ? "yes" : "no");
+        free(ids);
+        free(li);
+        if (c.m) glm_metal_fwd_free(&c);
+    }
+    free(greedy);
+    glm_synth_free(&sc);
+    const int all_ok = cases[0].ok && cases[1].ok && cases[2].ok;
+    if (out_full) *out_full = cases[0].ok;
+    if (out_partial) *out_partial = cases[1].ok;
+    if (out_miss) *out_miss = cases[2].ok;
+    return all_ok ? 0 : 1;
+#endif
+}
+
 int ds4_glm_spec_batch_verify_synth(int n_steps, int *out_match,
                                     int *out_verify_calls) {
     glm_synth_ctx sc;
