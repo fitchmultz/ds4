@@ -27099,18 +27099,19 @@ void glm_swiglu_dense_f32(float *out, const float *x,
     glm_matvec_f32(out, down, scratch_gate, H, I);
 }
 
-void glm_mla_forward_token_f32(float *out,
-                               const float *x,
-                               const float *WqA, const float *WqB,
-                               const float *WkvA, const float *WkB,
-                               const float *WvB, const float *Wo,
-                               const float *w_q_a_norm,
-                               const float *w_kv_a_norm,
-                               float *K_nope_cache, float *V_cache,
-                               float *K_rope_cache,
-                               uint32_t seq_n, uint32_t t,
-                               const glm_cpu_shape *shape,
-                               float *scratch) {
+static void glm_mla_forward_token_f32_pos(float *out,
+                                          const float *x,
+                                          const float *WqA, const float *WqB,
+                                          const float *WkvA, const float *WkB,
+                                          const float *WvB, const float *Wo,
+                                          const float *w_q_a_norm,
+                                          const float *w_kv_a_norm,
+                                          float *K_nope_cache, float *V_cache,
+                                          float *K_rope_cache,
+                                          uint32_t seq_n, uint32_t cache_t,
+                                          uint32_t rope_t,
+                                          const glm_cpu_shape *shape,
+                                          float *scratch) {
     /* One-token MLA decode, mirroring glm52_mla_moe_ref.py.
      * scratch is unused (kept for API symmetry with the other components); all
      * intermediate buffers are allocated internally since this is reference/
@@ -27159,13 +27160,15 @@ void glm_mla_forward_token_f32(float *out,
     glm_matvec_f32(k_nope, WkB, kvln, nh * nope, kvl);
     glm_matvec_f32(v, WvB, kvln, nh * vd, kvl);
 
-    /* Place current position's k/v into the (mutable) caches. */
+    /* Place current token's k/v into the requested cache slot.  `cache_t` is
+     * the local cache index; `rope_t` may be an absolute sequence position for
+     * draft-only probes that keep bounded local KV but need production RoPE. */
     for (uint32_t h = 0; h < nh; h++) {
-        memcpy(K_nope_cache + ((size_t)h * seq_n + t) * nope,
+        memcpy(K_nope_cache + ((size_t)h * seq_n + cache_t) * nope,
                k_nope + (size_t)h * nope, nope * sizeof(float));
-        memcpy(V_cache + ((size_t)h * seq_n + t) * vd,
+        memcpy(V_cache + ((size_t)h * seq_n + cache_t) * vd,
                v + (size_t)h * vd, vd * sizeof(float));
-        memcpy(K_rope_cache + ((size_t)h * seq_n + t) * rope,
+        memcpy(K_rope_cache + ((size_t)h * seq_n + cache_t) * rope,
                k_rope_raw, rope * sizeof(float));
     }
 
@@ -27174,23 +27177,22 @@ void glm_mla_forward_token_f32(float *out,
     for (uint32_t h = 0; h < nh; h++)
         for (uint32_t j = 0; j < rope; j++)
             qrope[(size_t)h * rope + j] = q_flat[(size_t)h * qhd + nope + j];
-    glm_rope_interleaved_f32(qrope, qrope, rope, nh, shape->rope_base, t);
+    glm_rope_interleaved_f32(qrope, qrope, rope, nh, shape->rope_base, rope_t);
     for (uint32_t h = 0; h < nh; h++)
         memcpy(krope + (size_t)h * rope, k_rope_raw, rope * sizeof(float));
-    glm_rope_interleaved_f32(krope, krope, rope, nh, shape->rope_base, t);
-    /* Overwrite the current t row of K_rope_cache with rotated k_rope. */
+    glm_rope_interleaved_f32(krope, krope, rope, nh, shape->rope_base, rope_t);
+    /* Overwrite the current cache row of K_rope_cache with rotated k_rope. */
     for (uint32_t h = 0; h < nh; h++)
-        memcpy(K_rope_cache + ((size_t)h * seq_n + t) * rope,
+        memcpy(K_rope_cache + ((size_t)h * seq_n + cache_t) * rope,
                krope + (size_t)h * rope, rope * sizeof(float));
 
-    /* Attention: scores = (q_nope.K_nope + q_rope.K_rope)/sqrt(qhd), causal
-     * mask n<=t, softmax, sum V -> attn_out [nh, vd]. */
-    float *scores = xmalloc((size_t)(t + 1) * sizeof(float));
+    /* Attention over the populated local draft/target cache rows [0..cache_t]. */
+    float *scores = xmalloc((size_t)(cache_t + 1) * sizeof(float));
     for (uint32_t h = 0; h < nh; h++) {
         const float *qnh = q_flat + (size_t)h * qhd;     /* [nope] */
         const float *qrh = qrope + (size_t)h * rope;     /* [rope] */
         float maxs = -1e30f;
-        for (uint32_t n = 0; n <= t; n++) {
+        for (uint32_t n = 0; n <= cache_t; n++) {
             const float *kn = K_nope_cache + ((size_t)h * seq_n + n) * nope;
             const float *kr = K_rope_cache + ((size_t)h * seq_n + n) * rope;
             float s = 0.0f;
@@ -27201,13 +27203,13 @@ void glm_mla_forward_token_f32(float *out,
             if (s > maxs) maxs = s;
         }
         float denom = 0.0f;
-        for (uint32_t n = 0; n <= t; n++) {
+        for (uint32_t n = 0; n <= cache_t; n++) {
             scores[n] = expf(scores[n] - maxs);
             denom += scores[n];
         }
         float *oh = attn_o + (size_t)h * vd;
         for (uint32_t d = 0; d < vd; d++) oh[d] = 0.0f;
-        for (uint32_t n = 0; n <= t; n++) {
+        for (uint32_t n = 0; n <= cache_t; n++) {
             const float wt = scores[n] / denom;
             const float *vn = V_cache + ((size_t)h * seq_n + n) * vd;
             for (uint32_t d = 0; d < vd; d++) oh[d] += wt * vn[d];
@@ -27221,6 +27223,24 @@ void glm_mla_forward_token_f32(float *out,
     free(wqa); free(wqa_n); free(q_flat); free(kva); free(kvln);
     free(k_nope); free(v); free(qrope); free(krope); free(attn_o);
     free(ones_ql); free(ones_kvl);
+}
+
+void glm_mla_forward_token_f32(float *out,
+                               const float *x,
+                               const float *WqA, const float *WqB,
+                               const float *WkvA, const float *WkB,
+                               const float *WvB, const float *Wo,
+                               const float *w_q_a_norm,
+                               const float *w_kv_a_norm,
+                               float *K_nope_cache, float *V_cache,
+                               float *K_rope_cache,
+                               uint32_t seq_n, uint32_t t,
+                               const glm_cpu_shape *shape,
+                               float *scratch) {
+    glm_mla_forward_token_f32_pos(out, x, WqA, WqB, WkvA, WkB, WvB, Wo,
+                                  w_q_a_norm, w_kv_a_norm,
+                                  K_nope_cache, V_cache, K_rope_cache,
+                                  seq_n, t, t, shape, scratch);
 }
 
 /* Bind one backbone layer's GLM tensors by name from the loaded split GGUF.
@@ -27703,7 +27723,8 @@ static bool glm_nextn_decoder_cpu_layer_cached(const ds4_model *m,
                                                float *Vc_cache,
                                                float *Krop_cache,
                                                uint32_t seq_n,
-                                               uint32_t t) {
+                                               uint32_t cache_t,
+                                               uint32_t rope_t) {
     const uint32_t H = shape->hidden, nh = shape->n_head, ql = shape->q_lora;
     const uint32_t kvl = shape->kv_lora, nope = shape->qk_nope, rope = shape->qk_rope;
     const uint32_t vd = shape->v_dim, E = shape->n_expert, K = shape->n_expert_used;
@@ -27724,7 +27745,7 @@ static bool glm_nextn_decoder_cpu_layer_cached(const ds4_model *m,
     float *WvB = xmalloc((size_t)nh * vd * kvl * sizeof(float));
     float *Wo = xmalloc((size_t)H * nh * vd * sizeof(float));
     const bool own_cache = !Knope_cache || !Vc_cache || !Krop_cache || seq_n == 0;
-    if (own_cache) { seq_n = 1; t = 0; }
+    if (own_cache) { seq_n = 1; cache_t = 0; rope_t = 0; }
     float *Knope = own_cache ? xmalloc((size_t)nh * seq_n * nope * sizeof(float)) : Knope_cache;
     float *Vc = own_cache ? xmalloc((size_t)nh * seq_n * vd * sizeof(float)) : Vc_cache;
     float *Krop = own_cache ? xmalloc((size_t)nh * seq_n * rope * sizeof(float)) : Krop_cache;
@@ -27756,10 +27777,11 @@ static bool glm_nextn_decoder_cpu_layer_cached(const ds4_model *m,
     glm_k_b_reorder(WkB, WkBn, nope, kvl, nh);
     glm_dequant_weight(m, v_b, WvB);
     glm_dequant_weight(m, wop, Wo);
-    glm_mla_forward_token_f32(mla_out, xn, WqA, WqB, WkvA, WkB, WvB, Wo,
-                              (const float *)tensor_data(m, qa_norm_t),
-                              (const float *)tensor_data(m, kv_norm_t),
-                              Knope, Vc, Krop, seq_n, t, shape, NULL);
+    glm_mla_forward_token_f32_pos(mla_out, xn, WqA, WqB, WkvA, WkB, WvB, Wo,
+                                  (const float *)tensor_data(m, qa_norm_t),
+                                  (const float *)tensor_data(m, kv_norm_t),
+                                  Knope, Vc, Krop, seq_n, cache_t, rope_t,
+                                  shape, NULL);
     for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
 
     const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
@@ -27826,7 +27848,7 @@ static bool glm_nextn_decoder_cpu_layer(const ds4_model *m,
                                         const float *seed,
                                         float *head_norm_out) {
     return glm_nextn_decoder_cpu_layer_cached(m, shape, il, seed, head_norm_out,
-                                              NULL, NULL, NULL, 1, 0);
+                                              NULL, NULL, NULL, 1, 0, 0);
 }
 
 static bool glm_nextn_decoder_cpu(const ds4_model *m,
@@ -27906,7 +27928,8 @@ static bool glm_nextn_draft_cpu(const ds4_model *m,
 static bool glm_nextn_draft_chain_cpu_layer(const ds4_model *m,
                                             const glm_cpu_shape *shape,
                                             uint32_t il,
-                                            int seed_token, const float *seed_h,
+                                            int seed_token, uint32_t start_pos,
+                                            const float *seed_h,
                                             int depth, uint32_t vocab,
                                             int *out_drafts /*[depth]*/) {
     if (!m || !shape || !seed_h || !out_drafts || depth <= 0) return false;
@@ -27928,7 +27951,8 @@ static bool glm_nextn_draft_chain_cpu_layer(const ds4_model *m,
         if (!glm_nextn_eh_project_cpu_layer(m, shape, il, tok, cur_h, eh) ||
             !glm_nextn_decoder_cpu_layer_cached(m, shape, il, eh, draft_h,
                                                 Knope, Vc, Krop,
-                                                (uint32_t)depth, (uint32_t)j) ||
+                                                (uint32_t)depth, (uint32_t)j,
+                                                start_pos + (uint32_t)j) ||
             !glm_nextn_logits_cpu(m, shape, draft_h, logits, vocab)) {
             ok = false;
             break;
@@ -27948,11 +27972,12 @@ static bool glm_nextn_draft_chain_cpu_layer(const ds4_model *m,
 
 static bool glm_nextn_draft_chain_cpu(const ds4_model *m,
                                       const glm_cpu_shape *shape,
-                                      int seed_token, const float *seed_h,
+                                      int seed_token, uint32_t start_pos,
+                                      const float *seed_h,
                                       int depth, uint32_t vocab,
                                       int *out_drafts /*[depth]*/) {
-    return glm_nextn_draft_chain_cpu_layer(m, shape, 78, seed_token, seed_h,
-                                           depth, vocab, out_drafts);
+    return glm_nextn_draft_chain_cpu_layer(m, shape, 78, seed_token, start_pos,
+                                           seed_h, depth, vocab, out_drafts);
 }
 
 static bool glm_nextn_draft_cache_delta_cpu_layer(const ds4_model *m,
@@ -27974,19 +27999,24 @@ static bool glm_nextn_draft_cache_delta_cpu_layer(const ds4_model *m,
     float *Knope = xmalloc((size_t)nhead * 2u * nope * sizeof(float));
     float *Vc = xmalloc((size_t)nhead * 2u * vd * sizeof(float));
     float *Krop = xmalloc((size_t)nhead * 2u * rope * sizeof(float));
+    float *Knope_reset = xmalloc((size_t)nhead * nope * sizeof(float));
+    float *Vc_reset = xmalloc((size_t)nhead * vd * sizeof(float));
+    float *Krop_reset = xmalloc((size_t)nhead * rope * sizeof(float));
     bool ok = false;
     *out_maxabs = 0.0f;
     if (!glm_nextn_eh_project_cpu_layer(m, shape, il, seed_token, seed_h, eh0) ||
         !glm_nextn_decoder_cpu_layer_cached(m, shape, il, eh0, h0,
-                                            Knope, Vc, Krop, 2, 0) ||
+                                            Knope, Vc, Krop, 2, 0, 5) ||
         !glm_nextn_logits_cpu(m, shape, h0, logits0, vocab)) {
         goto done;
     }
     int draft0 = sample_argmax(logits0, vocab);
     if (!glm_nextn_eh_project_cpu_layer(m, shape, il, draft0, h0, eh1) ||
         !glm_nextn_decoder_cpu_layer_cached(m, shape, il, eh1, h_cached,
-                                            Knope, Vc, Krop, 2, 1) ||
-        !glm_nextn_decoder_cpu_layer(m, shape, il, eh1, h_reset)) {
+                                            Knope, Vc, Krop, 2, 1, 6) ||
+        !glm_nextn_decoder_cpu_layer_cached(m, shape, il, eh1, h_reset,
+                                            Knope_reset, Vc_reset, Krop_reset,
+                                            1, 0, 6)) {
         goto done;
     }
     for (uint32_t i = 0; i < H; i++) {
@@ -27996,6 +28026,7 @@ static bool glm_nextn_draft_cache_delta_cpu_layer(const ds4_model *m,
     ok = true;
 
 done:
+    free(Krop_reset); free(Vc_reset); free(Knope_reset);
     free(Krop); free(Vc); free(Knope);
     free(h_reset); free(h_cached); free(eh1); free(logits0); free(h0); free(eh0);
     return ok;
@@ -28363,18 +28394,19 @@ static bool glm_fused_q8_matvec(const void *model_map, uint64_t model_size,
  * glm_mla_forward_token_f32 line-for-line; scratch is caller-allocated and
  * reused across layers/tokens (the CPU composite mallocs internally; this path
  * runs 78 layers x n_tokens so reuse matters).  KV caches are host-side
- * [nh,seq_n,dim] row-major, mutated at position t before the attn kernel reads
- * them.  When `fast` is true the five Q8_0 MLA projections use the fused
+ * [nh,seq_n,dim] row-major, mutated at cache slot `cache_t` before the attn
+ * kernel reads them. `rope_t` may be an absolute sequence position for draft
+ * calls with bounded local KV. When `fast` is true the five Q8_0 MLA projections use the fused
  * ds4_gpu_matmul_q8_0_tensor (weights stay quantized in the mmap); k_b always
  * uses the F32 `WkB` (dequanted + reordered by the caller). Returns true. */
-static bool glm_mla_forward_token_metal(
+static bool glm_mla_forward_token_metal_pos(
         const float *x,
         const ds4_model *m, uint32_t il, bool fast,
         const float *WqA, const float *WqB, const float *WkvA,
         const float *WkB, const float *WvB, const float *Wo,
         const float *w_q_a_norm, const float *w_kv_a_norm,
         float *K_nope_cache, float *V_cache, float *K_rope_cache,
-        uint32_t seq_n, uint32_t t,
+        uint32_t seq_n, uint32_t cache_t, uint32_t rope_t,
         const glm_cpu_shape *shape,
         float *out,
         float *wqa, float *wqa_n, float *q_flat, float *kva, float *kvln,
@@ -28426,11 +28458,11 @@ static bool glm_mla_forward_token_metal(
     /* Insert current token k/v into host-side caches (rope unrotated first,
      * overwritten with rotated rope below -- mirrors the CPU composite). */
     for (uint32_t h = 0; h < nh; h++) {
-        memcpy(K_nope_cache + ((size_t)h * seq_n + t) * nope,
+        memcpy(K_nope_cache + ((size_t)h * seq_n + cache_t) * nope,
                k_nope + (size_t)h * nope, nope * sizeof(float));
-        memcpy(V_cache + ((size_t)h * seq_n + t) * vd,
+        memcpy(V_cache + ((size_t)h * seq_n + cache_t) * vd,
                v + (size_t)h * vd, vd * sizeof(float));
-        memcpy(K_rope_cache + ((size_t)h * seq_n + t) * rope,
+        memcpy(K_rope_cache + ((size_t)h * seq_n + cache_t) * rope,
                k_rope_raw, rope * sizeof(float));
     }
 
@@ -28438,12 +28470,12 @@ static bool glm_mla_forward_token_metal(
     for (uint32_t h = 0; h < nh; h++)
         for (uint32_t j = 0; j < rope; j++)
             qrope[(size_t)h * rope + j] = q_flat[(size_t)h * qhd + nope + j];
-    if (!ds4_gpu_glm_rope_interleaved_f32(qrope, qrope, rope, nh, shape->rope_base, t)) return false;
+    if (!ds4_gpu_glm_rope_interleaved_f32(qrope, qrope, rope, nh, shape->rope_base, rope_t)) return false;
     for (uint32_t h = 0; h < nh; h++)
         memcpy(krope + (size_t)h * rope, k_rope_raw, rope * sizeof(float));
-    if (!ds4_gpu_glm_rope_interleaved_f32(krope, krope, rope, nh, shape->rope_base, t)) return false;
+    if (!ds4_gpu_glm_rope_interleaved_f32(krope, krope, rope, nh, shape->rope_base, rope_t)) return false;
     for (uint32_t h = 0; h < nh; h++)
-        memcpy(K_rope_cache + ((size_t)h * seq_n + t) * rope,
+        memcpy(K_rope_cache + ((size_t)h * seq_n + cache_t) * rope,
                krope + (size_t)h * rope, rope * sizeof(float));
 
     /* Assemble Q [nh, qhd] = [q_flat nope | rotated qrope] for the attn kernel. */
@@ -28452,7 +28484,7 @@ static bool glm_mla_forward_token_metal(
         memcpy(Q_combined + (size_t)h * qhd + nope, qrope + (size_t)h * rope, rope * sizeof(float));
     }
     if (!ds4_gpu_glm_attn_decode_f32(Q_combined, K_nope_cache, K_rope_cache, V_cache,
-                                     attn_o, nh, nope, rope, vd, qhd, seq_n, t)) return false;
+                                     attn_o, nh, nope, rope, vd, qhd, seq_n, cache_t)) return false;
 
     /* Single attn_output projection: Wo @ attn_o -> out [H]. */
     if (fast) {
@@ -28461,6 +28493,30 @@ static bool glm_mla_forward_token_metal(
                                           twop->abs_offset, nh * vd, H, attn_o, out)) return false;
     } else if (!ds4_gpu_glm_matvec_f32(Wo, attn_o, out, H, nh * vd)) return false;
     return true;
+}
+
+
+static bool glm_mla_forward_token_metal(
+        const float *x,
+        const ds4_model *m, uint32_t il, bool fast,
+        const float *WqA, const float *WqB, const float *WkvA,
+        const float *WkB, const float *WvB, const float *Wo,
+        const float *w_q_a_norm, const float *w_kv_a_norm,
+        float *K_nope_cache, float *V_cache, float *K_rope_cache,
+        uint32_t seq_n, uint32_t t,
+        const glm_cpu_shape *shape,
+        float *out,
+        float *wqa, float *wqa_n, float *q_flat, float *kva, float *kvln,
+        float *k_nope, float *v, float *qrope, float *krope,
+        float *attn_o, float *Q_combined) {
+    return glm_mla_forward_token_metal_pos(x, m, il, fast,
+                                           WqA, WqB, WkvA, WkB, WvB, Wo,
+                                           w_q_a_norm, w_kv_a_norm,
+                                           K_nope_cache, V_cache, K_rope_cache,
+                                           seq_n, t, t, shape, out,
+                                           wqa, wqa_n, q_flat, kva, kvln,
+                                           k_nope, v, qrope, krope,
+                                           attn_o, Q_combined);
 }
 
 /* Dense/shared-expert SwiGLU FFN via Metal kernels (mirrors
@@ -28563,7 +28619,8 @@ static bool glm_nextn_decoder_metal_layer_cached(const ds4_model *m,
                                                  float *Vc_cache,
                                                  float *Krop_cache,
                                                  uint32_t seq_n,
-                                                 uint32_t t) {
+                                                 uint32_t cache_t,
+                                                 uint32_t rope_t) {
     const uint32_t H = shape->hidden, nh = shape->n_head, ql = shape->q_lora;
     const uint32_t kvl = shape->kv_lora, nope = shape->qk_nope, rope = shape->qk_rope;
     const uint32_t vd = shape->v_dim, E = shape->n_expert, K = shape->n_expert_used;
@@ -28583,7 +28640,7 @@ static bool glm_nextn_decoder_metal_layer_cached(const ds4_model *m,
     float *WvB = xmalloc((size_t)nh * vd * kvl * sizeof(float));
     float *Wo = xmalloc((size_t)H * nh * vd * sizeof(float));
     const bool own_cache = !Knope_cache || !Vc_cache || !Krop_cache || seq_n == 0;
-    if (own_cache) { seq_n = 1; t = 0; }
+    if (own_cache) { seq_n = 1; cache_t = 0; rope_t = 0; }
     float *Knope = own_cache ? xmalloc((size_t)nh * seq_n * nope * sizeof(float)) : Knope_cache;
     float *Vc = own_cache ? xmalloc((size_t)nh * seq_n * vd * sizeof(float)) : Vc_cache;
     float *Krop = own_cache ? xmalloc((size_t)nh * seq_n * rope * sizeof(float)) : Krop_cache;
@@ -28627,13 +28684,14 @@ static bool glm_nextn_decoder_metal_layer_cached(const ds4_model *m,
     glm_k_b_reorder(WkB, WkBn, nope, kvl, nh);
     glm_dequant_weight(m, v_b, WvB);
     glm_dequant_weight(m, wop, Wo);
-    if (!glm_mla_forward_token_metal(xn, m, il, false,
-                                     WqA, WqB, WkvA, WkB, WvB, Wo,
-                                     (const float *)tensor_data(m, qa_norm_t),
-                                     (const float *)tensor_data(m, kv_norm_t),
-                                     Knope, Vc, Krop, seq_n, t, shape, mla_out,
-                                     wqa, wqa_n, q_flat, kva, kvln, k_nope, vv,
-                                     qrope, krope, attn_o, Q_comb)) goto done;
+    if (!glm_mla_forward_token_metal_pos(xn, m, il, false,
+                                         WqA, WqB, WkvA, WkB, WvB, Wo,
+                                         (const float *)tensor_data(m, qa_norm_t),
+                                         (const float *)tensor_data(m, kv_norm_t),
+                                         Knope, Vc, Krop, seq_n, cache_t, rope_t,
+                                         shape, mla_out,
+                                         wqa, wqa_n, q_flat, kva, kvln, k_nope, vv,
+                                         qrope, krope, attn_o, Q_comb)) goto done;
     for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
 
     const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
@@ -28701,13 +28759,14 @@ static bool glm_nextn_decoder_metal_layer(const ds4_model *m,
                                           const float *seed,
                                           float *head_norm_out) {
     return glm_nextn_decoder_metal_layer_cached(m, shape, il, seed, head_norm_out,
-                                                NULL, NULL, NULL, 1, 0);
+                                                NULL, NULL, NULL, 1, 0, 0);
 }
 
 static bool glm_nextn_draft_chain_metal_layer(const ds4_model *m,
                                               const glm_cpu_shape *shape,
                                               uint32_t il,
-                                              int seed_token, const float *seed_h,
+                                              int seed_token, uint32_t start_pos,
+                                              const float *seed_h,
                                               int depth, uint32_t vocab,
                                               int *out_drafts /*[depth]*/) {
     if (!m || !shape || !seed_h || !out_drafts || depth <= 0) return false;
@@ -28732,7 +28791,8 @@ static bool glm_nextn_draft_chain_metal_layer(const ds4_model *m,
         if (!glm_nextn_eh_project_metal_layer(m, shape, il, tok, cur_h, eh) ||
             !glm_nextn_decoder_metal_layer_cached(m, shape, il, eh, draft_h,
                                                   Knope, Vc, Krop,
-                                                  (uint32_t)depth, (uint32_t)j) ||
+                                                  (uint32_t)depth, (uint32_t)j,
+                                                  start_pos + (uint32_t)j) ||
             !glm_nextn_logits_metal(m, shape, draft_h, logits, vocab,
                                     chunk_w, chunk_logits, chunk_rows)) {
             ok = false;
@@ -28753,11 +28813,12 @@ static bool glm_nextn_draft_chain_metal_layer(const ds4_model *m,
 
 static bool glm_nextn_draft_chain_metal(const ds4_model *m,
                                         const glm_cpu_shape *shape,
-                                        int seed_token, const float *seed_h,
+                                        int seed_token, uint32_t start_pos,
+                                        const float *seed_h,
                                         int depth, uint32_t vocab,
                                         int *out_drafts /*[depth]*/) {
-    return glm_nextn_draft_chain_metal_layer(m, shape, 78, seed_token, seed_h,
-                                             depth, vocab, out_drafts);
+    return glm_nextn_draft_chain_metal_layer(m, shape, 78, seed_token, start_pos,
+                                             seed_h, depth, vocab, out_drafts);
 }
 
 /* Core Metal forward.  Same tensor binding/dequant/KV-cache growth as
@@ -29447,12 +29508,13 @@ int ds4_glm_nextn_metal_synth(int *out_token, float *out_top_logit, bool *out_fi
     }
     int metal_chain[DS4_GLM_NEXTN_MAX_DEPTH];
     int cpu_chain[DS4_GLM_NEXTN_MAX_DEPTH];
+    const uint32_t synth_start_pos = 5;
     const bool metal_chain_ok = glm_nextn_draft_chain_metal_layer(
-        &c.model, &c.shape, il, accepted, target_h, DS4_GLM_NEXTN_MAX_DEPTH,
-        c.vocab, metal_chain);
+        &c.model, &c.shape, il, accepted, synth_start_pos, target_h,
+        DS4_GLM_NEXTN_MAX_DEPTH, c.vocab, metal_chain);
     const bool cpu_chain_ok = glm_nextn_draft_chain_cpu_layer(
-        &c.model, &c.shape, il, accepted, target_h, DS4_GLM_NEXTN_MAX_DEPTH,
-        c.vocab, cpu_chain);
+        &c.model, &c.shape, il, accepted, synth_start_pos, target_h,
+        DS4_GLM_NEXTN_MAX_DEPTH, c.vocab, cpu_chain);
     bool chain_match = metal_chain_ok && cpu_chain_ok;
     for (int i = 0; chain_match && i < DS4_GLM_NEXTN_MAX_DEPTH; i++)
         if (metal_chain[i] != cpu_chain[i]) chain_match = false;
@@ -29728,6 +29790,7 @@ static const float *glm_gen_metal_hnorm(void *ctx) {
  * miss cases.  The real-model path defaults to the Metal NextN drafter; the
  * CPU drafter remains available as an A/B diagnostic fallback. */
 typedef bool (*glm_draft_chain_fn)(void *draft_ctx, int seed_token,
+                                   uint32_t seed_pos,
                                    const float *seed_hidden, int depth,
                                    int *out_drafts);
 typedef bool (*glm_verify_after_bonus_fn)(void *verify_ctx,
@@ -29753,20 +29816,22 @@ typedef struct {
 } glm_nextn_draft_state;
 
 static bool glm_nextn_draft_chain_cpu_thunk(void *vc, int seed_token,
+                                            uint32_t seed_pos,
                                             const float *seed_hidden, int depth,
                                             int *out_drafts) {
     glm_nextn_draft_state *s = (glm_nextn_draft_state *)vc;
-    return glm_nextn_draft_chain_cpu(s->m, s->shape, seed_token, seed_hidden,
-                                     depth, s->vocab, out_drafts);
+    return glm_nextn_draft_chain_cpu(s->m, s->shape, seed_token, seed_pos,
+                                     seed_hidden, depth, s->vocab, out_drafts);
 }
 
 #ifndef DS4_NO_GPU
 static bool glm_nextn_draft_chain_metal_thunk(void *vc, int seed_token,
+                                              uint32_t seed_pos,
                                               const float *seed_hidden, int depth,
                                               int *out_drafts) {
     glm_nextn_draft_state *s = (glm_nextn_draft_state *)vc;
-    return glm_nextn_draft_chain_metal(s->m, s->shape, seed_token, seed_hidden,
-                                       depth, s->vocab, out_drafts);
+    return glm_nextn_draft_chain_metal(s->m, s->shape, seed_token, seed_pos,
+                                       seed_hidden, depth, s->vocab, out_drafts);
 }
 #endif
 
@@ -29910,7 +29975,7 @@ static int glm_spec_decode(const char *label,
             active_depth = remaining_after_bonus < depth ? remaining_after_bonus : depth;
             if (active_depth > 0 && draft_fn && seed_h) {
                 const double d0 = now_sec();
-                (void)draft_fn(draft_ctx, bonus_token, seed_h, active_depth, draft);
+                (void)draft_fn(draft_ctx, bonus_token, pos, seed_h, active_depth, draft);
                 draft_s += now_sec() - d0;
             }
 
@@ -30381,9 +30446,9 @@ typedef struct {
     int *verify_calls;       /* optional batched-verifier call counter       */
 } glm_spec_mock_ctx;
 
-static bool glm_spec_mock_draft(void *vc, int seed_token, const float *seed_h,
-                                int depth, int *out_drafts) {
-    (void)seed_token; (void)seed_h;
+static bool glm_spec_mock_draft(void *vc, int seed_token, uint32_t seed_pos,
+                                const float *seed_h, int depth, int *out_drafts) {
+    (void)seed_token; (void)seed_pos; (void)seed_h;
     glm_spec_mock_ctx *mc = (glm_spec_mock_ctx *)vc;
     const int g = *mc->generated_ptr;          /* tokens emitted before bonus */
     for (int j = 0; j < depth; j++) {
