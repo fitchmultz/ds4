@@ -4,7 +4,7 @@ Status: **CORE PORT COMPLETE & WORKING; FAST PATH IN PROGRESS.** GLM-5.2 runs lo
 
 VERIFIED DONE: P0 scaffolding; P1 loader/split-GGUF/metadata/tensor-inventory (1809/1809); P2 glm4 BPE+chat (oracle); P3 SSD cache-plan (8359 experts); P4b all 10 quant dequant types bit-exact vs llama.cpp, including blk.78 NextN-only Q2_K/Q3_K and the IQ2_S full-tensor bugfix; P4a/P4a-full CPU forward (oracle-validated); P4c-i/ii Metal kernels (31/31); P4c-iv Metal forward (corr 1.0 vs CPU); P4e incremental-KV chat generation; routed MoE fast path (IQ2_XXS gate/up + IQ3_XXS/IQ4_XS down + resident shared expert) with decode improving from ~27s/token to ~9–12s/token on warm runs; env-gated selected-expert SSD pread staging (`DS4_GLM_EXPERT_PREAD=1`) validated on the real model. DeepSeek path byte-identical at every commit; full ds4_test green.
 
-REMAINING (usability/speed, not correctness): batched/persistent GLM graph or speculation to avoid one full model pass per token; automatic/control-policy integration for hot-expert pread/cache residency (the explicit selected-expert pread path exists, but DS4-speed needs smarter residency/prefetch); MLA still uses the F32 materialization path on UD_IQ2_M because q_a/attn_output are Q5_K/Q6_K and tested one-off Q5/Q6/Q8 wrappers were slower; DSA sparse indexer (deferred — dense MLA matches llama.cpp); NextN/MTP blk.78 (loaded, Q2_K/Q3_K dequant covered, unused — speculation accelerator).
+REMAINING (usability/speed, not correctness): batched/persistent GLM graph or speculation to avoid one full model pass per token; automatic/control-policy integration for hot-expert pread/cache residency (the explicit selected-expert pread path exists, but DS4-speed needs smarter residency/prefetch); MLA still uses the F32 materialization path on UD_IQ2_M because q_a/attn_output are Q5_K/Q6_K and tested one-off Q5/Q6/Q8 wrappers were slower; DSA sparse indexer (deferred — dense MLA matches llama.cpp); NextN/MTP blk.78 (loaded, Q2_K/Q3_K dequant covered, post-output-norm target hidden dump exposed by `DS4_GLM_H_NEXTN_OUT`, full speculative graph still unwired).
 Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
@@ -231,6 +231,10 @@ The core GLM port is complete and verified. The active work is usability/speed:
   GLM MoE path from mmap page faults to explicit `pread` from each split GGUF
   part fd. It is validated with the real model and keeps the same oracle token;
   default remains mmap staging until a smarter cache/prefetch policy is chosen.
+- `DS4_GLM_H_NEXTN_OUT=<path>` dumps the post-output-norm hidden state that feeds
+  the LM head. SGLang's NextN path uses this vector as the target-model hidden
+  input to `nextn.hnorm`; CPU-vs-Metal on `Hello` matches at maxabs ~3.4e-5,
+  corr ~1.0.
 - `--glm-raw` / `--glm-raw-cpu` bypass the GLM chat template and raw-tokenize
   `-p/--prompt`. This is a usability/benchmark mode, not chat: a one-token raw
   prompt avoids the 13-token chat-template prefill while batched prefill is

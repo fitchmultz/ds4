@@ -27358,6 +27358,32 @@ static void glm_dequant_weight(const ds4_model *m, const ds4_tensor *t,
  * step functions) so both CPU and Metal steps can read it. */
 static bool glm_fwd_progress = true;
 
+/* Diagnostic/NextN prerequisite: dump the post-output-norm target hidden state
+ * that feeds the LM head. SGLang's GLM/DeepSeek NextN path uses this vector as
+ * `spec_info.hidden_states`, then applies blk.78.nextn.hnorm before eh_proj.
+ * Env-gated so normal inference and tests are unchanged. */
+static void glm_dump_h_nextn_if_requested(const char *label,
+                                          const float *x,
+                                          uint32_t n) {
+    const char *path = getenv("DS4_GLM_H_NEXTN_OUT");
+    if (!path || !path[0] || !x || n == 0) return;
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "ds4: %s: failed to open DS4_GLM_H_NEXTN_OUT=%s: %s\n",
+                label ? label : "glm", path, strerror(errno));
+        return;
+    }
+    const size_t wrote = fwrite(x, sizeof(float), n, f);
+    fclose(f);
+    if (wrote == n) {
+        fprintf(stderr, "ds4: %s: dumped post-output-norm hidden (%u floats) to %s\n",
+                label ? label : "glm", n, path);
+    } else {
+        fprintf(stderr, "ds4: %s: short write dumping post-output-norm hidden to %s\n",
+                label ? label : "glm", path);
+    }
+}
+
 /* Phase 4e: persistent forward context.  Holds all per-layer weight scratch,
  * activation buffers, and per-layer KV caches sized to `seq_n` (the cache
  * capacity / stride).  Processing one token at position `pos` appends its K/V
@@ -27590,6 +27616,7 @@ static void glm_cpu_fwd_step(glm_cpu_fwd_ctx *c, int token, uint32_t pos,
     /* Output norm + LM head -> logits (only when requested for this pos). */
     if (want_logits) {
         glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, c->t_onorm), H, eps);
+        glm_dump_h_nextn_if_requested("glm-cpu-ref", xn, H);
         for (uint32_t v = 0; v < c->vocab; v++) {
             glm_dequant_count(m, c->t_out, (uint64_t)v * c->out_row_bytes, H, c->logits_row);
             float s = 0.0f;
@@ -28013,6 +28040,7 @@ static bool glm_lm_head_metal(const ds4_model *m,
                               uint32_t chunk_rows) {
     const uint32_t H = shape->hidden;
     if (!ds4_gpu_glm_rmsnorm_f32(x, w_onorm, xn, H, shape->rms_eps)) return false;
+    glm_dump_h_nextn_if_requested("glm-metal-ref", xn, H);
     const uint64_t out_row_bytes = t_out->bytes / vocab;
     for (uint32_t vstart = 0; vstart < vocab; vstart += chunk_rows) {
         const uint32_t nrows = (vocab - vstart < chunk_rows) ? (vocab - vstart) : chunk_rows;
