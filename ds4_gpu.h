@@ -1081,6 +1081,10 @@ int ds4_gpu_glm_attn_decode_batch_f32(const float * Q,
 int ds4_gpu_glm_moe_route_f32(const float * logits, const float * bias,
                               int * out_idx, float * out_w,
                               uint32_t n_expert, uint32_t top_k, float scale);
+int ds4_gpu_glm_moe_route_batch_f32(const float * logits, const float * bias,
+                                    int * out_idx, float * out_w,
+                                    uint32_t n_expert, uint32_t top_k,
+                                    uint32_t n_tok, float scale);
 
 /* Elementwise dense/shared-expert SwiGLU: out = silu(gate_x) * up_x.
  * The gate/up/down projections reuse ds4_gpu_glm_matvec_f32.

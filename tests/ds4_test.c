@@ -3472,6 +3472,58 @@ static void test_glm_metal_components(void) {
             }
             glm_metal_cmp("MoE route (Metal chain) weights", mw2, cw, K, tol_abs, tol_rel);
 
+            /* Batch-2 router over precomputed logits. Real layer-major MoE
+             * batching needs one top-K route per token row before expert work. */
+            float *blogits = malloc((size_t)batch_n * E * sizeof(float));
+            int *bcidx = malloc((size_t)batch_n * K * sizeof(int));
+            int *bmidx = malloc((size_t)batch_n * K * sizeof(int));
+            float *bcw = malloc((size_t)batch_n * K * sizeof(float));
+            float *bmw = malloc((size_t)batch_n * K * sizeof(float));
+            TEST_ASSERT(blogits && bcidx && bmidx && bcw && bmw);
+            for (uint32_t i = 0; i < E; i++) blogits[i] = mlogits[i] * 0.85f + 0.02f * (float)((int)i - 2);
+            memcpy(blogits + E, mlogits, (size_t)E * sizeof(float));
+            for (uint32_t t = 0; t < batch_n; t++) {
+                float prob[1024];
+                int *idx_row = bcidx + (size_t)t * K;
+                float *w_row = bcw + (size_t)t * K;
+                const float *log_row = blogits + (size_t)t * E;
+                for (uint32_t i = 0; i < E; i++) {
+                    const float li = log_row[i];
+                    prob[i] = (li >= 0.0f) ? 1.0f / (1.0f + expf(-li))
+                                           : expf(li) / (1.0f + expf(li));
+                }
+                for (uint32_t k = 0; k < K; k++) idx_row[k] = -1;
+                for (uint32_t i = 0; i < E; i++) {
+                    const float sel_i = prob[i] + bias[i];
+                    for (uint32_t j = 0; j < K; j++) {
+                        if (idx_row[j] < 0 ||
+                            sel_i > (prob[(uint32_t)idx_row[j]] + bias[(uint32_t)idx_row[j]])) {
+                            for (uint32_t m = K - 1u; m > j; m--) idx_row[m] = idx_row[m - 1u];
+                            idx_row[j] = (int)i;
+                            break;
+                        }
+                    }
+                }
+                float sum = 0.0f;
+                for (uint32_t k = 0; k < K; k++) sum += prob[(uint32_t)idx_row[k]];
+                if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+                const float inv = scale / sum;
+                for (uint32_t k = 0; k < K; k++) w_row[k] = prob[(uint32_t)idx_row[k]] * inv;
+            }
+            TEST_ASSERT(ds4_gpu_glm_moe_route_batch_f32(blogits, bias, bmidx, bmw, E, K, batch_n, scale));
+            {
+                bool idx_ok = true;
+                for (uint32_t i = 0; i < batch_n * K; i++)
+                    if (bmidx[i] != bcidx[i]) { idx_ok = false; break; }
+                fprintf(stderr, "  glm-metal: %-30s %s\n",
+                        "MoE route batch2 idx", idx_ok ? "PASS" : "FAIL");
+                g_glm_metal_total++;
+                if (idx_ok) g_glm_metal_pass++;
+                TEST_ASSERT(idx_ok);
+            }
+            glm_metal_cmp("MoE route batch2 weights", bmw, bcw, (size_t)batch_n * K, tol_abs, tol_rel);
+            free(blogits); free(bcidx); free(bmidx); free(bcw); free(bmw);
+
             free(clogits); free(mlogits);
         }
 

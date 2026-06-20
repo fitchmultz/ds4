@@ -373,6 +373,49 @@ kernel void kernel_glm_moe_route_f32(
     }
 }
 
+// Batched router: one sequential CPU-order route per token row. Logits layout
+// is [n_tok,E], outputs are [n_tok,K].
+kernel void kernel_glm_moe_route_batch_f32(
+        constant ds4_metal_args_glm_moe & args,
+        device const float * logits,
+        device const float * bias,
+        device int   * out_idx,
+        device float * out_w,
+        uint gid [[thread_position_in_grid]]) {
+    const uint32_t E = args.n_expert;
+    const uint32_t K = args.top_k;
+    device const float * row = logits + (uint64_t)gid * E;
+    device int * idx_out = out_idx + (uint64_t)gid * K;
+    device float * w_out = out_w + (uint64_t)gid * K;
+    thread float prob[GLM_MOE_MAX_EXPERT];
+    for (uint32_t i = 0; i < E; i++) {
+        const float li = row[i];
+        prob[i] = (li >= 0.0f) ? 1.0f / (1.0f + exp(-li))
+                               : exp(li) / (1.0f + exp(li));
+    }
+    int idx[GLM_MOE_MAX_K];
+    for (uint32_t k = 0; k < K; k++) idx[k] = -1;
+    for (uint32_t i = 0; i < E; i++) {
+        const float sel_i = prob[i] + bias[i];
+        for (uint32_t j = 0; j < K; j++) {
+            if (idx[j] < 0 ||
+                sel_i > (prob[(uint32_t)idx[j]] + bias[(uint32_t)idx[j]])) {
+                for (uint32_t m = K - 1u; m > j; m--) idx[m] = idx[m - 1u];
+                idx[j] = (int)i;
+                break;
+            }
+        }
+    }
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < K; k++) sum += prob[(uint32_t)idx[k]];
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    const float inv = args.scale / sum;
+    for (uint32_t k = 0; k < K; k++) {
+        idx_out[k] = idx[k];
+        w_out[k] = prob[(uint32_t)idx[k]] * inv;
+    }
+}
+
 // Elementwise dense/shared-expert SwiGLU: out[i] = silu(gate_x[i]) * up_x[i].
 // Stable sigmoid mirrors glm_silu_f32; the gate/up/down projections reuse
 // kernel_glm_matvec_f32.  One thread per element.
