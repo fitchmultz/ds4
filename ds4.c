@@ -27824,6 +27824,38 @@ static bool glm_nextn_logits_cpu(const ds4_model *m,
     return true;
 }
 
+static bool glm_nextn_draft_cpu(const ds4_model *m,
+                                const glm_cpu_shape *shape,
+                                int accepted_token,
+                                const float *target_h,
+                                uint32_t vocab,
+                                int *out_token,
+                                float *out_top_logit,
+                                bool *out_finite) {
+    if (!m || !shape || !target_h || !out_token) return false;
+    bool ok = false;
+    float *eh = xmalloc((size_t)shape->hidden * sizeof(float));
+    float *nh = xmalloc((size_t)shape->hidden * sizeof(float));
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
+    if (glm_nextn_eh_project_cpu(m, shape, accepted_token, target_h, eh) &&
+        glm_nextn_decoder_cpu(m, shape, eh, nh) &&
+        glm_nextn_logits_cpu(m, shape, nh, logits, vocab)) {
+        int arg = 0;
+        float top = logits[0];
+        bool finite = isfinite(logits[0]);
+        for (uint32_t v = 1; v < vocab; v++) {
+            if (!isfinite(logits[v])) finite = false;
+            if (logits[v] > top) { top = logits[v]; arg = (int)v; }
+        }
+        *out_token = arg;
+        if (out_top_logit) *out_top_logit = top;
+        if (out_finite) *out_finite = finite;
+        ok = true;
+    }
+    free(logits); free(nh); free(eh);
+    return ok;
+}
+
 static void glm_nextn_run_diagnostic(const char *label,
                                      const ds4_model *m,
                                      const glm_cpu_shape *shape,
@@ -29150,16 +29182,23 @@ int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit, bool *out_fi
 
 typedef bool (*glm_gen_step_fn)(void *ctx, int token, uint32_t pos,
                                 bool want_logits, float *logits);
+typedef const float *(*glm_gen_hnorm_fn)(void *ctx);
 
 static bool glm_gen_cpu_step(void *ctx, int token, uint32_t pos,
                              bool want_logits, float *logits) {
     glm_cpu_fwd_step((glm_cpu_fwd_ctx *)ctx, token, pos, want_logits, logits);
     return true;
 }
+static const float *glm_gen_cpu_hnorm(void *ctx) {
+    return ((glm_cpu_fwd_ctx *)ctx)->xn;
+}
 #ifndef DS4_NO_GPU
 static bool glm_gen_metal_step(void *ctx, int token, uint32_t pos,
                                bool want_logits, float *logits) {
     return glm_metal_fwd_step((glm_metal_fwd_ctx *)ctx, token, pos, want_logits, logits);
+}
+static const float *glm_gen_metal_hnorm(void *ctx) {
+    return ((glm_metal_fwd_ctx *)ctx)->xn;
 }
 #endif
 
@@ -29170,10 +29209,11 @@ static bool glm_gen_metal_step(void *ctx, int token, uint32_t pos,
  * `out` and reports prefill/decode timing + tok/s to stderr.  Returns 0 on
  * success, 1 on a kernel/step failure. */
 static int glm_generate_loop(const char *label,
-                             glm_gen_step_fn step, void *ctx,
+                             glm_gen_step_fn step, glm_gen_hnorm_fn hnorm, void *ctx,
                              const int *prompt, uint32_t prompt_len,
                              int n_predict, float *logits, uint32_t vocab,
-                             ds4_engine *e, int eos_id, FILE *out,
+                             ds4_engine *e, const glm_cpu_shape *shape,
+                             int eos_id, FILE *out,
                              int *out_generated, int *gen_ids_out,
                              double *out_decode_s) {
     const double pf0 = now_sec();
@@ -29184,6 +29224,10 @@ static int glm_generate_loop(const char *label,
     int next = sample_argmax(logits, vocab);
     uint32_t pos = prompt_len;
     int generated = 0;
+    const bool nextn_probe = getenv("DS4_GLM_NEXTN_PROBE") != NULL;
+    const bool nextn_probe_log = getenv("DS4_GLM_NEXTN_PROBE_LOG") != NULL;
+    uint64_t nextn_probe_total = 0, nextn_probe_hit = 0, nextn_probe_fail = 0;
+    double nextn_probe_s = 0.0;
     const double dec0 = now_sec();
     for (int i = 0; i < n_predict; i++) {
         if (next == eos_id) break;
@@ -29193,13 +29237,41 @@ static int glm_generate_loop(const char *label,
         if (out) { fwrite(piece, 1, plen, out); fflush(out); }
         free(piece);
         generated++;
-        if (!step(ctx, next, pos, true, logits)) {
+        const int accepted = next;
+        if (!step(ctx, accepted, pos, true, logits)) {
             if (out_decode_s) *out_decode_s = now_sec() - dec0;
             if (out_generated) *out_generated = generated;
             return 1;
         }
         pos++;
         next = sample_argmax(logits, vocab);
+        if (nextn_probe && hnorm && shape) {
+            int draft = -1;
+            float draft_logit = 0.0f;
+            bool draft_finite = false;
+            const double p0 = now_sec();
+            const bool pok = glm_nextn_draft_cpu(&e->model, shape, accepted,
+                                                 hnorm(ctx), vocab,
+                                                 &draft, &draft_logit, &draft_finite);
+            nextn_probe_s += now_sec() - p0;
+            if (pok) {
+                nextn_probe_total++;
+                if (draft == next) nextn_probe_hit++;
+                if (nextn_probe_log) {
+                    fprintf(stderr,
+                            "ds4: %s: nextn probe pos=%u accepted=%d draft=%d target=%d hit=%s top_logit=%.6f finite=%s\n",
+                            label ? label : "glm-generate", pos - 1, accepted, draft, next,
+                            draft == next ? "yes" : "no", (double)draft_logit,
+                            draft_finite ? "yes" : "no");
+                }
+            } else {
+                nextn_probe_fail++;
+                if (nextn_probe_log) {
+                    fprintf(stderr, "ds4: %s: nextn probe failed at pos=%u accepted=%d\n",
+                            label ? label : "glm-generate", pos - 1, accepted);
+                }
+            }
+        }
     }
     const double decode_s = now_sec() - dec0;
     if (out_generated) *out_generated = generated;
@@ -29207,6 +29279,15 @@ static int glm_generate_loop(const char *label,
     fprintf(stderr, "ds4: %s: prefill %.2fs (%u tok), decode %d tok in %.2fs (%.2f tok/s)\n",
             label ? label : "glm-generate", prefill_s, prompt_len, generated, decode_s,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    if (nextn_probe) {
+        fprintf(stderr,
+                "ds4: %s: nextn probe %llu/%llu hits, %llu failures, %.2fs diagnostic overhead\n",
+                label ? label : "glm-generate",
+                (unsigned long long)nextn_probe_hit,
+                (unsigned long long)nextn_probe_total,
+                (unsigned long long)nextn_probe_fail,
+                nextn_probe_s);
+    }
     return 0;
 }
 
@@ -29279,8 +29360,9 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
              * (MLA / MoE gu/down/shared / LM head) only for pos >= prompt_len,
              * so prefill is excluded and each entry is exactly one decode token. */
             if (getenv("DS4_GLM_DECODE_TIME")) mc.profile_after_pos = prompt_len;
-            rc = glm_generate_loop("glm-chat", glm_gen_metal_step, &mc, chat.v, prompt_len,
-                                   n_predict, logits, vocab, e, eos_id, stdout,
+            rc = glm_generate_loop("glm-chat", glm_gen_metal_step, glm_gen_metal_hnorm,
+                                   &mc, chat.v, prompt_len, n_predict, logits, vocab,
+                                   e, &shape, eos_id, stdout,
                                    &generated, gen_ids, &decode_s);
             glm_metal_fwd_free(&mc);
         } else {
@@ -29292,8 +29374,9 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
     } else {
         glm_cpu_fwd_ctx cc;
         glm_cpu_fwd_init(&cc, m, &shape, n_layer, n_dense, cap);
-        rc = glm_generate_loop("glm-chat", glm_gen_cpu_step, &cc, chat.v, prompt_len,
-                               n_predict, logits, vocab, e, eos_id, stdout,
+        rc = glm_generate_loop("glm-chat", glm_gen_cpu_step, glm_gen_cpu_hnorm,
+                               &cc, chat.v, prompt_len, n_predict, logits, vocab,
+                               e, &shape, eos_id, stdout,
                                &generated, gen_ids, &decode_s);
         glm_cpu_fwd_free(&cc);
     }
@@ -29365,8 +29448,9 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
         glm_metal_fwd_ctx mc;
         if (glm_metal_fwd_init(&mc, m, &shape, n_layer, n_dense, cap)) {
             if (getenv("DS4_GLM_DECODE_TIME")) mc.profile_after_pos = prompt_len;
-            rc = glm_generate_loop("glm-raw", glm_gen_metal_step, &mc, toks.v, prompt_len,
-                                   n_predict, logits, vocab, e, eos_id, stdout,
+            rc = glm_generate_loop("glm-raw", glm_gen_metal_step, glm_gen_metal_hnorm,
+                                   &mc, toks.v, prompt_len, n_predict, logits, vocab,
+                                   e, &shape, eos_id, stdout,
                                    &generated, gen_ids, &decode_s);
             glm_metal_fwd_free(&mc);
         } else {
@@ -29378,8 +29462,9 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
     } else {
         glm_cpu_fwd_ctx cc;
         glm_cpu_fwd_init(&cc, m, &shape, n_layer, n_dense, cap);
-        rc = glm_generate_loop("glm-raw", glm_gen_cpu_step, &cc, toks.v, prompt_len,
-                               n_predict, logits, vocab, e, eos_id, stdout,
+        rc = glm_generate_loop("glm-raw", glm_gen_cpu_step, glm_gen_cpu_hnorm,
+                               &cc, toks.v, prompt_len, n_predict, logits, vocab,
+                               e, &shape, eos_id, stdout,
                                &generated, gen_ids, &decode_s);
         glm_cpu_fwd_free(&cc);
     }
