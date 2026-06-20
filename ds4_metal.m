@@ -26886,6 +26886,11 @@ typedef struct {
     uint32_t nh; uint32_t nope; uint32_t rope; uint32_t vd;
     uint32_t qhd; uint32_t seq_n; uint32_t t; float kq_scale;
 } ds4_gpu_glm_attn_args;
+typedef struct {
+    uint32_t nh; uint32_t nope; uint32_t rope; uint32_t vd;
+    uint32_t qhd; uint32_t seq_n; uint32_t pos0; uint32_t n_tok;
+    float kq_scale;
+} ds4_gpu_glm_attn_batch_args;
 
 /* Bind a tensor's MTLBuffer/offset into a compute encoder at index idx. */
 static void ds4_gpu_glm_bind(id<MTLComputeCommandEncoder> enc,
@@ -27209,6 +27214,72 @@ int ds4_gpu_glm_attn_decode_f32(const float * Q,
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm attn decode");
+        if (ok) ds4_gpu_tensor_read(to, 0, attn_out, ob);
+        ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tkn);
+        ds4_gpu_tensor_free(tkr); ds4_gpu_tensor_free(tv);
+        ds4_gpu_tensor_free(to);
+        return ok;
+    }
+}
+
+int ds4_gpu_glm_attn_decode_batch_f32(const float * Q,
+                                      const float * K_nope_cache,
+                                      const float * K_rope_cache,
+                                      const float * V_cache,
+                                      float * attn_out,
+                                      uint32_t nh, uint32_t nope, uint32_t rope,
+                                      uint32_t vd, uint32_t qhd,
+                                      uint32_t seq_n, uint32_t pos0,
+                                      uint32_t n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const float kq_scale = 1.0f / sqrtf((float)qhd);
+    ds4_gpu_glm_attn_batch_args args = { nh, nope, rope, vd, qhd, seq_n, pos0, n_tok, kq_scale };
+    @autoreleasepool {
+        const uint64_t qb   = (uint64_t)n_tok * nh * qhd * sizeof(float);
+        const uint64_t knb  = (uint64_t)nh * seq_n * nope * sizeof(float);
+        const uint64_t krb  = (uint64_t)nh * seq_n * rope * sizeof(float);
+        const uint64_t vb   = (uint64_t)nh * seq_n * vd * sizeof(float);
+        const uint64_t ob   = (uint64_t)n_tok * nh * vd * sizeof(float);
+        ds4_gpu_tensor *tq   = ds4_gpu_tensor_alloc(qb);
+        ds4_gpu_tensor *tkn  = ds4_gpu_tensor_alloc(knb);
+        ds4_gpu_tensor *tkr  = ds4_gpu_tensor_alloc(krb);
+        ds4_gpu_tensor *tv   = ds4_gpu_tensor_alloc(vb);
+        ds4_gpu_tensor *to   = ds4_gpu_tensor_alloc(ob);
+        if (!tq || !tkn || !tkr || !tv || !to) {
+            ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tkn);
+            ds4_gpu_tensor_free(tkr); ds4_gpu_tensor_free(tv);
+            ds4_gpu_tensor_free(to);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tq, 0, Q, qb);
+        ds4_gpu_tensor_write(tkn, 0, K_nope_cache, knb);
+        ds4_gpu_tensor_write(tkr, 0, K_rope_cache, krb);
+        ds4_gpu_tensor_write(tv, 0, V_cache, vb);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline("kernel_glm_attn_decode_batch_f32");
+        int ok = 0;
+        if (pipe) {
+            [enc setComputePipelineState:pipe];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            ds4_gpu_glm_bind(enc, tq, 1);
+            ds4_gpu_glm_bind(enc, tkn, 2);
+            ds4_gpu_glm_bind(enc, tkr, 3);
+            ds4_gpu_glm_bind(enc, tv, 4);
+            ds4_gpu_glm_bind(enc, to, 5);
+            const NSUInteger total = (NSUInteger)n_tok * nh;
+            NSUInteger ntg = 64;
+            const NSUInteger maxt = pipe.maxTotalThreadsPerThreadgroup;
+            if (maxt && ntg > maxt) ntg = maxt;
+            if (ntg == 0) ntg = 1;
+            const NSUInteger groups = (total + ntg - 1u) / ntg;
+            [enc dispatchThreadgroups:MTLSizeMake(groups ? groups : 1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(ntg, 1, 1)];
+            ok = 1;
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm attn decode batch");
         if (ok) ds4_gpu_tensor_read(to, 0, attn_out, ob);
         ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tkn);
         ds4_gpu_tensor_free(tkr); ds4_gpu_tensor_free(tv);

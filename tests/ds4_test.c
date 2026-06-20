@@ -3229,6 +3229,20 @@ static void test_glm_metal_components(void) {
     TEST_ASSERT(ds4_gpu_glm_attn_decode_f32(Qm, K_nope_ref, K_rope_ref, V_ref, mattn,
                         nh, nope, rope, vd, qhd, seq_n, t_pos));
     glm_metal_cmp("attn decode (scores+V)", mattn, cattn, (size_t)nh * vd, tol_abs, tol_rel);
+    float *Qb = malloc((size_t)batch_n * nh * qhd * sizeof(float));
+    float *cattn_b = malloc((size_t)batch_n * nh * vd * sizeof(float));
+    float *mattn_b = malloc((size_t)batch_n * nh * vd * sizeof(float));
+    for (uint32_t i = 0; i < nh * qhd; i++) Qb[i] = Qc[i] * 0.8f + 0.015f * (float)((int)i - 4);
+    memcpy(Qb + (size_t)nh * qhd, Qc, (size_t)nh * qhd * sizeof(float));
+    glm_cpu_attn_decode(Qb, K_nope_ref, K_rope_ref, V_ref, cattn_b,
+                        nh, nope, rope, vd, qhd, seq_n, t_pos - 1u);
+    glm_cpu_attn_decode(Qb + (size_t)nh * qhd, K_nope_ref, K_rope_ref, V_ref,
+                        cattn_b + (size_t)nh * vd,
+                        nh, nope, rope, vd, qhd, seq_n, t_pos);
+    TEST_ASSERT(ds4_gpu_glm_attn_decode_batch_f32(Qb, K_nope_ref, K_rope_ref, V_ref, mattn_b,
+                        nh, nope, rope, vd, qhd, seq_n, t_pos - 1u, batch_n));
+    glm_metal_cmp("attn decode batch2 contiguous-pos", mattn_b, cattn_b,
+                  (size_t)batch_n * nh * vd, tol_abs, tol_rel);
 
     /* ---- component 7: single attn_output projection ---- */
     float *co = malloc(sizeof(float) * H), *mo = malloc(sizeof(float) * H);
@@ -3421,7 +3435,8 @@ static void test_glm_metal_components(void) {
     free(ckva); free(mkva); free(ckvln); free(mkvln); free(ck); free(mk); free(cv); free(mv);
     free(qr_in); free(cqr); free(mqr); free(qr_b); free(cqr_b); free(mqr_b);
     free(kr_in); free(ckr); free(mkr);
-    free(Qm); free(Qc); free(cattn); free(mattn); free(co); free(mo);
+    free(Qm); free(Qc); free(cattn); free(mattn); free(Qb); free(cattn_b); free(mattn_b);
+    free(co); free(mo);
     free(Kc_n); free(Kc_r); free(Vc); free(mattn2); free(mout);
     free(Kc2_n); free(Kc2_r); free(Vc2); free(cout); free(ref_mla_out);
     free(x); free(WqA); free(WqB); free(WkvA); free(WkB); free(WvB); free(Wo);
@@ -3452,7 +3467,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},
     {"--glm-nextn-metal-synth", "glm-nextn-metal-synth", "GLM-5.2 Metal NextN/MTP path on a tiny synthetic block (no model needed)", test_glm_nextn_metal_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
-    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/batch RoPE/MLA projections/batch matmul/batch RMSNorm/attention) vs CPU reference", test_glm_metal_components},
+    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/batch RoPE/MLA projections/batch matmul/batch RMSNorm/batch attention) vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
     {"--glm-spec-batch-verify-synth", "glm-spec-batch-verify-synth", "GLM-5.2 NextN batched-verifier contract == naive greedy (no model needed)", test_glm_spec_batch_verify_synth},

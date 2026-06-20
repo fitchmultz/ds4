@@ -186,6 +186,18 @@ struct ds4_metal_args_glm_attn {
     float    kq_scale; // 1/sqrt(qhd)
 };
 
+struct ds4_metal_args_glm_attn_batch {
+    uint32_t nh;       // attention heads
+    uint32_t nope;     // per-head no-RoPE q/k dim
+    uint32_t rope;     // per-head RoPE slice dim
+    uint32_t vd;       // per-head v dim
+    uint32_t qhd;      // nope + rope (per-head q stride)
+    uint32_t seq_n;    // cache seq stride
+    uint32_t pos0;     // first query position; row tok attends [0,pos0+tok]
+    uint32_t n_tok;    // token batch
+    float    kq_scale; // 1/sqrt(qhd)
+};
+
 // Score one cached token n for head h: (q_nope . k_nope + q_rope . k_rope).
 static inline float glm_attn_score_n(
         device const float * qn, device const float * qr,
@@ -222,6 +234,54 @@ kernel void kernel_glm_attn_decode_f32(
     device const float * kr_base = K_rope_cache  + (uint64_t)h * args.seq_n * args.rope;
     device const float * v_base  = V_cache       + (uint64_t)h * args.seq_n * args.vd;
     device       float * oh      = attn_out      + (uint64_t)h * args.vd;
+
+    float maxs = -1e30f;
+    for (uint32_t n = 0; n < nt; n++) {
+        const float sc = glm_attn_score_n(qn, qr, kn_base, kr_base,
+                                          args.nope, args.rope, args.seq_n, n)
+                         * args.kq_scale;
+        if (sc > maxs) maxs = sc;
+    }
+    float denom = 0.0f;
+    for (uint32_t n = 0; n < nt; n++) {
+        const float sc = glm_attn_score_n(qn, qr, kn_base, kr_base,
+                                          args.nope, args.rope, args.seq_n, n)
+                         * args.kq_scale;
+        denom += exp(sc - maxs);
+    }
+    for (uint32_t d = 0; d < args.vd; d++) oh[d] = 0.0f;
+    for (uint32_t n = 0; n < nt; n++) {
+        const float sc = glm_attn_score_n(qn, qr, kn_base, kr_base,
+                                          args.nope, args.rope, args.seq_n, n)
+                         * args.kq_scale;
+        const float w = exp(sc - maxs) / denom;
+        device const float * vn = v_base + (uint64_t)n * args.vd;
+        for (uint32_t d = 0; d < args.vd; d++) oh[d] += w * vn[d];
+    }
+}
+
+// Batched decode attention. K/V caches are already populated for all queried
+// positions; Q/out are [n_tok, nh, ...]. One thread handles one (token, head)
+// and mirrors kernel_glm_attn_decode_f32 for absolute position pos0+token.
+kernel void kernel_glm_attn_decode_batch_f32(
+        constant ds4_metal_args_glm_attn_batch & args,
+        device const float * Q,
+        device const float * K_nope_cache,
+        device const float * K_rope_cache,
+        device const float * V_cache,
+        device       float * attn_out,
+        uint gid [[thread_position_in_grid]]) {
+    const uint32_t total = args.n_tok * args.nh;
+    if (gid >= total) return;
+    const uint32_t tok = gid / args.nh;
+    const uint32_t h = gid - tok * args.nh;
+    const uint32_t nt = args.pos0 + tok + 1u;
+    device const float * qn = Q + ((uint64_t)tok * args.nh + h) * args.qhd;
+    device const float * qr = qn + args.nope;
+    device const float * kn_base = K_nope_cache + (uint64_t)h * args.seq_n * args.nope;
+    device const float * kr_base = K_rope_cache + (uint64_t)h * args.seq_n * args.rope;
+    device const float * v_base = V_cache + (uint64_t)h * args.seq_n * args.vd;
+    device       float * oh = attn_out + ((uint64_t)tok * args.nh + h) * args.vd;
 
     float maxs = -1e30f;
     for (uint32_t n = 0; n < nt; n++) {

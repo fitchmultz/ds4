@@ -1064,6 +1064,15 @@ int ds4_gpu_glm_attn_decode_f32(const float * Q,
                                 uint32_t nh, uint32_t nope, uint32_t rope,
                                 uint32_t vd, uint32_t qhd,
                                 uint32_t seq_n, uint32_t t);
+int ds4_gpu_glm_attn_decode_batch_f32(const float * Q,
+                                      const float * K_nope_cache,
+                                      const float * K_rope_cache,
+                                      const float * V_cache,
+                                      float * attn_out,
+                                      uint32_t nh, uint32_t nope, uint32_t rope,
+                                      uint32_t vd, uint32_t qhd,
+                                      uint32_t seq_n, uint32_t pos0,
+                                      uint32_t n_tok);
 
 /* Sigmoid MoE router on PRECOMPUTED logits (gate@x is done separately via
  * ds4_gpu_glm_matvec_f32).  prob=sigmoid(logits); sel=prob+bias; stable
