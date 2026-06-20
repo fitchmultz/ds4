@@ -391,8 +391,10 @@ The core GLM port is complete and verified. The active work is usability/speed:
   through the current layer-major batch helper was tested and rejected for now:
   the zero-prefix variant emitted token `59` instead of the known `108714` for
   `asdfqwer -n 1`, and a seeded-token-0 suffix variant still emitted `896`.
-  Therefore no batched-prefill flag is exposed yet; future prefill work needs a
-  dedicated zero/prefix correctness fixture before it can be enabled.
+  `--glm-metal-target-batch-synth` now includes zero-prefix and seeded-prefix
+  synthetic prefill comparisons, but no batched-prefill flag is exposed yet;
+  future prefill work still needs a real-model/oracle zero-prefix proof before it
+  can be enabled.
   LM head is only ~0.5–0.6s/token and is not the next target.
   A measured top-1-only verifier readback experiment was discarded: on
   `asdfqwer -n 2` the full-logit path reported lm-head ~0.462s while the

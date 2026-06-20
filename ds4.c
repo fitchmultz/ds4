@@ -31683,11 +31683,105 @@ int ds4_glm_metal_target_batch_synth(int *out_match, float *out_hidden_max,
         const int bt = sample_argmax(bat_cont_logits, sc.vocab);
         if (st != bt) top_ok = false;
     }
-    const bool pass = ok && top_ok && hdiff < 2e-5f && ldiff < 2e-5f && cdiff < 2e-5f;
+
+    /* Dedicated prefill-shape checks: the production real-model probe showed
+     * target-verifier correctness is not enough to expose all prefill issues.
+     * Keep zero-prefix and seeded-prefix synthetic comparisons here before any
+     * future batched-prefill flag is allowed. */
+    float pre_zero_hdiff = 1.0e30f, pre_zero_ldiff = 1.0e30f, pre_zero_cdiff = 1.0e30f;
+    float pre_seed_hdiff = 1.0e30f, pre_seed_ldiff = 1.0e30f, pre_seed_cdiff = 1.0e30f;
+    bool pre_zero_top = false, pre_seed_top = false;
+    {
+        glm_metal_fwd_ctx zseq, zbat, sseq, sbat;
+        memset(&zseq, 0, sizeof(zseq)); memset(&zbat, 0, sizeof(zbat));
+        memset(&sseq, 0, sizeof(sseq)); memset(&sbat, 0, sizeof(sbat));
+        float *zseq_logits = xmalloc((size_t)plen * sc.vocab * sizeof(float));
+        float *zbat_logits = xmalloc((size_t)plen * sc.vocab * sizeof(float));
+        float *zseq_hidden = xmalloc((size_t)plen * sc.shape.hidden * sizeof(float));
+        float *zbat_hidden = xmalloc((size_t)plen * sc.shape.hidden * sizeof(float));
+        float *sseq_logits = xmalloc((size_t)(plen - 1u) * sc.vocab * sizeof(float));
+        float *sbat_logits = xmalloc((size_t)(plen - 1u) * sc.vocab * sizeof(float));
+        float *sseq_hidden = xmalloc((size_t)(plen - 1u) * sc.shape.hidden * sizeof(float));
+        float *sbat_hidden = xmalloc((size_t)(plen - 1u) * sc.shape.hidden * sizeof(float));
+        float *zc_seq = xmalloc((size_t)sc.vocab * sizeof(float));
+        float *zc_bat = xmalloc((size_t)sc.vocab * sizeof(float));
+        float *sc_seq = xmalloc((size_t)sc.vocab * sizeof(float));
+        float *sc_bat = xmalloc((size_t)sc.vocab * sizeof(float));
+        bool zok = glm_metal_fwd_init(&zseq, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap) &&
+                   glm_metal_fwd_init(&zbat, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap);
+        for (uint32_t r = 0; zok && r < plen; r++) {
+            zok = glm_metal_fwd_step(&zseq, prompt[r], r, true,
+                                     zseq_logits + (size_t)r * sc.vocab);
+            if (zok) memcpy(zseq_hidden + (size_t)r * sc.shape.hidden, zseq.x,
+                            (size_t)sc.shape.hidden * sizeof(float));
+        }
+        if (zok) zok = glm_metal_fwd_batch_f32(&zbat, prompt, 0, plen, true,
+                                               zbat_logits, zbat_hidden, NULL);
+        if (zok) zok = glm_metal_fwd_step(&zseq, 13, plen, true, zc_seq) &&
+                       glm_metal_fwd_step(&zbat, 13, plen, true, zc_bat);
+        if (zok) {
+            pre_zero_hdiff = max_abs_diff(zseq_hidden, zbat_hidden,
+                                          (uint64_t)plen * sc.shape.hidden);
+            pre_zero_ldiff = max_abs_diff(zseq_logits, zbat_logits,
+                                          (uint64_t)plen * sc.vocab);
+            pre_zero_cdiff = max_abs_diff(zc_seq, zc_bat, sc.vocab);
+            pre_zero_top = true;
+            for (uint32_t r = 0; pre_zero_top && r < plen; r++)
+                pre_zero_top = sample_argmax(zseq_logits + (size_t)r * sc.vocab, sc.vocab) ==
+                               sample_argmax(zbat_logits + (size_t)r * sc.vocab, sc.vocab);
+            if (pre_zero_top)
+                pre_zero_top = sample_argmax(zc_seq, sc.vocab) == sample_argmax(zc_bat, sc.vocab);
+        }
+
+        bool sok = glm_metal_fwd_init(&sseq, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap) &&
+                   glm_metal_fwd_init(&sbat, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap);
+        if (sok) sok = glm_metal_fwd_step(&sseq, prompt[0], 0, false, NULL) &&
+                       glm_metal_fwd_step(&sbat, prompt[0], 0, false, NULL);
+        for (uint32_t r = 1; sok && r < plen; r++) {
+            sok = glm_metal_fwd_step(&sseq, prompt[r], r, true,
+                                     sseq_logits + (size_t)(r - 1u) * sc.vocab);
+            if (sok) memcpy(sseq_hidden + (size_t)(r - 1u) * sc.shape.hidden, sseq.x,
+                            (size_t)sc.shape.hidden * sizeof(float));
+        }
+        if (sok) sok = glm_metal_fwd_batch_f32(&sbat, prompt + 1, 1, plen - 1u, true,
+                                               sbat_logits, sbat_hidden, NULL);
+        if (sok) sok = glm_metal_fwd_step(&sseq, 13, plen, true, sc_seq) &&
+                       glm_metal_fwd_step(&sbat, 13, plen, true, sc_bat);
+        if (sok) {
+            pre_seed_hdiff = max_abs_diff(sseq_hidden, sbat_hidden,
+                                          (uint64_t)(plen - 1u) * sc.shape.hidden);
+            pre_seed_ldiff = max_abs_diff(sseq_logits, sbat_logits,
+                                          (uint64_t)(plen - 1u) * sc.vocab);
+            pre_seed_cdiff = max_abs_diff(sc_seq, sc_bat, sc.vocab);
+            pre_seed_top = true;
+            for (uint32_t r = 0; pre_seed_top && r < plen - 1u; r++)
+                pre_seed_top = sample_argmax(sseq_logits + (size_t)r * sc.vocab, sc.vocab) ==
+                               sample_argmax(sbat_logits + (size_t)r * sc.vocab, sc.vocab);
+            if (pre_seed_top)
+                pre_seed_top = sample_argmax(sc_seq, sc.vocab) == sample_argmax(sc_bat, sc.vocab);
+        }
+        if (sbat.m) glm_metal_fwd_free(&sbat);
+        if (sseq.m) glm_metal_fwd_free(&sseq);
+        if (zbat.m) glm_metal_fwd_free(&zbat);
+        if (zseq.m) glm_metal_fwd_free(&zseq);
+        free(sc_bat); free(sc_seq); free(zc_bat); free(zc_seq);
+        free(sbat_hidden); free(sseq_hidden); free(sbat_logits); free(sseq_logits);
+        free(zbat_hidden); free(zseq_hidden); free(zbat_logits); free(zseq_logits);
+    }
+    const bool pre_zero_pass = pre_zero_top && pre_zero_hdiff < 2e-5f &&
+                               pre_zero_ldiff < 2e-5f && pre_zero_cdiff < 2e-5f;
+    const bool pre_seed_pass = pre_seed_top && pre_seed_hdiff < 2e-5f &&
+                               pre_seed_ldiff < 2e-5f && pre_seed_cdiff < 2e-5f;
+    const bool pass = ok && top_ok && hdiff < 2e-5f && ldiff < 2e-5f && cdiff < 2e-5f &&
+                      pre_zero_pass && pre_seed_pass;
     fprintf(stderr,
-            "  glm-metal-target-batch-synth: %s (rows=%u hidden_max=%g logits_max=%g cont_logits_max=%g top_match=%s)\n",
+            "  glm-metal-target-batch-synth: %s (rows=%u hidden_max=%g logits_max=%g cont_logits_max=%g top_match=%s zero_prefill=%s/%g/%g/%g seeded_prefill=%s/%g/%g/%g)\n",
             pass ? "PASS" : "FAIL", n_batch, (double)hdiff, (double)ldiff,
-            (double)cdiff, top_ok ? "yes" : "no");
+            (double)cdiff, top_ok ? "yes" : "no",
+            pre_zero_pass ? "yes" : "no", (double)pre_zero_hdiff,
+            (double)pre_zero_ldiff, (double)pre_zero_cdiff,
+            pre_seed_pass ? "yes" : "no", (double)pre_seed_hdiff,
+            (double)pre_seed_ldiff, (double)pre_seed_cdiff);
     if (out_match) *out_match = pass ? 1 : 0;
     if (out_hidden_max) *out_hidden_max = hdiff;
     if (out_logits_max) *out_logits_max = ldiff;
