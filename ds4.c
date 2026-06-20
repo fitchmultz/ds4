@@ -27680,6 +27680,150 @@ static bool glm_nextn_eh_project_cpu(const ds4_model *m,
     return true;
 }
 
+/* Run blk.78 as a one-token NextN decoder over the eh_proj seed and return the
+ * post-`nextn.shared_head_norm` hidden vector.  This validates the complete
+ * blk.78 tensor layout and CPU dequant path (Q5_K/Q8_0 attention, Q2_K gate/up,
+ * Q3_K down, Q5_K/Q6_K shared expert) without yet implementing speculative
+ * cache/accept semantics. */
+static bool glm_nextn_decoder_cpu(const ds4_model *m,
+                                  const glm_cpu_shape *shape,
+                                  const float *seed,
+                                  float *head_norm_out) {
+    const uint32_t il = 78;
+    const uint32_t H = shape->hidden, nh = shape->n_head, ql = shape->q_lora;
+    const uint32_t kvl = shape->kv_lora, nope = shape->qk_nope, rope = shape->qk_rope;
+    const uint32_t vd = shape->v_dim, E = shape->n_expert, K = shape->n_expert_used;
+    const float eps = shape->rms_eps;
+    bool ok = false;
+
+    float *x = xmalloc((size_t)H * sizeof(float));
+    float *xn = xmalloc((size_t)H * sizeof(float));
+    float *res = xmalloc((size_t)H * sizeof(float));
+    float *mla_out = xmalloc((size_t)H * sizeof(float));
+    float *ffn_out = xmalloc((size_t)H * sizeof(float));
+    float *etmp = xmalloc((size_t)H * sizeof(float));
+    float *WqA = xmalloc((size_t)ql * H * sizeof(float));
+    float *WqB = xmalloc((size_t)nh * (nope + rope) * ql * sizeof(float));
+    float *WkvA = xmalloc((size_t)(kvl + rope) * H * sizeof(float));
+    float *WkBn = xmalloc((size_t)nh * nope * kvl * sizeof(float));
+    float *WkB = xmalloc((size_t)nh * nope * kvl * sizeof(float));
+    float *WvB = xmalloc((size_t)nh * vd * kvl * sizeof(float));
+    float *Wo = xmalloc((size_t)H * nh * vd * sizeof(float));
+    float *Knope = xmalloc((size_t)nh * nope * sizeof(float));
+    float *Vc = xmalloc((size_t)nh * vd * sizeof(float));
+    float *Krop = xmalloc((size_t)nh * rope * sizeof(float));
+    float *router = xmalloc((size_t)E * sizeof(float));
+    int *idx = xmalloc((size_t)K * sizeof(int));
+    float *rw = xmalloc((size_t)K * sizeof(float));
+    float *fgate = NULL, *fup = NULL, *fdown = NULL, *sg = NULL, *su = NULL;
+
+    memcpy(x, seed, (size_t)H * sizeof(float));
+
+    const ds4_tensor *anorm_t = glm_layer_tensor(m, il, "attn_norm");
+    const ds4_tensor *q_a  = glm_layer_tensor(m, il, "attn_q_a");
+    const ds4_tensor *q_b  = glm_layer_tensor(m, il, "attn_q_b");
+    const ds4_tensor *kv_a = glm_layer_tensor(m, il, "attn_kv_a_mqa");
+    const ds4_tensor *k_b  = glm_layer_tensor(m, il, "attn_k_b");
+    const ds4_tensor *v_b  = glm_layer_tensor(m, il, "attn_v_b");
+    const ds4_tensor *wop  = glm_layer_tensor(m, il, "attn_output");
+    const ds4_tensor *qa_norm_t = glm_layer_tensor(m, il, "attn_q_a_norm");
+    const ds4_tensor *kv_norm_t = glm_layer_tensor(m, il, "attn_kv_a_norm");
+    if (!anorm_t || !q_a || !q_b || !kv_a || !k_b || !v_b || !wop ||
+        !qa_norm_t || !kv_norm_t) goto done;
+
+    memcpy(res, x, (size_t)H * sizeof(float));
+    glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, anorm_t), H, eps);
+    glm_dequant_weight(m, q_a, WqA);
+    glm_dequant_weight(m, q_b, WqB);
+    glm_dequant_weight(m, kv_a, WkvA);
+    glm_dequant_weight(m, k_b, WkBn);
+    glm_k_b_reorder(WkB, WkBn, nope, kvl, nh);
+    glm_dequant_weight(m, v_b, WvB);
+    glm_dequant_weight(m, wop, Wo);
+    glm_mla_forward_token_f32(mla_out, xn, WqA, WqB, WkvA, WkB, WvB, Wo,
+                              (const float *)tensor_data(m, qa_norm_t),
+                              (const float *)tensor_data(m, kv_norm_t),
+                              Knope, Vc, Krop, 1, 0, shape, NULL);
+    for (uint32_t d = 0; d < H; d++) x[d] = res[d] + mla_out[d];
+
+    const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
+    const ds4_tensor *ge  = glm_layer_tensor(m, il, "ffn_gate_exps");
+    const ds4_tensor *ue  = glm_layer_tensor(m, il, "ffn_up_exps");
+    const ds4_tensor *de  = glm_layer_tensor(m, il, "ffn_down_exps");
+    const ds4_tensor *ginp= glm_layer_tensor(m, il, "ffn_gate_inp");
+    const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
+    const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
+    const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
+    const ds4_tensor *shnorm_t = glm_layer_tensor(m, il, "nextn.shared_head_norm");
+    char bias_name[64];
+    snprintf(bias_name, sizeof(bias_name), "blk.%u.exp_probs_b.bias", il);
+    const ds4_tensor *bias_t = model_find_tensor(m, bias_name);
+    if (!fnorm_t || !ge || !ue || !de || !ginp || !gsh || !ush || !dsh ||
+        !shnorm_t || !bias_t) goto done;
+
+    const uint32_t ei = (uint32_t)ge->dim[1];
+    const uint64_t pe_gate = ge->bytes / ge->dim[2];
+    const uint64_t pe_up   = ue->bytes / ue->dim[2];
+    const uint64_t pe_down = de->bytes / de->dim[2];
+    glm_cpu_shape eshape = *shape;
+    eshape.ff_inter = ei;
+    fgate = xmalloc((size_t)ei * H * sizeof(float));
+    fup   = xmalloc((size_t)ei * H * sizeof(float));
+    fdown = xmalloc((size_t)H * ei * sizeof(float));
+    sg    = xmalloc((size_t)ei * sizeof(float));
+    su    = xmalloc((size_t)ei * sizeof(float));
+
+    memcpy(res, x, (size_t)H * sizeof(float));
+    glm_rmsnorm_f32(xn, x, (const float *)tensor_data(m, fnorm_t), H, eps);
+    glm_moe_route_sigmoid(idx, rw, (const float *)tensor_data(m, ginp), xn,
+                          (const float *)tensor_data(m, bias_t), shape, router);
+    for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] = 0.0f;
+    for (uint32_t k = 0; k < K; k++) {
+        const uint32_t e = (uint32_t)idx[k];
+        glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, fgate);
+        glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, fup);
+        glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, fdown);
+        glm_swiglu_dense_f32(etmp, xn, fgate, fup, fdown, &eshape, sg, su);
+        for (uint32_t d0 = 0; d0 < H; d0++) ffn_out[d0] += rw[k] * etmp[d0];
+    }
+    glm_dequant_weight(m, gsh, fgate);
+    glm_dequant_weight(m, ush, fup);
+    glm_dequant_weight(m, dsh, fdown);
+    glm_swiglu_dense_f32(etmp, xn, fgate, fup, fdown, &eshape, sg, su);
+    for (uint32_t d0 = 0; d0 < H; d0++) x[d0] = res[d0] + ffn_out[d0] + etmp[d0];
+
+    glm_rmsnorm_f32(head_norm_out, x, (const float *)tensor_data(m, shnorm_t), H, eps);
+    ok = true;
+
+done:
+    free(fgate); free(fup); free(fdown); free(sg); free(su);
+    free(rw); free(idx); free(router);
+    free(Krop); free(Vc); free(Knope);
+    free(Wo); free(WvB); free(WkB); free(WkBn); free(WkvA); free(WqB); free(WqA);
+    free(etmp); free(ffn_out); free(mla_out); free(res); free(xn); free(x);
+    return ok;
+}
+
+static bool glm_nextn_logits_cpu(const ds4_model *m,
+                                 const glm_cpu_shape *shape,
+                                 const float *head_norm,
+                                 float *logits,
+                                 uint32_t vocab) {
+    const ds4_tensor *t_out = model_find_tensor(m, "output.weight");
+    if (!t_out || t_out->dim[1] != vocab) return false;
+    const uint32_t H = shape->hidden;
+    const uint64_t out_row_bytes = t_out->bytes / vocab;
+    float *row = xmalloc((size_t)H * sizeof(float));
+    for (uint32_t v = 0; v < vocab; v++) {
+        glm_dequant_count(m, t_out, (uint64_t)v * out_row_bytes, H, row);
+        float s = 0.0f;
+        for (uint32_t d = 0; d < H; d++) s += row[d] * head_norm[d];
+        logits[v] = s;
+    }
+    free(row);
+    return true;
+}
+
 void ds4_glm_cpu_forward_UNUSED(void) {}  /* placeholder removed below */
 
 /* CLI driver: tokenize the prompt with the loaded GLM vocab, run the full CPU
@@ -27750,6 +27894,58 @@ int ds4_engine_glm_cpu_ref(ds4_engine *e, const char *prompt, int n_predict) {
             fprintf(stderr, "ds4: glm-cpu-ref: failed to compute NextN eh_proj seed\n");
         }
         free(eh);
+    }
+
+    const char *nh_path = getenv("DS4_GLM_NEXTN_H_OUT");
+    const char *nl_path = getenv("DS4_GLM_NEXTN_LOGITS_OUT");
+    if ((nh_path && nh_path[0]) || (nl_path && nl_path[0])) {
+        float *eh = xmalloc((size_t)shape.hidden * sizeof(float));
+        float *nh = xmalloc((size_t)shape.hidden * sizeof(float));
+        if (glm_nextn_eh_project_cpu(m, &shape, argmax, h_nextn, eh) &&
+            glm_nextn_decoder_cpu(m, &shape, eh, nh)) {
+            if (nh_path && nh_path[0]) {
+                FILE *hf = fopen(nh_path, "wb");
+                if (hf) {
+                    fwrite(nh, sizeof(float), shape.hidden, hf);
+                    fclose(hf);
+                    fprintf(stderr, "ds4: glm-cpu-ref: dumped NextN decoder hidden (%u floats) to %s\n",
+                            shape.hidden, nh_path);
+                } else {
+                    fprintf(stderr, "ds4: glm-cpu-ref: failed to open DS4_GLM_NEXTN_H_OUT=%s: %s\n",
+                            nh_path, strerror(errno));
+                }
+            }
+            if (nl_path && nl_path[0]) {
+                float *nlogits = xmalloc((size_t)vocab * sizeof(float));
+                if (glm_nextn_logits_cpu(m, &shape, nh, nlogits, vocab)) {
+                    int narg = 0;
+                    float ntop = nlogits[0];
+                    bool nfinite = isfinite(nlogits[0]);
+                    for (uint32_t v = 1; v < vocab; v++) {
+                        if (!isfinite(nlogits[v])) nfinite = false;
+                        if (nlogits[v] > ntop) { ntop = nlogits[v]; narg = (int)v; }
+                    }
+                    printf("glm-nextn-cpu: token=%d top_logit=%.6f logits_finite=%s vocab=%u\n",
+                           narg, (double)ntop, nfinite ? "yes" : "no", vocab);
+                    FILE *nf = fopen(nl_path, "wb");
+                    if (nf) {
+                        fwrite(nlogits, sizeof(float), vocab, nf);
+                        fclose(nf);
+                        fprintf(stderr, "ds4: glm-cpu-ref: dumped NextN logits (%u floats) to %s\n",
+                                vocab, nl_path);
+                    } else {
+                        fprintf(stderr, "ds4: glm-cpu-ref: failed to open DS4_GLM_NEXTN_LOGITS_OUT=%s: %s\n",
+                                nl_path, strerror(errno));
+                    }
+                } else {
+                    fprintf(stderr, "ds4: glm-cpu-ref: failed to compute NextN logits\n");
+                }
+                free(nlogits);
+            }
+        } else {
+            fprintf(stderr, "ds4: glm-cpu-ref: failed to run NextN decoder diagnostic\n");
+        }
+        free(nh); free(eh);
     }
 
     /* Optional full-logit dump for the strong full-vector comparison vs the
