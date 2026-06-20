@@ -371,7 +371,10 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `The meaning of life is -n 3`, kept identical ids/stdout (`264 27066 323`,
   ` a profound and`) but missed the draft (`target_steps=2,target_batches=2`) and
   measured NextN decode `22.55s` vs plain greedy `20.36s`, confirming acceptance
-  rate still gates speed. Default remains the pure F32 proof path,
+  rate still gates speed. A naive adaptive miss-budget probe was rejected for now:
+  on `The meaning of life is -n 5`, disabling drafts after the first miss kept
+  ids/stdout but slowed decode to `44.92s` versus `36.24s` with normal NextN,
+  because the next round would have accepted. Default remains the pure F32 proof path,
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and
