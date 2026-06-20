@@ -292,7 +292,10 @@ The core GLM port is complete and verified. The active work is usability/speed:
   prompt avoids the 13-token chat-template prefill while batched prefill is
   pending. The CLI generation loop also skips the unnecessary target forward
   after the final requested token, so `-n 1` returns immediately after prefill
-  plus text emission.
+  plus text emission. `DS4_GLM_RAW_GEN_IDS_OUT=<path>` writes generated raw-mode
+  token ids for byte-independent plain-vs-NextN validation; current real-model
+  smoke has plain and `--glm-nextn --glm-nextn-draft 1` both emitting ids
+  `108714 100461` (`12345`) for `asdfqwer -n 2`.
 - A critical probe showed the older “fused Q8 MLA” path is not active for the
   downloaded UD_IQ2_M quant: `attn_q_a` and `attn_output` are Q5_K (Q6_K on
   blk.8), so the all-Q8 eligibility is false for every backbone layer.

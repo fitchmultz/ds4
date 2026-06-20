@@ -30087,9 +30087,19 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
                                spec, e->glm_nextn_depth);
         glm_cpu_fwd_free(&cc);
     }
-    if (rc == 0)
+    if (rc == 0) {
         fprintf(stderr, "\nds4: glm-raw: generated %d tokens (%s)\n",
                 generated, use_metal ? "metal" : "cpu");
+        const char *gids = getenv("DS4_GLM_RAW_GEN_IDS_OUT");
+        if (gids && gids[0]) {
+            FILE *gf = fopen(gids, "w");
+            if (gf) {
+                for (int i = 0; i < generated; i++) fprintf(gf, "%d\n", gen_ids[i]);
+                fclose(gf);
+                fprintf(stderr, "ds4: glm-raw: wrote %d generated ids to %s\n", generated, gids);
+            }
+        }
+    }
     free(gen_ids);
     free(logits);
     free(toks.v);
