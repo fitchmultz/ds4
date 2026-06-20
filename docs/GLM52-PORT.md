@@ -213,9 +213,17 @@ coverage, including blk.78 NextN-only Q2_K/Q3_K. DSA deferred. DONE:
 llama.cpp on the current oracle prompts; sparse DSA/index sharing is a later
 long-context quality/perf task.
 
-**Phase 6 — NextN/MTP speculative.** Deferred. `blk.78.nextn.*` tensors are
-loaded/identified, but the GLM generator currently ignores them. This is now a
-high-value speed direction because single-token decode still costs ~9–12s/token.
+**Phase 6 — NextN/MTP speculative.** Partially wired/diagnostic. `blk.78.nextn.*`
+loads, dequants, and runs through the CPU diagnostic path; `ds4_test
+--glm-nextn-synth` pins the no-model control/tensor wiring; `DS4_GLM_NEXTN_PROBE=1`
+measures one-draft agreement during generation without changing output. Production
+speculative decode is still unwired: SGLang's current NEXTN/EAGLE V2 flow first
+fills/extends the draft KV cache from target hidden states and target next tokens,
+then recursively drafts a tree, then verifies with a batched target tree pass
+(`python/sglang/srt/speculative/eagle_worker_v2.py`, `deepseek_nextn.py`). A
+correct GLM implementation therefore needs draft KV state plus target batched
+verify/rollback, not an argmax-only shortcut. This remains a high-value speed
+direction because single-token decode still costs ~9–12s/token.
 
 **Phase 7 — tests/eval/docs.** Tiered: always-on (metadata/cache-math/router
 microkernels), `DS4_TEST_GLM52_SHARD1`, `DS4_TEST_GLM52_GGUF`, `DS4_TEST_GLM52_LONG`.
@@ -270,7 +278,9 @@ The core GLM port is complete and verified. The active work is usability/speed:
   next target argmax. `DS4_GLM_NEXTN_PROBE_LOG=1` prints per-step evidence. On
   `DS4_GLM_FAST=1 --glm-raw -p asdfqwer -n 1`, output remains `123`; the probe
   is finite and reports `0/1` hits (`draft=108714`, `target=100461`). This is
-  still diagnostic-only, not a production speculative cache/accept loop.
+  still diagnostic-only. Per SGLang NEXTN/EAGLE V2, production acceptance needs
+  draft KV extend/fill, recursive draft forward, and batched target verify before
+  committing accepted draft tokens.
 - `--glm-raw` / `--glm-raw-cpu` bypass the GLM chat template and raw-tokenize
   `-p/--prompt`. This is a usability/benchmark mode, not chat: a one-token raw
   prompt avoids the 13-token chat-template prefill while batched prefill is
@@ -290,7 +300,8 @@ The core GLM port is complete and verified. The active work is usability/speed:
 ## 8. Risks / blockers
 
 - NextN/MTP still needs graph wiring and fast kernels. CPU dequant now covers
-  blk.78 Q2_K/Q3_K, but no speculative acceptance loop is wired yet.
+  blk.78 Q2_K/Q3_K and no-model wiring is tested, but no draft KV cache or
+  batched speculative target-verify loop is wired yet.
 - `DS4_MAX_*` cap bumps (DS4_MAX_LAYER>=79, DS4_MAX_VOCAB>=154880) for inference
   must not change DeepSeek shapes/allocs — decide between bumping vs a GLM-specific
   shape struct in Phase 4.
