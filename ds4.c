@@ -29701,13 +29701,26 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
                 }
             }
             if (!ok) break;
-            glm_dequant_weight(m, gsh, c->fgate);
-            glm_dequant_weight(m, ush, c->fup);
-            glm_dequant_weight(m, dsh, c->fdown);
-            ok = ds4_gpu_glm_matmul_f32(c->fgate, xn, bg, ei, H, n_tok) != 0;
-            if (ok) ok = ds4_gpu_glm_matmul_f32(c->fup, xn, bu, ei, H, n_tok) != 0;
+            const bool shexp_resident = c->fast && c->sh_g && c->sh_u && c->sh_d &&
+                                        c->sh_g[il] && c->sh_u[il] && c->sh_d[il] &&
+                                        getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
+            const float *shg = NULL, *shu = NULL, *shd = NULL;
+            if (shexp_resident) {
+                shg = c->sh_g[il];
+                shu = c->sh_u[il];
+                shd = c->sh_d[il];
+            } else {
+                glm_dequant_weight(m, gsh, c->fgate);
+                glm_dequant_weight(m, ush, c->fup);
+                glm_dequant_weight(m, dsh, c->fdown);
+                shg = c->fgate;
+                shu = c->fup;
+                shd = c->fdown;
+            }
+            ok = ds4_gpu_glm_matmul_f32(shg, xn, bg, ei, H, n_tok) != 0;
+            if (ok) ok = ds4_gpu_glm_matmul_f32(shu, xn, bu, ei, H, n_tok) != 0;
             if (ok) ok = ds4_gpu_glm_swiglu_f32(bg, bu, bact, (uint64_t)n_tok * ei) != 0;
-            if (ok) ok = ds4_gpu_glm_matmul_f32(c->fdown, bact, mla_out, H, ei, n_tok) != 0;
+            if (ok) ok = ds4_gpu_glm_matmul_f32(shd, bact, mla_out, H, ei, n_tok) != 0;
             if (!ok) break;
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *outt = ffn_out + (size_t)t * H;

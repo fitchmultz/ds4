@@ -339,7 +339,9 @@ The core GLM port is complete and verified. The active work is usability/speed:
   output norm, LM head) matches sequential Metal target rows on the tiny
   synthetic GLM model and leaves KV cache state usable for the next decode row;
   the F32 routed/shared MoE verifier branch now batches expert projections over
-  rows by route rank/unique expert instead of calling the per-row SwiGLU helper.
+  rows by route rank/unique expert instead of calling the per-row SwiGLU helper,
+  and reuses resident shared-expert F32 weights when the GLM fast path has
+  already pre-dequanted them.
   A real `asdfqwer -n 3` smoke with `DS4_GLM_VERIFY_BATCH_F32=1` keeps the known
   ids `108714 100461 21` / stdout `123456` and shows `target_steps=2,
   target_batches=1` with `batch_f32 calls=1 fallbacks=0` (still correctness-first,
