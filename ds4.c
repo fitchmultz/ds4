@@ -30153,12 +30153,11 @@ static bool glm_spec_verify_after_bonus_single(glm_gen_step_fn step,
 }
 
 #ifndef DS4_NO_GPU
-static bool glm_metal_fwd_clone_kv(glm_metal_fwd_ctx *dst,
-                                   const glm_metal_fwd_ctx *src) {
-    if (!dst || !src || !src->m || !src->shape) return false;
-    memset(dst, 0, sizeof(*dst));
-    if (!glm_metal_fwd_init(dst, src->m, src->shape,
-                            src->n_layer, src->n_dense, src->seq_n))
+static bool glm_metal_fwd_copy_kv(glm_metal_fwd_ctx *dst,
+                                  const glm_metal_fwd_ctx *src) {
+    if (!dst || !src || !dst->m || !src->m || dst->seq_n != src->seq_n ||
+        dst->n_layer != src->n_layer || dst->nh != src->nh ||
+        dst->nope != src->nope || dst->vd != src->vd || dst->rope != src->rope)
         return false;
     const size_t kn = (size_t)src->nh * src->seq_n * src->nope * sizeof(float);
     const size_t vn = (size_t)src->nh * src->seq_n * src->vd * sizeof(float);
@@ -30170,6 +30169,11 @@ static bool glm_metal_fwd_clone_kv(glm_metal_fwd_ctx *dst,
     }
     return true;
 }
+
+typedef struct {
+    glm_metal_fwd_ctx *live;
+    glm_metal_fwd_ctx *scratch;
+} glm_metal_verify_ctx;
 
 /* Rollback-safe Metal verifier seam.  It runs the candidate after-bonus chain
  * against a scratch copy of the target KV cache, collects target hidden rows,
@@ -30194,8 +30198,10 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
                                                       int *fallback_token,
                                                       int *next_out,
                                                       uint32_t *target_batches_out) {
-    glm_metal_fwd_ctx *live = (glm_metal_fwd_ctx *)verify_ctx;
-    if (!live || !pos_io || !logits || !emit_after || !emit_count ||
+    glm_metal_verify_ctx *vc = (glm_metal_verify_ctx *)verify_ctx;
+    glm_metal_fwd_ctx *live = vc ? vc->live : NULL;
+    glm_metal_fwd_ctx *scratch = vc ? vc->scratch : NULL;
+    if (!live || !scratch || !pos_io || !logits || !emit_after || !emit_count ||
         !accepted || !fallback_emitted || !fallback_token || !next_out)
         return false;
 
@@ -30212,27 +30218,26 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
     if (chain_rows > (uint32_t)remaining_after_bonus) chain_rows = (uint32_t)remaining_after_bonus;
     if (chain_rows == 0 || chain_rows > DS4_GLM_NEXTN_MAX_DEPTH + 1u) return false;
 
-    glm_metal_fwd_ctx scratch;
-    if (!glm_metal_fwd_clone_kv(&scratch, live)) return false;
+    if (!glm_metal_fwd_copy_kv(scratch, live)) return false;
     float *row_hidden = xmalloc((size_t)chain_rows * live->H * sizeof(float));
     float *row_norm = xmalloc((size_t)chain_rows * live->H * sizeof(float));
     float *row_logits = xmalloc((size_t)chain_rows * vocab * sizeof(float));
-    float *batch_chunk_logits = xmalloc((size_t)chain_rows * scratch.chunk_rows * sizeof(float));
+    float *batch_chunk_logits = xmalloc((size_t)chain_rows * scratch->chunk_rows * sizeof(float));
     int *row_top = xmalloc((size_t)chain_rows * sizeof(int));
     float *row_val = xmalloc((size_t)chain_rows * sizeof(float));
     bool ok = true;
     for (uint32_t r = 0; r < chain_rows && ok; r++) {
         const int tok = (r == 0) ? bonus_token : draft[r - 1u];
-        ok = glm_gen_metal_step(&scratch, tok, pos0 + r, false, NULL);
+        ok = glm_gen_metal_step(scratch, tok, pos0 + r, false, NULL);
         if (ok) memcpy(row_hidden + (size_t)r * live->H,
-                       scratch.x, (size_t)live->H * sizeof(float));
+                       scratch->x, (size_t)live->H * sizeof(float));
     }
     if (ok) ok = glm_lm_head_metal_batch_logits(live->m, row_hidden,
                                                 (const float *)tensor_data(live->m, live->t_onorm),
                                                 live->t_out, vocab, live->shape,
                                                 chain_rows, row_logits, row_norm,
-                                                scratch.chunk_w, batch_chunk_logits,
-                                                scratch.chunk_rows);
+                                                scratch->chunk_w, batch_chunk_logits,
+                                                scratch->chunk_rows);
     if (ok) ok = ds4_gpu_glm_argmax_batch_f32(row_logits, row_top, row_val,
                                               vocab, chain_rows) != 0;
 
@@ -30302,7 +30307,6 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
     free(row_logits);
     free(row_norm);
     free(row_hidden);
-    glm_metal_fwd_free(&scratch);
     return ok;
 }
 #endif
@@ -31084,12 +31088,15 @@ int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
         {"miss",    GLM_SPEC_MOCK_MISS,    0,     0},
     };
     for (int ci = 0; ci < 3; ci++) {
-        glm_metal_fwd_ctx c;
+        glm_metal_fwd_ctx c, scratch;
         memset(&c, 0, sizeof(c));
+        memset(&scratch, 0, sizeof(scratch));
         float *li = xmalloc((size_t)sc.vocab * sizeof(float));
         int *ids = xmalloc((size_t)n_steps * sizeof(int));
         bool ok = glm_metal_fwd_init(&c, &sc.model, &sc.shape,
                                      sc.n_layer, sc.n_dense, cap);
+        if (ok) ok = glm_metal_fwd_init(&scratch, &sc.model, &sc.shape,
+                                        sc.n_layer, sc.n_dense, cap);
         for (uint32_t t = 0; ok && t < plen; t++)
             ok = glm_metal_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
         int live_generated = 0;
@@ -31097,13 +31104,14 @@ int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
                                  cases[ci].partial_k, cases[ci].mode, NULL };
         int generated = 0;
         const int eos_id = -1;
+        glm_metal_verify_ctx vc = { &c, &scratch };
         int rc = ok ? glm_spec_decode("glm-spec-metal-synth", glm_gen_metal_step,
                                       glm_gen_metal_hnorm, &c, prompt, plen,
                                       n_steps, li, sc.vocab, NULL, eos_id, NULL,
                                       &generated, ids, NULL, depth,
                                       glm_spec_mock_draft, &mc, NULL,
                                       glm_spec_verify_after_bonus_metal_scratch,
-                                      &c, &live_generated)
+                                      &vc, &live_generated)
                     : 1;
         ok = ok && rc == 0 && generated == n_steps;
         for (int s = 0; ok && s < n_steps; s++)
@@ -31115,6 +31123,7 @@ int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
                 ok ? "PASS" : "FAIL", generated, n_steps, ok ? "yes" : "no");
         free(ids);
         free(li);
+        if (scratch.m) glm_metal_fwd_free(&scratch);
         if (c.m) glm_metal_fwd_free(&c);
     }
     free(greedy);
