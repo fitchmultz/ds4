@@ -3748,13 +3748,15 @@ static void test_glm_metal_components(void) {
                                                               bm_blk_attn, nh, nope, rope, vd, qhd,
                                                               seq_n, block_pos0, batch_n));
                 TEST_ASSERT(ds4_gpu_glm_matmul_f32(Wo, bm_blk_attn, bm_mla, H, nh * vd, batch_n));
-                for (uint32_t i = 0; i < batch_n * H; i++) bm_res1[i] = xb[i] + bm_mla[i];
+                TEST_ASSERT(ds4_gpu_glm_add_batch_f32(xb, bm_mla, bm_res1, H, batch_n));
+                glm_metal_cmp("residual add batch2", bm_res1, bc_res1,
+                              (size_t)batch_n * H, tol_abs, tol_rel);
                 TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(bm_res1, ones_h, bm_fn, H, batch_n, shape.rms_eps));
                 TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_gate, bm_fn, bm_blk_gh, ff, H, batch_n));
                 TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_up, bm_fn, bm_blk_uh, ff, H, batch_n));
                 TEST_ASSERT(ds4_gpu_glm_swiglu_f32(bm_blk_gh, bm_blk_uh, bm_blk_act, batch_n * ff));
                 TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_down, bm_blk_act, bm_ffn, H, ff, batch_n));
-                for (uint32_t i = 0; i < batch_n * H; i++) bm_block[i] = bm_res1[i] + bm_ffn[i];
+                TEST_ASSERT(ds4_gpu_glm_add_batch_f32(bm_res1, bm_ffn, bm_block, H, batch_n));
                 glm_metal_cmp("dense block batch2 residual", bm_block, bc_block,
                               (size_t)batch_n * H, tol_abs, tol_rel);
 

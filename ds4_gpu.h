@@ -1036,6 +1036,11 @@ int ds4_gpu_glm_matvec_f32(const float * W, const float * x, float * out,
 int ds4_gpu_glm_matmul_f32(const float * W, const float * x, float * out,
                            uint32_t rows, uint32_t cols, uint32_t n_tok);
 
+/* Elementwise residual add over [n_tok,n]: out = a + b.  Small glue primitive
+ * for keeping layer-major verifier/prefill batch composites on GPU. */
+int ds4_gpu_glm_add_batch_f32(const float * a, const float * b, float * out,
+                              uint32_t n, uint32_t n_tok);
+
 /* RMSNorm over n elements with per-channel weight w.  Latent-only norm is
  * this with n = kv_lora on the latent slice (no masked variant needed). */
 int ds4_gpu_glm_rmsnorm_f32(const float * x, const float * w, float * out,

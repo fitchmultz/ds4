@@ -64,6 +64,25 @@ kernel void kernel_glm_matmul_f32(
     out[(uint64_t)t * args.rows + r] = acc;
 }
 
+struct ds4_metal_args_glm_add_batch {
+    uint32_t n;      // elements per token row
+    uint32_t n_tok;  // token batch
+};
+
+// Elementwise residual add over [n_tok,n].  One thread per scalar; this tiny
+// glue primitive lets layer-major verifier/prefill composites keep residual
+// math on the GPU instead of round-tripping through CPU buffers.
+kernel void kernel_glm_add_batch_f32(
+        constant ds4_metal_args_glm_add_batch & args,
+        device const float * a,
+        device const float * b,
+        device       float * out,
+        uint gid [[thread_position_in_grid]]) {
+    const uint64_t total = (uint64_t)args.n_tok * args.n;
+    if ((uint64_t)gid >= total) return;
+    out[gid] = a[gid] + b[gid];
+}
+
 struct ds4_metal_args_glm_rmsnorm {
     uint32_t n;     // elements to normalize over
     float    eps;   // 1e-5
