@@ -284,6 +284,8 @@ static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
+static void ds4_gpu_glm_expert_cache_print_summary(void);
+static void ds4_gpu_glm_expert_cache_clear(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
 static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t       layer,
@@ -6729,6 +6731,8 @@ void ds4_gpu_cleanup(void) {
         g_selected_readback_event_value = 0;
         [g_transient_buffers removeAllObjects];
         ds4_gpu_stream_expert_pread_pool_shutdown();
+        ds4_gpu_glm_expert_cache_print_summary();
+        ds4_gpu_glm_expert_cache_clear();
         ds4_gpu_stream_expert_cache_clear_all(1);
         for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
             g_stream_expert_cache_gate_addr_buffers[layer] = nil;
@@ -27177,6 +27181,236 @@ int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
     }
 }
 
+typedef struct {
+    uintptr_t map_id;
+    uint64_t base_off;
+    uint64_t tensor_bytes;
+    uint64_t slot_bytes;
+    uint32_t expert_id;
+    uint64_t last_use;
+    uint8_t *data;
+} ds4_gpu_glm_expert_cache_entry;
+
+static pthread_mutex_t g_glm_expert_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_glm_expert_cache_once = PTHREAD_ONCE_INIT;
+static ds4_gpu_glm_expert_cache_entry *g_glm_expert_cache_entries;
+static uint32_t g_glm_expert_cache_count;
+static uint32_t g_glm_expert_cache_cap;
+static uint64_t g_glm_expert_cache_budget_bytes;
+static uint64_t g_glm_expert_cache_used_bytes;
+static uint64_t g_glm_expert_cache_clock;
+static uint64_t g_glm_expert_cache_hits;
+static uint64_t g_glm_expert_cache_misses;
+static uint64_t g_glm_expert_cache_stores;
+static uint64_t g_glm_expert_cache_evictions;
+static int g_glm_expert_cache_summary_printed;
+
+static uint64_t ds4_gpu_glm_expert_cache_parse_bytes(void) {
+    const uint64_t mib = 1024ull * 1024ull;
+    const uint64_t gib = 1024ull * mib;
+    const char *mib_env = getenv("DS4_GLM_EXPERT_CACHE_MIB");
+    if (mib_env && mib_env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(mib_env, &end, 10);
+        if (end != mib_env && *end == '\0') {
+            return v > UINT64_MAX / mib ? UINT64_MAX : v * mib;
+        }
+    }
+    const char *gib_env = getenv("DS4_GLM_EXPERT_CACHE_GIB");
+    if (gib_env && gib_env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(gib_env, &end, 10);
+        if (end != gib_env && *end == '\0') {
+            return v > UINT64_MAX / gib ? UINT64_MAX : v * gib;
+        }
+    }
+    return 0;
+}
+
+static void ds4_gpu_glm_expert_cache_init_once(void) {
+    g_glm_expert_cache_budget_bytes = ds4_gpu_glm_expert_cache_parse_bytes();
+    if (g_glm_expert_cache_budget_bytes != 0) {
+        fprintf(stderr,
+                "ds4: glm-fast: expert slab cache budget %.2f GiB (DS4_GLM_EXPERT_CACHE_*), policy=LRU\n",
+                ds4_gpu_gib(g_glm_expert_cache_budget_bytes));
+    }
+}
+
+static uint64_t ds4_gpu_glm_expert_cache_budget(void) {
+    pthread_once(&g_glm_expert_cache_once, ds4_gpu_glm_expert_cache_init_once);
+    return g_glm_expert_cache_budget_bytes;
+}
+
+static int ds4_gpu_glm_expert_cache_key_equal(
+        const ds4_gpu_glm_expert_cache_entry *e,
+        uintptr_t map_id,
+        uint64_t base_off,
+        uint64_t tensor_bytes,
+        uint64_t slot_bytes,
+        uint32_t expert_id) {
+    return e && e->data &&
+           e->map_id == map_id &&
+           e->base_off == base_off &&
+           e->tensor_bytes == tensor_bytes &&
+           e->slot_bytes == slot_bytes &&
+           e->expert_id == expert_id;
+}
+
+static int ds4_gpu_glm_expert_cache_lookup(
+        uintptr_t map_id,
+        uint64_t base_off,
+        uint64_t tensor_bytes,
+        uint64_t slot_bytes,
+        uint32_t expert_id,
+        void *out) {
+    if (!out || slot_bytes == 0 || ds4_gpu_glm_expert_cache_budget() < slot_bytes)
+        return 0;
+    int hit = 0;
+    pthread_mutex_lock(&g_glm_expert_cache_mutex);
+    for (uint32_t i = 0; i < g_glm_expert_cache_count; i++) {
+        ds4_gpu_glm_expert_cache_entry *e = &g_glm_expert_cache_entries[i];
+        if (ds4_gpu_glm_expert_cache_key_equal(e, map_id, base_off, tensor_bytes,
+                                               slot_bytes, expert_id)) {
+            memcpy(out, e->data, (size_t)slot_bytes);
+            e->last_use = ++g_glm_expert_cache_clock;
+            g_glm_expert_cache_hits++;
+            hit = 1;
+            break;
+        }
+    }
+    if (!hit) g_glm_expert_cache_misses++;
+    pthread_mutex_unlock(&g_glm_expert_cache_mutex);
+    return hit;
+}
+
+static void ds4_gpu_glm_expert_cache_evict_index(uint32_t idx) {
+    if (idx >= g_glm_expert_cache_count) return;
+    ds4_gpu_glm_expert_cache_entry *e = &g_glm_expert_cache_entries[idx];
+    if (e->data) {
+        if (g_glm_expert_cache_used_bytes >= e->slot_bytes) {
+            g_glm_expert_cache_used_bytes -= e->slot_bytes;
+        } else {
+            g_glm_expert_cache_used_bytes = 0;
+        }
+        free(e->data);
+        e->data = NULL;
+    }
+    g_glm_expert_cache_evictions++;
+    if (idx + 1 != g_glm_expert_cache_count) {
+        g_glm_expert_cache_entries[idx] =
+            g_glm_expert_cache_entries[g_glm_expert_cache_count - 1];
+    }
+    g_glm_expert_cache_count--;
+}
+
+static int ds4_gpu_glm_expert_cache_evict_one(void) {
+    if (g_glm_expert_cache_count == 0) return 0;
+    uint32_t victim = 0;
+    uint64_t oldest = g_glm_expert_cache_entries[0].last_use;
+    for (uint32_t i = 1; i < g_glm_expert_cache_count; i++) {
+        if (g_glm_expert_cache_entries[i].last_use < oldest) {
+            oldest = g_glm_expert_cache_entries[i].last_use;
+            victim = i;
+        }
+    }
+    ds4_gpu_glm_expert_cache_evict_index(victim);
+    return 1;
+}
+
+static void ds4_gpu_glm_expert_cache_store(
+        uintptr_t map_id,
+        uint64_t base_off,
+        uint64_t tensor_bytes,
+        uint64_t slot_bytes,
+        uint32_t expert_id,
+        const void *data) {
+    const uint64_t budget = ds4_gpu_glm_expert_cache_budget();
+    if (!data || slot_bytes == 0 || budget < slot_bytes) return;
+
+    pthread_mutex_lock(&g_glm_expert_cache_mutex);
+    for (uint32_t i = 0; i < g_glm_expert_cache_count; i++) {
+        ds4_gpu_glm_expert_cache_entry *e = &g_glm_expert_cache_entries[i];
+        if (ds4_gpu_glm_expert_cache_key_equal(e, map_id, base_off, tensor_bytes,
+                                               slot_bytes, expert_id)) {
+            memcpy(e->data, data, (size_t)slot_bytes);
+            e->last_use = ++g_glm_expert_cache_clock;
+            pthread_mutex_unlock(&g_glm_expert_cache_mutex);
+            return;
+        }
+    }
+
+    while (g_glm_expert_cache_used_bytes > budget - slot_bytes) {
+        if (!ds4_gpu_glm_expert_cache_evict_one()) break;
+    }
+    if (g_glm_expert_cache_used_bytes > budget - slot_bytes) {
+        pthread_mutex_unlock(&g_glm_expert_cache_mutex);
+        return;
+    }
+    if (g_glm_expert_cache_count == g_glm_expert_cache_cap) {
+        uint32_t new_cap = g_glm_expert_cache_cap ? g_glm_expert_cache_cap * 2u : 256u;
+        ds4_gpu_glm_expert_cache_entry *new_entries =
+            (ds4_gpu_glm_expert_cache_entry *)realloc(g_glm_expert_cache_entries,
+                    (size_t)new_cap * sizeof(*new_entries));
+        if (!new_entries) {
+            pthread_mutex_unlock(&g_glm_expert_cache_mutex);
+            return;
+        }
+        g_glm_expert_cache_entries = new_entries;
+        g_glm_expert_cache_cap = new_cap;
+    }
+    uint8_t *copy = (uint8_t *)malloc((size_t)slot_bytes);
+    if (!copy) {
+        pthread_mutex_unlock(&g_glm_expert_cache_mutex);
+        return;
+    }
+    memcpy(copy, data, (size_t)slot_bytes);
+    ds4_gpu_glm_expert_cache_entry *e =
+        &g_glm_expert_cache_entries[g_glm_expert_cache_count++];
+    e->map_id = map_id;
+    e->base_off = base_off;
+    e->tensor_bytes = tensor_bytes;
+    e->slot_bytes = slot_bytes;
+    e->expert_id = expert_id;
+    e->last_use = ++g_glm_expert_cache_clock;
+    e->data = copy;
+    g_glm_expert_cache_used_bytes += slot_bytes;
+    g_glm_expert_cache_stores++;
+    pthread_mutex_unlock(&g_glm_expert_cache_mutex);
+}
+
+static void ds4_gpu_glm_expert_cache_print_summary(void) {
+    if (g_glm_expert_cache_summary_printed || g_glm_expert_cache_budget_bytes == 0)
+        return;
+    g_glm_expert_cache_summary_printed = 1;
+    const uint64_t lookups = g_glm_expert_cache_hits + g_glm_expert_cache_misses;
+    const double hit_rate = lookups ?
+        (double)g_glm_expert_cache_hits / (double)lookups : 0.0;
+    fprintf(stderr,
+            "ds4: glm-fast: expert slab cache summary budget=%.2f GiB live=%.2f GiB entries=%u hits=%llu misses=%llu hit_rate=%.3f stores=%llu evictions=%llu\n",
+            ds4_gpu_gib(g_glm_expert_cache_budget_bytes),
+            ds4_gpu_gib(g_glm_expert_cache_used_bytes),
+            g_glm_expert_cache_count,
+            (unsigned long long)g_glm_expert_cache_hits,
+            (unsigned long long)g_glm_expert_cache_misses,
+            hit_rate,
+            (unsigned long long)g_glm_expert_cache_stores,
+            (unsigned long long)g_glm_expert_cache_evictions);
+}
+
+static void ds4_gpu_glm_expert_cache_clear(void) {
+    pthread_mutex_lock(&g_glm_expert_cache_mutex);
+    for (uint32_t i = 0; i < g_glm_expert_cache_count; i++) {
+        free(g_glm_expert_cache_entries[i].data);
+        g_glm_expert_cache_entries[i].data = NULL;
+    }
+    free(g_glm_expert_cache_entries);
+    g_glm_expert_cache_entries = NULL;
+    g_glm_expert_cache_count = 0;
+    g_glm_expert_cache_cap = 0;
+    g_glm_expert_cache_used_bytes = 0;
+    pthread_mutex_unlock(&g_glm_expert_cache_mutex);
+}
+
 static int ds4_gpu_glm_expert_pread_enabled(void) {
     const char *e = getenv("DS4_GLM_EXPERT_PREAD");
     return e && atoi(e) == 1;
@@ -27198,10 +27432,13 @@ static int ds4_gpu_glm_stage_selected_slabs(
         return 0;
     if ((uint64_t)n_total_expert * slot_bytes != tensor_bytes) return 0;
     const int use_pread = ds4_gpu_glm_expert_pread_enabled() && fd >= 0;
-    char *pread_buf = NULL;
+    const int use_cache = ds4_gpu_glm_expert_cache_budget() >= slot_bytes;
+    char *slot_buf = NULL;
+    if (use_pread || use_cache) {
+        slot_buf = (char *)malloc((size_t)slot_bytes);
+        if (!slot_buf) return 0;
+    }
     if (use_pread) {
-        pread_buf = (char *)malloc((size_t)slot_bytes);
-        if (!pread_buf) return 0;
         static int warned = 0;
         if (!warned) {
             fprintf(stderr, "ds4: glm-fast: selected expert staging uses pread (DS4_GLM_EXPERT_PREAD=1)\n");
@@ -27221,12 +27458,22 @@ static int ds4_gpu_glm_stage_selected_slabs(
             break;
         }
         const uint64_t dst_off = (uint64_t)k * slot_bytes;
+        if (use_cache && ds4_gpu_glm_expert_cache_lookup((uintptr_t)map,
+                                                         base_off, tensor_bytes,
+                                                         slot_bytes, (uint32_t)e,
+                                                         slot_buf)) {
+            ds4_gpu_tensor_write(dst, dst_off, slot_buf, slot_bytes);
+            continue;
+        }
         if (use_pread) {
             const uint64_t off = base_off + rel;
             size_t done = 0;
             while (done < slot_bytes) {
                 const size_t want = (size_t)(slot_bytes - done);
-                const ssize_t got = pread(fd, pread_buf + done, want, (off_t)(off + done));
+                ssize_t got;
+                do {
+                    got = pread(fd, slot_buf + done, want, (off_t)(off + done));
+                } while (got < 0 && errno == EINTR);
                 if (got <= 0) {
                     fprintf(stderr, "ds4: glm-fast: pread failed while staging %s expert %llu: %s\n",
                             label ? label : "selected", (unsigned long long)e,
@@ -27236,13 +27483,29 @@ static int ds4_gpu_glm_stage_selected_slabs(
                 }
                 done += (size_t)got;
             }
-            if (ok) ds4_gpu_tensor_write(dst, dst_off, pread_buf, slot_bytes);
+            if (ok) {
+                ds4_gpu_tensor_write(dst, dst_off, slot_buf, slot_bytes);
+                if (use_cache) {
+                    ds4_gpu_glm_expert_cache_store((uintptr_t)map,
+                                                   base_off, tensor_bytes,
+                                                   slot_bytes, (uint32_t)e,
+                                                   slot_buf);
+                }
+            }
+        } else if (use_cache) {
+            const char *src = (const char *)map + base_off + rel;
+            memcpy(slot_buf, src, (size_t)slot_bytes);
+            ds4_gpu_tensor_write(dst, dst_off, slot_buf, slot_bytes);
+            ds4_gpu_glm_expert_cache_store((uintptr_t)map,
+                                           base_off, tensor_bytes,
+                                           slot_bytes, (uint32_t)e,
+                                           slot_buf);
         } else {
             const char *src = (const char *)map + base_off + rel;
             ds4_gpu_tensor_write(dst, dst_off, src, slot_bytes);
         }
     }
-    free(pread_buf);
+    free(slot_buf);
     return ok;
 }
 
