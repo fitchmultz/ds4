@@ -120,6 +120,8 @@ typedef struct {
     bool glm_cpu_ref;            /* Phase 4a-full: GLM CPU reference forward */
     bool glm_metal_ref;          /* Phase 4c-iv: GLM Metal forward (F32 kernels) */
     bool glm_chat;               /* Phase 4e: GLM incremental chat generation    */
+    bool glm_nextn;              /* opt-in GLM NextN speculative decode scaffold */
+    int  glm_nextn_depth;        /* NextN draft depth (capped at 4)              */
     ds4_distributed_options distributed;
 } ds4_engine_options;
 
@@ -411,6 +413,14 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
  * *out_match receives the number of matching steps; return 0 if all n_steps match. */
 int ds4_glm_cpu_generate_synth(int n_steps, int *out_match);
 int ds4_glm_metal_generate_synth(int n_steps, int *out_match);
+
+/* Commit 2 no-model synth harness: proves the opt-in GLM NextN speculative
+ * accept/rollback state machine emits EXACTLY the naive greedy token sequence
+ * for full-accept, partial-accept, and miss cases via a controllable mock
+ * drafter.  Sets each out_* to 1 when that mode matched the greedy reference
+ * for all n_steps; returns 0 only if all three matched.  No model on disk. */
+int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
+                                int *out_miss);
 
 /* Phase 4c-iv: tiny synthetic Metal forward self-check (no model needed).
  * Builds the same in-memory F32 layers as ds4_glm_cpu_forward_synth and runs

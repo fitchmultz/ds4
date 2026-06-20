@@ -1408,6 +1408,7 @@ static cli_config parse_options(int argc, char **argv) {
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .glm_nextn_depth = 4,
         },
         .gen = {
             .prompt = NULL,
@@ -1648,6 +1649,19 @@ static cli_config parse_options(int argc, char **argv) {
             c.glm_chat_metal = false;
             c.engine.glm_chat = true;
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--glm-nextn")) {
+            /* Opt-in GLM NextN/MTP speculative greedy decode scaffold. Metal
+             * target only (CPU target ignores it); correctness-first, NOT a
+             * speed claim. Output stays byte-for-byte greedy-identical. */
+            c.engine.glm_nextn = true;
+        } else if (!strcmp(arg, "--glm-nextn-draft")) {
+            int d = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (d < 1) d = 1;
+            if (d > 4) {
+                fprintf(stderr, "ds4: --glm-nextn-draft capped at 4 (got %d)\n", d);
+                d = 4;
+            }
+            c.engine.glm_nextn_depth = d;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {

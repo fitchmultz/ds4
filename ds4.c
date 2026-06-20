@@ -22288,6 +22288,8 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool metal_ready;
     bool mtp_ready;
+    bool glm_nextn;        /* opt-in GLM NextN speculative decode scaffold */
+    int  glm_nextn_depth;  /* NextN draft depth (capped at 4)              */
 };
 
 static bool cpu_directional_steering_enabled(
@@ -27870,6 +27872,54 @@ static bool glm_nextn_draft_cpu(const ds4_model *m,
     return ok;
 }
 
+/* Maximum recursive NextN draft depth.  Pinned to 4 for the opt-in GLM
+ * speculative path so the draft chain stays bounded and auditable; raising it
+ * does not change correctness (every emitted token is still the verified
+ * target argmax), only the per-round draft cost. */
+#define DS4_GLM_NEXTN_MAX_DEPTH 4
+
+/* Recursive NextN/MTP draft chain (blk.78) for the opt-in GLM speculative
+ * path.  Seeds from the last committed target token + its post-output-norm
+ * hidden, then drafts `depth` tokens by recursing on each draft token + the
+ * draft model's own decoder hidden (the SGLang NEXTN recursion).  Uses the
+ * same validated CPU eh_proj / decoder / logits helpers as the one-draft
+ * probe; the CPU drafter is diagnostic-grade (CPU-vs-Metal NextN already
+ * match tightly) and is deliberately decoupled from the target backend.
+ * Returns true if all `depth` drafts were produced; writes drafts to out[]. */
+static bool glm_nextn_draft_chain_cpu(const ds4_model *m,
+                                      const glm_cpu_shape *shape,
+                                      int seed_token, const float *seed_h,
+                                      int depth, uint32_t vocab,
+                                      int *out_drafts /*[depth]*/) {
+    if (!m || !shape || !seed_h || !out_drafts || depth <= 0) return false;
+    if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
+    const uint32_t H = shape->hidden;
+    float *eh = xmalloc((size_t)H * sizeof(float));
+    float *nh = xmalloc((size_t)H * sizeof(float));
+    float *cur_h = xmalloc((size_t)H * sizeof(float));
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
+    memcpy(cur_h, seed_h, (size_t)H * sizeof(float));
+    int tok = seed_token;
+    bool ok = true;
+    for (int j = 0; j < depth; j++) {
+        if (!glm_nextn_eh_project_cpu(m, shape, tok, cur_h, eh) ||
+            !glm_nextn_decoder_cpu(m, shape, eh, nh) ||
+            !glm_nextn_logits_cpu(m, shape, nh, logits, vocab)) {
+            ok = false;
+            break;
+        }
+        int arg = 0;
+        float top = logits[0];
+        for (uint32_t v = 1; v < vocab; v++)
+            if (logits[v] > top) { top = logits[v]; arg = (int)v; }
+        out_drafts[j] = arg;
+        tok = arg;                       /* recurse on the draft token ...   */
+        memcpy(cur_h, nh, (size_t)H * sizeof(float)); /* ... + draft hidden */
+    }
+    free(logits); free(cur_h); free(nh); free(eh);
+    return ok;
+}
+
 static void glm_nextn_run_diagnostic(const char *label,
                                      const ds4_model *m,
                                      const glm_cpu_shape *shape,
@@ -29501,6 +29551,144 @@ static const float *glm_gen_metal_hnorm(void *ctx) {
 }
 #endif
 
+/* Draft provider for the opt-in GLM speculative path.  Given the last
+ * committed target token + its post-output-norm hidden, propose up to `depth`
+ * draft tokens into out[].  Production uses the recursive NextN chain; the
+ * no-model synth harness injects a controllable mock to force full/partial/
+ * miss cases.  The real-model path currently uses the CPU NextN drafter as a
+ * correctness scaffold; the Metal NextN synth pins the Metal math separately. */
+typedef bool (*glm_draft_chain_fn)(void *draft_ctx, int seed_token,
+                                   const float *seed_hidden, int depth,
+                                   int *out_drafts);
+
+typedef struct {
+    const ds4_model *m;
+    const glm_cpu_shape *shape;
+    uint32_t vocab;
+} glm_nextn_draft_state;
+
+static bool glm_nextn_draft_chain_thunk(void *vc, int seed_token,
+                                        const float *seed_hidden, int depth,
+                                        int *out_drafts) {
+    glm_nextn_draft_state *s = (glm_nextn_draft_state *)vc;
+    return glm_nextn_draft_chain_cpu(s->m, s->shape, seed_token, seed_hidden,
+                                     depth, s->vocab, out_drafts);
+}
+
+/* Opt-in GLM NextN speculative decode (Commit 2).  Correctness-first, NOT a
+ * speed claim: verification reuses the existing single-token target step, and
+ * the current real-model drafter is CPU-side. Every emitted token is the
+ * authoritative target argmax verified against the real target. The draft chain never enters the target KV cache, so there is
+ * NO target-cache rollback: a rejected draft tail is simply discarded.  The
+ * emitted sequence is therefore byte-for-byte identical to plain greedy GLM
+ * generation regardless of draft agreement.  If obs_generated is non-NULL it is
+ * kept in sync with tokens emitted so far (instrumentation for the synth
+ * harness's controllable mock drafter).  Assumes the prompt is already
+ * prefilled and `logits` holds the first target distribution.  Returns 0 on
+ * success, 1 on a step failure. */
+static int glm_spec_decode(const char *label,
+                           glm_gen_step_fn step, glm_gen_hnorm_fn hnorm,
+                           void *ctx, const int *prompt, uint32_t prompt_len,
+                           int n_predict, float *logits, uint32_t vocab,
+                           ds4_engine *e, int eos_id, FILE *out,
+                           int *out_generated, int *gen_ids_out,
+                           double *out_decode_s,
+                           int draft_depth, glm_draft_chain_fn draft_fn,
+                           void *draft_ctx, int *obs_generated) {
+    int depth = draft_depth;
+    if (depth < 1) depth = 1;
+    if (depth > DS4_GLM_NEXTN_MAX_DEPTH) depth = DS4_GLM_NEXTN_MAX_DEPTH;
+    int *draft = xmalloc(sizeof(int) * (size_t)depth);
+
+    int next = sample_argmax(logits, vocab);   /* first verified target token */
+    uint32_t pos = prompt_len;
+    int generated = 0;
+    int last_committed = prompt_len ? prompt[prompt_len - 1] : -1;
+    uint64_t rounds = 0, acc_full = 0, acc_partial = 0, acc_miss = 0;
+    double draft_s = 0.0;
+
+    const double dec0 = now_sec();
+    while (generated < n_predict && next != eos_id) {
+        rounds++;
+        const float *seed_h = hnorm ? hnorm(ctx) : NULL;
+        if (obs_generated) *obs_generated = generated;
+        for (int j = 0; j < depth; j++) draft[j] = -1;
+        if (draft_fn && seed_h) {
+            const double d0 = now_sec();
+            (void)draft_fn(draft_ctx, last_committed, seed_h, depth, draft);
+            draft_s += now_sec() - d0;
+        }
+
+        /* Accept the contiguous prefix of drafts that match the authoritative
+         * target greedy token, emitting + stepping the target on each accepted
+         * token exactly as plain greedy would. */
+        int acc = 0;
+        while (acc < depth && draft[acc] == next &&
+               generated < n_predict && next != eos_id) {
+            if (gen_ids_out) gen_ids_out[generated] = next;
+            if (out) {
+                size_t pl = 0;
+                char *piece = ds4_token_text(e, next, &pl);
+                fwrite(piece, 1, pl, out); fflush(out); free(piece);
+            }
+            last_committed = next;
+            generated++;
+            if (!step(ctx, next, pos, true, logits)) {
+                free(draft);
+                if (out_decode_s) *out_decode_s = now_sec() - dec0;
+                if (out_generated) *out_generated = generated;
+                return 1;
+            }
+            pos++;
+            next = sample_argmax(logits, vocab);
+            acc++;
+        }
+
+        /* Fallback: emit the authoritative target token.  Covers miss at
+         * acc==0, the first rejected draft on a partial accept, and the
+         * boundary token after a full accept (which was never drafted).  The
+         * rejected draft tail draft[acc..depth-1] stays invisible: it never
+         * touched the target cache, so nothing is rolled back. */
+        if (generated < n_predict && next != eos_id) {
+            if (gen_ids_out) gen_ids_out[generated] = next;
+            if (out) {
+                size_t pl = 0;
+                char *piece = ds4_token_text(e, next, &pl);
+                fwrite(piece, 1, pl, out); fflush(out); free(piece);
+            }
+            last_committed = next;
+            generated++;
+            if (!step(ctx, next, pos, true, logits)) {
+                free(draft);
+                if (out_decode_s) *out_decode_s = now_sec() - dec0;
+                if (out_generated) *out_generated = generated;
+                return 1;
+            }
+            pos++;
+            next = sample_argmax(logits, vocab);
+        }
+
+        if (acc == 0) acc_miss++;
+        else if (acc < depth) acc_partial++;
+        else acc_full++;
+        if (obs_generated) *obs_generated = generated;
+    }
+    free(draft);
+    const double decode_s = now_sec() - dec0;
+    if (out_generated) *out_generated = generated;
+    if (out_decode_s) *out_decode_s = decode_s;
+    fprintf(stderr,
+            "ds4: %s: nextn spec decode %d tok in %.2fs (%.2f tok/s), "
+            "%llu rounds [full %llu / partial %llu / miss %llu], draft %.2fs "
+            "(correctness-first; not a speed claim)\n",
+            label ? label : "glm-generate", generated, decode_s,
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0,
+            (unsigned long long)rounds, (unsigned long long)acc_full,
+            (unsigned long long)acc_partial, (unsigned long long)acc_miss,
+            draft_s);
+    return 0;
+}
+
 /* Shared greedy generation loop over a persistent ctx.  Prefills the prompt
  * (logits at the last position), then autoregressively decodes: emit the
  * argmax, stop at EOS / n_predict, feed it back at the next position.  The cache
@@ -29514,11 +29702,28 @@ static int glm_generate_loop(const char *label,
                              ds4_engine *e, const glm_cpu_shape *shape,
                              int eos_id, FILE *out,
                              int *out_generated, int *gen_ids_out,
-                             double *out_decode_s) {
+                             double *out_decode_s,
+                             bool spec_enabled, int spec_depth) {
     const double pf0 = now_sec();
     for (uint32_t t = 0; t < prompt_len; t++)
         if (!step(ctx, prompt[t], t, t + 1 == prompt_len, logits)) return 1;
     const double prefill_s = now_sec() - pf0;
+
+    /* Opt-in NextN speculative path (default-off).  It reuses the shared
+     * correctness-first verifier below and is byte-for-byte identical to
+     * plain greedy: every emitted token is the verified target argmax and
+     * the draft never touches the target KV cache. */
+    if (spec_enabled) {
+        glm_nextn_draft_state ds = { &e->model, shape, vocab };
+        int rc = glm_spec_decode(label, step, hnorm, ctx, prompt, prompt_len,
+                                 n_predict, logits, vocab, e, eos_id, out,
+                                 out_generated, gen_ids_out, out_decode_s,
+                                 spec_depth, glm_nextn_draft_chain_thunk, &ds,
+                                 NULL);
+        fprintf(stderr, "ds4: %s: prefill %.2fs (%u tok)\n",
+                label ? label : "glm-generate", prefill_s, prompt_len);
+        return rc;
+    }
 
     int next = sample_argmax(logits, vocab);
     uint32_t pos = prompt_len;
@@ -29650,6 +29855,12 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
     int generated = 0, rc = 1;
     double decode_s = 0.0;
     int *gen_ids = xmalloc((size_t)n_predict * sizeof(int));
+    /* Opt-in NextN speculative decode is Metal-target-only (the validated CPU
+     * drafter feeds a Metal target).  On CPU it is ignored with a diagnostic so
+     * plain greedy runs unchanged.  Output is greedy-identical either way. */
+    const bool spec = use_metal && e->glm_nextn;
+    if (e->glm_nextn && !use_metal)
+        fprintf(stderr, "ds4: glm-chat: --glm-nextn is Metal-target-only; ignored on CPU\n");
     glm_fwd_progress = false;   /* quiet the per-layer progress for chat output */
     if (use_metal) {
 #ifndef DS4_NO_GPU
@@ -29662,7 +29873,8 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
             rc = glm_generate_loop("glm-chat", glm_gen_metal_step, glm_gen_metal_hnorm,
                                    &mc, chat.v, prompt_len, n_predict, logits, vocab,
                                    e, &shape, eos_id, stdout,
-                                   &generated, gen_ids, &decode_s);
+                                   &generated, gen_ids, &decode_s,
+                                   spec, e->glm_nextn_depth);
             glm_metal_fwd_free(&mc);
         } else {
             fprintf(stderr, "ds4: glm-chat: Metal context init failed\n");
@@ -29676,7 +29888,8 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
         rc = glm_generate_loop("glm-chat", glm_gen_cpu_step, glm_gen_cpu_hnorm,
                                &cc, chat.v, prompt_len, n_predict, logits, vocab,
                                e, &shape, eos_id, stdout,
-                               &generated, gen_ids, &decode_s);
+                               &generated, gen_ids, &decode_s,
+                               spec, e->glm_nextn_depth);
         glm_cpu_fwd_free(&cc);
     }
     if (rc == 0) {
@@ -29741,6 +29954,9 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
     int generated = 0, rc = 1;
     double decode_s = 0.0;
     int *gen_ids = xmalloc((size_t)n_predict * sizeof(int));
+    const bool spec = use_metal && e->glm_nextn;
+    if (e->glm_nextn && !use_metal)
+        fprintf(stderr, "ds4: glm-raw: --glm-nextn is Metal-target-only; ignored on CPU\n");
     glm_fwd_progress = false;
     if (use_metal) {
 #ifndef DS4_NO_GPU
@@ -29750,7 +29966,8 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
             rc = glm_generate_loop("glm-raw", glm_gen_metal_step, glm_gen_metal_hnorm,
                                    &mc, toks.v, prompt_len, n_predict, logits, vocab,
                                    e, &shape, eos_id, stdout,
-                                   &generated, gen_ids, &decode_s);
+                                   &generated, gen_ids, &decode_s,
+                                   spec, e->glm_nextn_depth);
             glm_metal_fwd_free(&mc);
         } else {
             fprintf(stderr, "ds4: glm-raw: Metal context init failed\n");
@@ -29764,7 +29981,8 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
         rc = glm_generate_loop("glm-raw", glm_gen_cpu_step, glm_gen_cpu_hnorm,
                                &cc, toks.v, prompt_len, n_predict, logits, vocab,
                                e, &shape, eos_id, stdout,
-                               &generated, gen_ids, &decode_s);
+                               &generated, gen_ids, &decode_s,
+                               spec, e->glm_nextn_depth);
         glm_cpu_fwd_free(&cc);
     }
     if (rc == 0)
@@ -29813,6 +30031,115 @@ int ds4_glm_cpu_generate_synth(int n_steps, int *out_match) {
     glm_cpu_fwd_free(&c);
     glm_synth_free(&sc);
     return match == n_steps ? 0 : 1;
+}
+
+/* No-model synthetic GLM NextN speculative accept/rollback harness.
+ * Proves the opt-in speculative state machine (glm_spec_decode) emits EXACTLY
+ * the naive greedy token sequence for full-accept, partial-accept, and miss
+ * cases.  A controllable mock drafter forces each accept length against a
+ * precomputed greedy reference; the real NextN drafter is exercised separately
+ * by --glm-nextn-synth.  Sets each out_* to 1 if that mode matched the greedy
+ * reference for all n_steps; returns 0 only if all three matched.  No model on
+ * disk is required. */
+typedef enum { GLM_SPEC_MOCK_FULL, GLM_SPEC_MOCK_PARTIAL, GLM_SPEC_MOCK_MISS }
+        glm_spec_mock_mode;
+
+typedef struct {
+    const int *greedy;       /* naive greedy reference sequence [n_steps]   */
+    const int *generated_ptr;/* live counter observed via glm_spec_decode    */
+    int n_steps;
+    uint32_t vocab;
+    int partial_k;           /* accept length forced in PARTIAL mode         */
+    glm_spec_mock_mode mode;
+} glm_spec_mock_ctx;
+
+static bool glm_spec_mock_draft(void *vc, int seed_token, const float *seed_h,
+                                int depth, int *out_drafts) {
+    (void)seed_token; (void)seed_h;
+    glm_spec_mock_ctx *mc = (glm_spec_mock_ctx *)vc;
+    const int g = *mc->generated_ptr;          /* tokens emitted so far */
+    for (int j = 0; j < depth; j++) {
+        const int target = (g + j < mc->n_steps) ? mc->greedy[g + j] : 0;
+        const int wrong = (target + 1) % (int)mc->vocab;  /* guaranteed != target */
+        if (mc->mode == GLM_SPEC_MOCK_FULL) {
+            out_drafts[j] = target;
+        } else if (mc->mode == GLM_SPEC_MOCK_PARTIAL) {
+            out_drafts[j] = (j < mc->partial_k) ? target : wrong;
+        } else { /* GLM_SPEC_MOCK_MISS */
+            out_drafts[j] = wrong;
+        }
+    }
+    return true;
+}
+
+int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
+                                int *out_miss) {
+    glm_synth_ctx sc;
+    glm_synth_build(&sc);
+    int prompt[3] = { 1, 5, 9 };
+    const uint32_t plen = 3;
+    const uint32_t cap = plen + (uint32_t)n_steps + 4;
+    const int eos_id = -1;   /* never matches: run the full n_steps */
+
+    /* Naive greedy reference over the incremental ctx (same oracle policy as
+     * ds4_glm_cpu_generate_synth). */
+    int *greedy = xmalloc((size_t)n_steps * sizeof(int));
+    {
+        glm_cpu_fwd_ctx c;
+        glm_cpu_fwd_init(&c, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap);
+        float *li = xmalloc((size_t)sc.vocab * sizeof(float));
+        for (uint32_t t = 0; t < plen; t++)
+            glm_cpu_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
+        for (int s = 0; s < n_steps; s++) {
+            greedy[s] = sample_argmax(li, sc.vocab);
+            glm_cpu_fwd_step(&c, greedy[s], plen + (uint32_t)s, true, li);
+        }
+        free(li);
+        glm_cpu_fwd_free(&c);
+    }
+
+    const int depth = 4;   /* exercises the depth cap */
+    int live_generated = 0;
+    struct { const char *name; glm_spec_mock_mode mode; int partial_k; int ok; }
+            cases[3] = {
+        {"full",   GLM_SPEC_MOCK_FULL,    depth, 0},
+        {"partial", GLM_SPEC_MOCK_PARTIAL, 2,    0},
+        {"miss",   GLM_SPEC_MOCK_MISS,    0,    0},
+    };
+    for (int ci = 0; ci < 3; ci++) {
+        glm_cpu_fwd_ctx c;
+        glm_cpu_fwd_init(&c, &sc.model, &sc.shape, sc.n_layer, sc.n_dense, cap);
+        float *li = xmalloc((size_t)sc.vocab * sizeof(float));
+        int *ids = xmalloc((size_t)n_steps * sizeof(int));
+        for (uint32_t t = 0; t < plen; t++)
+            glm_cpu_fwd_step(&c, prompt[t], t, t + 1 == plen, li);
+        live_generated = 0;
+        glm_spec_mock_ctx mc = { greedy, &live_generated, n_steps, sc.vocab,
+                                 cases[ci].partial_k, cases[ci].mode };
+        int generated = 0;
+        int rc = glm_spec_decode("glm-spec-synth", glm_gen_cpu_step,
+                                 glm_gen_cpu_hnorm, &c, prompt, plen, n_steps,
+                                 li, sc.vocab, NULL, eos_id, NULL, &generated,
+                                 ids, NULL, depth, glm_spec_mock_draft, &mc,
+                                 &live_generated);
+        bool ok = (rc == 0) && (generated == n_steps);
+        for (int s = 0; ok && s < n_steps; s++)
+            if (ids[s] != greedy[s]) ok = false;
+        cases[ci].ok = ok ? 1 : 0;
+        fprintf(stderr,
+                "  glm-spec-generate-synth (%s): %s (generated %d/%d, "
+                "greedy-identical=%s)\n", cases[ci].name,
+                ok ? "PASS" : "FAIL", generated, n_steps, ok ? "yes" : "no");
+        free(ids); free(li);
+        glm_cpu_fwd_free(&c);
+    }
+    free(greedy);
+    glm_synth_free(&sc);
+    const int all_ok = cases[0].ok && cases[1].ok && cases[2].ok;
+    if (out_full)    *out_full    = cases[0].ok;
+    if (out_partial) *out_partial = cases[1].ok;
+    if (out_miss)    *out_miss    = cases[2].ok;
+    return all_ok ? 0 : 1;
 }
 
 /* Metal incremental generation synth self-check: the Metal incremental decode
@@ -30514,6 +30841,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
+    e->glm_nextn = opt->glm_nextn;
+    e->glm_nextn_depth = opt->glm_nextn_depth > 0 ? opt->glm_nextn_depth : 4;
+    if (e->glm_nextn_depth > 4) e->glm_nextn_depth = 4;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {

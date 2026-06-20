@@ -3014,6 +3014,20 @@ static void test_glm_generate_synth(void) {
     TEST_ASSERT(metal_match == n_steps);
 }
 
+/* Commit 2: the opt-in GLM NextN speculative accept/rollback state machine must
+ * emit EXACTLY the naive greedy token sequence for full-accept, partial-accept,
+ * and miss/rollback cases.  A controllable mock drafter forces each accept
+ * length against a precomputed greedy reference (no model on disk). */
+static void test_glm_spec_generate_synth(void) {
+    const int n_steps = 8;
+    int full = 0, partial = 0, miss = 0;
+    int rc = ds4_glm_spec_generate_synth(n_steps, &full, &partial, &miss);
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(full == 1);
+    TEST_ASSERT(partial == 1);
+    TEST_ASSERT(miss == 1);
+}
+
 static void test_glm_metal_components(void) {
 #ifdef DS4_NO_GPU
     fprintf(stderr, "  glm-metal: SKIP (built without GPU/Metal)\n");
@@ -3348,6 +3362,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
+    {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
 };
 
 static void test_print_help(const char *prog) {
