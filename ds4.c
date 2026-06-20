@@ -28614,6 +28614,39 @@ static bool glm_lm_head_metal(const ds4_model *m,
     return true;
 }
 
+static bool glm_lm_head_metal_batch_logits(const ds4_model *m,
+                                           const float *x_rows,
+                                           const float *w_onorm,
+                                           const ds4_tensor *t_out,
+                                           uint32_t vocab,
+                                           const glm_cpu_shape *shape,
+                                           uint32_t n_tok,
+                                           float *logits_rows,
+                                           float *xn_rows,
+                                           float *chunk_w,
+                                           float *chunk_logits,
+                                           uint32_t chunk_rows) {
+    if (n_tok == 0 || chunk_rows == 0) return false;
+    const uint32_t H = shape->hidden;
+    if (!ds4_gpu_glm_rmsnorm_batch_f32(x_rows, w_onorm, xn_rows, H, n_tok, shape->rms_eps))
+        return false;
+    const uint64_t out_row_bytes = t_out->bytes / vocab;
+    for (uint32_t vstart = 0; vstart < vocab; vstart += chunk_rows) {
+        const uint32_t nrows = (vocab - vstart < chunk_rows) ? (vocab - vstart) : chunk_rows;
+        glm_dequant_count(m, t_out, (uint64_t)vstart * out_row_bytes,
+                          (size_t)nrows * H, chunk_w);
+        if (!ds4_gpu_glm_matmul_f32(chunk_w, xn_rows, chunk_logits,
+                                    nrows, H, n_tok))
+            return false;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            memcpy(logits_rows + (size_t)t * vocab + vstart,
+                   chunk_logits + (size_t)t * nrows,
+                   (size_t)nrows * sizeof(float));
+        }
+    }
+    return true;
+}
+
 static bool glm_nextn_eh_project_metal_layer(const ds4_model *m,
                                              const glm_cpu_shape *shape,
                                              uint32_t il,
@@ -30139,11 +30172,12 @@ static bool glm_metal_fwd_clone_kv(glm_metal_fwd_ctx *dst,
 }
 
 /* Rollback-safe Metal verifier seam.  It runs the candidate after-bonus chain
- * against a scratch copy of the target KV cache, reduces all collected row
- * logits through the Metal batch-argmax primitive, then replays only the live
- * committed target-prefix tokens into the real context.  The target rows are
- * still produced by single-token steps; this is a correctness seam for the
- * future batch graph, not a speed claim. */
+ * against a scratch copy of the target KV cache, collects target hidden rows,
+ * runs the GLM LM head for those rows as one batch, then reduces with Metal
+ * batch-argmax.  It replays only the live committed target-prefix tokens into
+ * the real context.  The target layer rows are still produced by single-token
+ * steps; this is a correctness seam for the future full-layer batch graph, not
+ * a speed claim. */
 static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
                                                       int bonus_token,
                                                       const int *draft,
@@ -30180,15 +30214,25 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
 
     glm_metal_fwd_ctx scratch;
     if (!glm_metal_fwd_clone_kv(&scratch, live)) return false;
+    float *row_hidden = xmalloc((size_t)chain_rows * live->H * sizeof(float));
+    float *row_norm = xmalloc((size_t)chain_rows * live->H * sizeof(float));
     float *row_logits = xmalloc((size_t)chain_rows * vocab * sizeof(float));
+    float *batch_chunk_logits = xmalloc((size_t)chain_rows * scratch.chunk_rows * sizeof(float));
     int *row_top = xmalloc((size_t)chain_rows * sizeof(int));
     float *row_val = xmalloc((size_t)chain_rows * sizeof(float));
     bool ok = true;
     for (uint32_t r = 0; r < chain_rows && ok; r++) {
         const int tok = (r == 0) ? bonus_token : draft[r - 1u];
-        ok = glm_gen_metal_step(&scratch, tok, pos0 + r, true,
-                                row_logits + (size_t)r * vocab);
+        ok = glm_gen_metal_step(&scratch, tok, pos0 + r, false, NULL);
+        if (ok) memcpy(row_hidden + (size_t)r * live->H,
+                       scratch.x, (size_t)live->H * sizeof(float));
     }
+    if (ok) ok = glm_lm_head_metal_batch_logits(live->m, row_hidden,
+                                                (const float *)tensor_data(live->m, live->t_onorm),
+                                                live->t_out, vocab, live->shape,
+                                                chain_rows, row_logits, row_norm,
+                                                scratch.chunk_w, batch_chunk_logits,
+                                                scratch.chunk_rows);
     if (ok) ok = ds4_gpu_glm_argmax_batch_f32(row_logits, row_top, row_val,
                                               vocab, chain_rows) != 0;
 
@@ -30254,7 +30298,10 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
 
     free(row_val);
     free(row_top);
+    free(batch_chunk_logits);
     free(row_logits);
+    free(row_norm);
+    free(row_hidden);
     glm_metal_fwd_free(&scratch);
     return ok;
 }
