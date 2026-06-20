@@ -29013,6 +29013,11 @@ typedef struct {
     double dec_mla_s, dec_gu_s, dec_down_s, dec_sh_s, dec_lm_s;
     uint64_t dec_steps;
     uint32_t profile_after_pos;   /* UINT32_MAX = decode profiling disabled */
+    /* DS4_GLM_VERIFY_BATCH_TIME: opt-in timing for the full F32 layer-major
+     * verifier batch helper.  This is proof/diagnostic data for the remaining
+     * production-speed NextN work; it does not change math or routing. */
+    double batch_alloc_s, batch_embed_s, batch_attn_s, batch_ffn_s, batch_head_s;
+    uint64_t batch_calls, batch_rows, batch_layers;
     /* Step 5 diagnostic: count MoE layers that took the fused shared-expert
      * path (for verifying eligibility + A/B attribution). */
     uint64_t shexp_fast_calls, shexp_fallback_calls;
@@ -29233,6 +29238,21 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
                 c->moe_gu_total, c->moe_down_total, c->moe_sh_total,
                 (unsigned long long)c->moe_calls,
                 c->moe_gu_total / (double)c->moe_calls);
+    if (c->batch_calls && glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_TIME")) {
+        const double rows = c->batch_rows ? (double)c->batch_rows : 1.0;
+        const double calls = (double)c->batch_calls;
+        const double total = c->batch_alloc_s + c->batch_embed_s +
+                             c->batch_attn_s + c->batch_ffn_s + c->batch_head_s;
+        fprintf(stderr, "ds4: glm-metal batch-f32 profile (%llu calls, %llu rows, %llu layer-rows): "
+                        "alloc=%.3fs embed=%.3fs attn=%.3fs ffn=%.3fs head=%.3fs "
+                        "total=%.3fs avg/call=%.3fs avg/row=%.3fs\n",
+                (unsigned long long)c->batch_calls,
+                (unsigned long long)c->batch_rows,
+                (unsigned long long)c->batch_layers,
+                c->batch_alloc_s, c->batch_embed_s, c->batch_attn_s,
+                c->batch_ffn_s, c->batch_head_s, total,
+                total / calls, total / rows);
+    }
     if (c->dec_steps && getenv("DS4_GLM_DECODE_TIME")) {
         const double n = (double)c->dec_steps;
         fprintf(stderr, "ds4: glm-metal decode profile (%llu steps, avg/token): "
@@ -29541,6 +29561,8 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
     const size_t nope_rows = (size_t)n_tok * nh * nope;
     const size_t rope_rows = (size_t)n_tok * nh * rope;
     const size_t vd_rows = (size_t)n_tok * nh * vd;
+    const bool batch_prof = glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_TIME");
+    double prof_t0 = batch_prof ? now_sec() : 0.0;
 
     float *x = xmalloc(h_rows * sizeof(float));
     float *xn = xmalloc(h_rows * sizeof(float));
@@ -29571,10 +29593,20 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
     float *head_norm = want_logits ? (norm_rows ? norm_rows : xmalloc(h_rows * sizeof(float))) : NULL;
     float *batch_chunk_logits = want_logits ? xmalloc((size_t)n_tok * c->chunk_rows * sizeof(float)) : NULL;
     bool ok = true;
+    if (batch_prof) {
+        c->batch_alloc_s += now_sec() - prof_t0;
+        c->batch_calls++;
+        c->batch_rows += n_tok;
+        prof_t0 = now_sec();
+    }
 
     for (uint32_t t = 0; t < n_tok; t++)
         glm_dequant_count(m, c->t_embd, (uint64_t)tokens[t] * c->embd_row_bytes,
                           H, x + (size_t)t * H);
+    if (batch_prof) {
+        c->batch_embed_s += now_sec() - prof_t0;
+        prof_t0 = now_sec();
+    }
 
     for (uint32_t il = 0; il < n_layer && ok; il++) {
         memcpy(res, x, h_rows * sizeof(float));
@@ -29650,6 +29682,10 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
                                                        c->seq_n, pos0, n_tok) != 0;
         if (ok) ok = ds4_gpu_glm_matmul_f32(c->Wo, battn, mla_out, H, nh * vd, n_tok) != 0;
         if (ok) ok = ds4_gpu_glm_add_batch_f32(res, mla_out, x, H, n_tok) != 0;
+        if (batch_prof) {
+            c->batch_attn_s += now_sec() - prof_t0;
+            prof_t0 = now_sec();
+        }
 
         memcpy(res, x, h_rows * sizeof(float));
         const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
@@ -29755,15 +29791,22 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
             }
         }
         if (ok) ok = ds4_gpu_glm_add_batch_f32(res, ffn_out, x, H, n_tok) != 0;
+        if (batch_prof) {
+            c->batch_ffn_s += now_sec() - prof_t0;
+            c->batch_layers += n_tok;
+            prof_t0 = now_sec();
+        }
     }
 
     if (ok && hidden_rows) memcpy(hidden_rows, x, h_rows * sizeof(float));
     if (ok && want_logits) {
+        if (batch_prof) prof_t0 = now_sec();
         ok = glm_lm_head_metal_batch_logits(m, x, (const float *)tensor_data(m, c->t_onorm),
                                             c->t_out, c->vocab, shape, n_tok,
                                             logits_rows, head_norm,
                                             c->chunk_w, batch_chunk_logits,
                                             c->chunk_rows);
+        if (batch_prof) c->batch_head_s += now_sec() - prof_t0;
         if (ok) memcpy(c->xn, head_norm + (size_t)(n_tok - 1u) * H, (size_t)H * sizeof(float));
     }
     if (ok) memcpy(c->x, x + (size_t)(n_tok - 1u) * H, (size_t)H * sizeof(float));

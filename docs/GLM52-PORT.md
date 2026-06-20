@@ -347,7 +347,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   A real `asdfqwer -n 3` smoke with `DS4_GLM_VERIFY_BATCH_F32=1` keeps the known
   ids `108714 100461 21` / stdout `123456` and shows `target_steps=2,
   target_batches=1` with `batch_f32 calls=1 fallbacks=0` (still correctness-first,
-  not a speed claim),
+  not a speed claim). `DS4_GLM_VERIFY_BATCH_TIME=1` times that opt-in batch helper
+  by alloc/embed/attention/FFN/head so remaining production-speed work can be
+  based on real verifier bottlenecks; on the real `asdfqwer -n 3` smoke the
+  2-row F32 batch measured `attn=6.731s ffn=25.185s head=0.461s total=32.377s`,
+  confirming FFN/routed-expert work is still the production-speed blocker,
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and
