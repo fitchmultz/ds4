@@ -2882,6 +2882,30 @@ static void test_glm_nextn_synth(void) {
             token, (double)top, finite ? "yes" : "no");
 }
 
+static void test_glm_nextn_metal_synth(void) {
+#ifdef DS4_NO_GPU
+    fprintf(stderr, "  glm-nextn-metal-synth: SKIP (built without GPU/Metal)\n");
+    return;
+#else
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "  glm-nextn-metal-synth: SKIP (no Metal device)\n");
+        return;
+    }
+    int mtok = -1, ctok = -1;
+    float mtop = 0.0f, ctop = 0.0f;
+    bool mfinite = false, cfinite = false;
+    int mrc = ds4_glm_nextn_metal_synth(&mtok, &mtop, &mfinite);
+    int crc = ds4_glm_nextn_synth(&ctok, &ctop, &cfinite);
+    TEST_ASSERT(mrc == 0);
+    TEST_ASSERT(crc == 0);
+    TEST_ASSERT(mfinite && cfinite);
+    TEST_ASSERT(mtok == ctok);
+    TEST_ASSERT(fabsf(mtop - ctop) < 1e-5f);
+    fprintf(stderr, "  glm-nextn-metal-synth: PASS (metal=%d cpu=%d top m=%.6f c=%.6f)\n",
+            mtok, ctok, (double)mtop, (double)ctop);
+#endif
+}
+
 /* Phase 4c-iv: the full Metal forward assembly (glm_metal_forward) on the same
  * tiny synthetic model as the CPU synth.  Proves the end-to-end Metal path
  * (per-layer dequant -> GPU kernels -> GPU KV cache -> MLA/dense/MoE dispatch
@@ -3320,6 +3344,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-cpu-ref-components", "glm-cpu-ref-components", "GLM-5.2 CPU reference components (RoPE/MLA/dense-FFN/MoE) vs numpy oracle", test_glm_cpu_ref_components},
     {"--glm-cpu-forward-synth", "glm-cpu-forward-synth", "GLM-5.2 full CPU forward assembly on a tiny synthetic model (no model needed)", test_glm_cpu_forward_synth},
     {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},
+    {"--glm-nextn-metal-synth", "glm-nextn-metal-synth", "GLM-5.2 Metal NextN/MTP path on a tiny synthetic block (no model needed)", test_glm_nextn_metal_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},

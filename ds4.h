@@ -375,6 +375,8 @@ int ds4_glm_cpu_forward_synth(int *out_token, float *out_top_logit,
  * and reports a finite greedy token. */
 int ds4_glm_nextn_synth(int *out_token, float *out_top_logit,
                         bool *out_finite);
+int ds4_glm_nextn_metal_synth(int *out_token, float *out_top_logit,
+                              bool *out_finite);
 
 /* CLI driver: tokenize `prompt` with the loaded GLM vocab, run the full CPU
  * reference forward, and print the greedy token id + top logit + finiteness.
