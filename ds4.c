@@ -29733,32 +29733,79 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
                                                          E, K, n_tok, shape->moe_scale) != 0;
             if (!ok) break;
             memset(ffn_out, 0, h_rows * sizeof(float));
-            for (uint32_t k = 0; k < K && ok; k++) {
-                uint32_t unique_ids[DS4_GLM_NEXTN_MAX_DEPTH + 1];
-                uint32_t n_unique = 0;
-                for (uint32_t t = 0; t < n_tok; t++) {
-                    const uint32_t e = (uint32_t)route_idx[(size_t)t * K + k];
-                    bool seen = false;
-                    for (uint32_t u0 = 0; u0 < n_unique; u0++)
-                        if (unique_ids[u0] == e) { seen = true; break; }
-                    if (!seen) unique_ids[n_unique++] = e;
-                }
-                for (uint32_t u0 = 0; u0 < n_unique && ok; u0++) {
-                    const uint32_t e = unique_ids[u0];
-                    glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
-                    glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
-                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
-                    ok = ds4_gpu_glm_matmul_f32(c->fgate, xn, bg, ei, H, n_tok) != 0;
-                    if (ok) ok = ds4_gpu_glm_matmul_f32(c->fup, xn, bu, ei, H, n_tok) != 0;
-                    if (ok) ok = ds4_gpu_glm_swiglu_f32(bg, bu, bact, (uint64_t)n_tok * ei) != 0;
-                    if (ok) ok = ds4_gpu_glm_matmul_f32(c->fdown, bact, mla_out, H, ei, n_tok) != 0;
+            const bool batch_fast_moe = c->fast &&
+                                        glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE") &&
+                                        glm_moe_gate_up_iq2xxs_eligible(m, il);
+            const int batch_down_fast_type =
+                (batch_fast_moe && getenv("DS4_GLM_NO_DOWN_FAST") == NULL)
+                    ? glm_moe_down_fused_type(m, il) : 0;
+            if (batch_fast_moe) {
+                for (uint32_t t = 0; t < n_tok && ok; t++) {
+                    const int *idx_t = route_idx + (size_t)t * K;
+                    const float *w_t = route_w + (size_t)t * K;
+                    float *outt = ffn_out + (size_t)t * H;
+                    const float *xnt = xn + (size_t)t * H;
+                    ok = ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
+                            m->parts[ge->part].map, m->parts[ge->part].fd,
+                            m->parts[ge->part].size, ge->abs_offset, ge->bytes,
+                            m->parts[ue->part].map, m->parts[ue->part].fd,
+                            m->parts[ue->part].size, ue->abs_offset, ue->bytes,
+                            pe_gate, (uint32_t)ge->dim[2],
+                            xnt, idx_t, w_t, c->moe_mid, H, ei, K) != 0;
                     if (!ok) break;
+                    if (batch_down_fast_type != 0) {
+                        ok = ((batch_down_fast_type == GLM_DOWN_TYPE_IQ3_XXS)
+                                  ? ds4_gpu_glm_moe_down_iq3xxs_fused(
+                                        m->parts[de->part].map, m->parts[de->part].fd,
+                                        m->parts[de->part].size, de->abs_offset, de->bytes,
+                                        pe_down, (uint32_t)de->dim[2], idx_t,
+                                        c->moe_mid, outt, H, ei, K)
+                                  : ds4_gpu_glm_moe_down_iq4xs_fused(
+                                        m->parts[de->part].map, m->parts[de->part].fd,
+                                        m->parts[de->part].size, de->abs_offset, de->bytes,
+                                        pe_down, (uint32_t)de->dim[2], idx_t,
+                                        c->moe_mid, outt, H, ei, K)) != 0;
+                    } else {
+                        for (uint32_t k = 0; k < K && ok; k++) {
+                            const uint32_t e = (uint32_t)idx_t[k];
+                            glm_dequant_count(m, de, (uint64_t)e * pe_down,
+                                              (size_t)H * ei, c->fdown);
+                            ok = ds4_gpu_glm_matvec_f32(c->fdown,
+                                                        c->moe_mid + (uint64_t)k * ei,
+                                                        c->etmp, H, ei) != 0;
+                            if (!ok) break;
+                            for (uint32_t d0 = 0; d0 < H; d0++) outt[d0] += c->etmp[d0];
+                        }
+                    }
+                }
+            } else {
+                for (uint32_t k = 0; k < K && ok; k++) {
+                    uint32_t unique_ids[DS4_GLM_NEXTN_MAX_DEPTH + 1];
+                    uint32_t n_unique = 0;
                     for (uint32_t t = 0; t < n_tok; t++) {
-                        if ((uint32_t)route_idx[(size_t)t * K + k] != e) continue;
-                        const float wk = route_w[(size_t)t * K + k];
-                        float *outt = ffn_out + (size_t)t * H;
-                        const float *et = mla_out + (size_t)t * H;
-                        for (uint32_t d0 = 0; d0 < H; d0++) outt[d0] += wk * et[d0];
+                        const uint32_t e = (uint32_t)route_idx[(size_t)t * K + k];
+                        bool seen = false;
+                        for (uint32_t u0 = 0; u0 < n_unique; u0++)
+                            if (unique_ids[u0] == e) { seen = true; break; }
+                        if (!seen) unique_ids[n_unique++] = e;
+                    }
+                    for (uint32_t u0 = 0; u0 < n_unique && ok; u0++) {
+                        const uint32_t e = unique_ids[u0];
+                        glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
+                        glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
+                        glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
+                        ok = ds4_gpu_glm_matmul_f32(c->fgate, xn, bg, ei, H, n_tok) != 0;
+                        if (ok) ok = ds4_gpu_glm_matmul_f32(c->fup, xn, bu, ei, H, n_tok) != 0;
+                        if (ok) ok = ds4_gpu_glm_swiglu_f32(bg, bu, bact, (uint64_t)n_tok * ei) != 0;
+                        if (ok) ok = ds4_gpu_glm_matmul_f32(c->fdown, bact, mla_out, H, ei, n_tok) != 0;
+                        if (!ok) break;
+                        for (uint32_t t = 0; t < n_tok; t++) {
+                            if ((uint32_t)route_idx[(size_t)t * K + k] != e) continue;
+                            const float wk = route_w[(size_t)t * K + k];
+                            float *outt = ffn_out + (size_t)t * H;
+                            const float *et = mla_out + (size_t)t * H;
+                            for (uint32_t d0 = 0; d0 < H; d0++) outt[d0] += wk * et[d0];
+                        }
                     }
                 }
             }

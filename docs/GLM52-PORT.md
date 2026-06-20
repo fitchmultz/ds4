@@ -351,7 +351,13 @@ The core GLM port is complete and verified. The active work is usability/speed:
   by alloc/embed/attention/FFN/head so remaining production-speed work can be
   based on real verifier bottlenecks; on the real `asdfqwer -n 3` smoke the
   2-row F32 batch measured `attn=6.731s ffn=25.185s head=0.461s total=32.377s`,
-  confirming FFN/routed-expert work is still the production-speed blocker,
+  confirming FFN/routed-expert work is still the production-speed blocker.
+  `DS4_GLM_VERIFY_BATCH_FAST_MOE=1` is the next opt-in bridge: with
+  `DS4_GLM_FAST=1`, the batched verifier keeps the F32 attention/proof scaffold
+  but uses the same production fast routed-MoE gate/up/down kernels as normal
+  decode; the same smoke keeps ids/trace and measures `attn=6.725s ffn=4.719s
+  head=0.463s total=11.907s`, so the remaining production-speed blocker shifts
+  from routed FFN to F32 attention/MLA. Default remains the pure F32 proof path,
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and

@@ -255,6 +255,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "DS4_GLM_NEXTN_TRACE_OUT=FILE", "GLM diagnostic: write --glm-nextn per-round CSV trace with drafts, accepted count, fallback token, and generated count.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_F32=1", "GLM diagnostic: opt --glm-nextn verification into the full F32 layer-major Metal target-batch path; 0/off/false/no disable. Correctness/proof path, not a default speed claim.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_TIME=1", "GLM diagnostic: time the opt-in full F32 NextN verifier batch helper by alloc/embed/attention/FFN/head; 0/off/false/no disable.");
+    opt(fp, c, "DS4_GLM_VERIFY_BATCH_FAST_MOE=1", "GLM diagnostic: with DS4_GLM_VERIFY_BATCH_F32=1 and DS4_GLM_FAST=1, let the batch verifier use production fast routed-MoE kernels; default keeps the pure F32 proof path.");
     opt(fp, c, "DS4_GLM_FAST=1", "GLM-5.2 Metal fast path: fused routed MoE gate/up/down plus resident shared experts.");
     opt(fp, c, "DS4_GLM_EXPERT_PREAD=0/off", "GLM fast path: disable default selected-expert pread and restore mmap page-fault staging for A/B tests.");
     opt(fp, c, "DS4_GLM_EXPERT_CACHE_PRESET=decode|plan", "GLM fast path: enable bounded LRU routed-expert slab cache; decode is conservative, plan is the documented ~88 GiB cache plan.");
