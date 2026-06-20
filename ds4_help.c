@@ -249,6 +249,11 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--glm-chat-cpu", "GLM-5.2 only: same as --glm-chat on the CPU reference backend (identical greedy sequence).");
     opt(fp, c, "--glm-raw", "GLM-5.2 only: raw-tokenize -p/--prompt and greedy-decode without the chat template. Useful for low-prefill latency experiments while batched prefill is pending.");
     opt(fp, c, "--glm-raw-cpu", "GLM-5.2 only: same as --glm-raw on the CPU reference backend.");
+    opt(fp, c, "DS4_GLM_FAST=1", "GLM-5.2 Metal fast path: fused routed MoE gate/up/down plus resident shared experts.");
+    opt(fp, c, "DS4_GLM_EXPERT_PREAD=1", "GLM fast path: stage selected routed-expert quant slabs with explicit pread instead of mmap page faults.");
+    opt(fp, c, "DS4_GLM_EXPERT_CACHE_PRESET=decode|plan", "GLM fast path: enable bounded LRU routed-expert slab cache; decode is conservative, plan is the documented ~88 GiB cache plan.");
+    opt(fp, c, "DS4_GLM_EXPERT_CACHE_MIB/GIB=N", "GLM fast path: explicit slab-cache budget; overrides cache presets.");
+    opt(fp, c, "DS4_GLM_NEXTN_PROBE=1", "GLM diagnostic: compare blk.78 NextN one-token draft with the next target argmax without changing output.");
     opt(fp, c, "--dump-tokens", "Tokenize the prompt exactly as written, then exit.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");
