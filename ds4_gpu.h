@@ -1040,6 +1040,8 @@ int ds4_gpu_glm_matmul_f32(const float * W, const float * x, float * out,
  * this with n = kv_lora on the latent slice (no masked variant needed). */
 int ds4_gpu_glm_rmsnorm_f32(const float * x, const float * w, float * out,
                             uint32_t n, float eps);
+int ds4_gpu_glm_rmsnorm_batch_f32(const float * x, const float * w, float * out,
+                                  uint32_t n, uint32_t n_tok, float eps);
 
 /* Standard interleaved RoPE on n_head rows of width d (theta base, position t). */
 int ds4_gpu_glm_rope_interleaved_f32(const float * x, float * out,

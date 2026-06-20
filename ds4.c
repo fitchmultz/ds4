@@ -26998,6 +26998,13 @@ void glm_rmsnorm_f32(float *out, const float *x, const float *weight,
     for (uint32_t i = 0; i < n; i++) out[i] = x[i] * scale * weight[i];
 }
 
+void glm_rmsnorm_batch_f32(float *out, const float *x, const float *weight,
+                           uint32_t n, uint32_t n_tok, float eps) {
+    for (uint32_t t = 0; t < n_tok; t++)
+        glm_rmsnorm_f32(out + (size_t)t * n, x + (size_t)t * n,
+                        weight, n, eps);
+}
+
 void glm_rope_interleaved_f32(float *out, const float *x,
                               uint32_t d, uint32_t n_head,
                               float base, uint32_t t) {

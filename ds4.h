@@ -241,6 +241,8 @@ void glm_rope_interleaved_f32(float *out, const float *x,
 /* Standard RMSNorm with learned per-channel scale. */
 void glm_rmsnorm_f32(float *out, const float *x, const float *weight,
                      uint32_t n, float eps);
+void glm_rmsnorm_batch_f32(float *out, const float *x, const float *weight,
+                           uint32_t n, uint32_t n_tok, float eps);
 
 /* F32 matvec: out[r] = sum_c W[r*cols + c] * x[c]  for r in [0,rows). */
 void glm_matvec_f32(float *out, const float *W, const float *x,

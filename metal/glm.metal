@@ -69,6 +69,12 @@ struct ds4_metal_args_glm_rmsnorm {
     float    eps;   // 1e-5
 };
 
+struct ds4_metal_args_glm_rmsnorm_batch {
+    uint32_t n;      // elements per token row
+    uint32_t n_tok;  // token batch
+    float    eps;    // 1e-5
+};
+
 // out[i] = x[i] * (1/sqrt(mean(x^2)+eps)) * w[i], one row.
 // Latent-only RMSNorm is just this kernel with n = kv_lora (not kv_lora+rope):
 // the caller passes the latent slice and its width, so no separate masked
@@ -83,6 +89,24 @@ kernel void kernel_glm_rmsnorm_f32(
     for (uint32_t i = 0; i < args.n; i++) ss += x[i] * x[i];
     const float scale = 1.0f / sqrt(ss / (float)args.n + args.eps);
     for (uint32_t i = 0; i < args.n; i++) out[i] = x[i] * scale * w[i];
+}
+
+// Batched RMSNorm: one sequential row per thread, same row-local accumulation
+// order as kernel_glm_rmsnorm_f32. This is the paired primitive to
+// kernel_glm_matmul_f32 for future GLM layer-major verifier/prefill batches.
+kernel void kernel_glm_rmsnorm_batch_f32(
+        constant ds4_metal_args_glm_rmsnorm_batch & args,
+        device const float * x,
+        device const float * w,
+        device       float * out,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_tok) return;
+    device const float * xr = x + (uint64_t)gid * args.n;
+    device       float * orow = out + (uint64_t)gid * args.n;
+    float ss = 0.0f;
+    for (uint32_t i = 0; i < args.n; i++) ss += xr[i] * xr[i];
+    const float scale = 1.0f / sqrt(ss / (float)args.n + args.eps);
+    for (uint32_t i = 0; i < args.n; i++) orow[i] = xr[i] * scale * w[i];
 }
 
 struct ds4_metal_args_glm_rope {
