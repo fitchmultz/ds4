@@ -321,10 +321,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   microbatch a concrete contract to replace without changing accept/rollback
   semantics. `ds4_test --glm-spec-generate-synth` pins full/partial/miss cases
   to the exact naive greedy sequence, `--glm-spec-metal-target-synth` now routes
-  those cases through a rollback-safe Metal scratch/replay verifier callback
-  using a persistent scratch context, KV-copy reset per verify, a batched GLM LM
-  head, and Metal batch-argmax over collected target hidden rows (target layer
-  rows are still produced by single-token steps; no speed claim),
+  those cases through a rollback-safe Metal scratch verifier callback using a
+  persistent scratch context, KV-copy reset per verify, verified-KV-slot copyback
+  instead of live replay, a batched GLM LM head, and Metal batch-argmax over
+  collected target hidden rows (target layer rows are still produced by
+  single-token steps; no speed claim),
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and

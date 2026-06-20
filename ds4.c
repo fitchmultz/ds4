@@ -30153,12 +30153,16 @@ static bool glm_spec_verify_after_bonus_single(glm_gen_step_fn step,
 }
 
 #ifndef DS4_NO_GPU
+static bool glm_metal_fwd_compatible(const glm_metal_fwd_ctx *dst,
+                                      const glm_metal_fwd_ctx *src) {
+    return dst && src && dst->m && src->m && dst->seq_n == src->seq_n &&
+           dst->n_layer == src->n_layer && dst->nh == src->nh &&
+           dst->nope == src->nope && dst->vd == src->vd && dst->rope == src->rope;
+}
+
 static bool glm_metal_fwd_copy_kv(glm_metal_fwd_ctx *dst,
                                   const glm_metal_fwd_ctx *src) {
-    if (!dst || !src || !dst->m || !src->m || dst->seq_n != src->seq_n ||
-        dst->n_layer != src->n_layer || dst->nh != src->nh ||
-        dst->nope != src->nope || dst->vd != src->vd || dst->rope != src->rope)
-        return false;
+    if (!glm_metal_fwd_compatible(dst, src)) return false;
     const size_t kn = (size_t)src->nh * src->seq_n * src->nope * sizeof(float);
     const size_t vn = (size_t)src->nh * src->seq_n * src->vd * sizeof(float);
     const size_t rn = (size_t)src->nh * src->seq_n * src->rope * sizeof(float);
@@ -30166,6 +30170,29 @@ static bool glm_metal_fwd_copy_kv(glm_metal_fwd_ctx *dst,
         memcpy(dst->Knope[il], src->Knope[il], kn);
         memcpy(dst->Vc[il],    src->Vc[il],    vn);
         memcpy(dst->Krop[il],  src->Krop[il],  rn);
+    }
+    return true;
+}
+
+static bool glm_metal_fwd_copy_kv_slots(glm_metal_fwd_ctx *dst,
+                                        const glm_metal_fwd_ctx *src,
+                                        uint32_t first_pos,
+                                        uint32_t n_pos) {
+    if (!glm_metal_fwd_compatible(dst, src)) return false;
+    if (n_pos == 0) return true;
+    if (first_pos > src->seq_n || src->seq_n - first_pos < n_pos) return false;
+    for (uint32_t il = 0; il < src->n_layer; il++) {
+        for (uint32_t h = 0; h < src->nh; h++) {
+            const size_t k0 = ((size_t)h * src->seq_n + first_pos) * src->nope;
+            const size_t v0 = ((size_t)h * src->seq_n + first_pos) * src->vd;
+            const size_t r0 = ((size_t)h * src->seq_n + first_pos) * src->rope;
+            memcpy(dst->Knope[il] + k0, src->Knope[il] + k0,
+                   (size_t)n_pos * src->nope * sizeof(float));
+            memcpy(dst->Vc[il] + v0, src->Vc[il] + v0,
+                   (size_t)n_pos * src->vd * sizeof(float));
+            memcpy(dst->Krop[il] + r0, src->Krop[il] + r0,
+                   (size_t)n_pos * src->rope * sizeof(float));
+        }
     }
     return true;
 }
@@ -30178,10 +30205,10 @@ typedef struct {
 /* Rollback-safe Metal verifier seam.  It runs the candidate after-bonus chain
  * against a scratch copy of the target KV cache, collects target hidden rows,
  * runs the GLM LM head for those rows as one batch, then reduces with Metal
- * batch-argmax.  It replays only the live committed target-prefix tokens into
- * the real context.  The target layer rows are still produced by single-token
- * steps; this is a correctness seam for the future full-layer batch graph, not
- * a speed claim. */
+ * batch-argmax.  It copies only the verified KV slots and matching hidden/logits
+ * back into the live context.  The target layer rows are still produced by
+ * single-token steps; this is a correctness seam for the future full-layer
+ * batch graph, not a speed claim. */
 static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
                                                       int bonus_token,
                                                       const int *draft,
@@ -30275,9 +30302,17 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
             break;
         }
 
-        for (uint32_t i = 0; i < replay_steps && ok; i++) {
-            const int tok = (i == 0) ? bonus_token : emit_after[i - 1u];
-            ok = glm_gen_metal_step(live, tok, pos0 + i, true, logits);
+        if (ok && replay_steps > 0) {
+            ok = glm_metal_fwd_copy_kv_slots(live, scratch, pos0, replay_steps);
+            if (ok) {
+                const uint32_t last = replay_steps - 1u;
+                memcpy(live->x, row_hidden + (size_t)last * live->H,
+                       (size_t)live->H * sizeof(float));
+                memcpy(live->xn, row_norm + (size_t)last * live->H,
+                       (size_t)live->H * sizeof(float));
+                memcpy(logits, row_logits + (size_t)last * vocab,
+                       (size_t)vocab * sizeof(float));
+            }
         }
         if (ok && *fallback_emitted && *emit_count < remaining_after_bonus) {
             ok = glm_gen_metal_step(live, *fallback_token, pos0 + replay_steps,
