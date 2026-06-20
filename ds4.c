@@ -31015,10 +31015,13 @@ static int glm_generate_loop(const char *label,
     const double pf0 = now_sec();
     bool batch_prefill = false;
 #ifndef DS4_NO_GPU
-    if (step == glm_gen_metal_step && prompt_len > 0 &&
-        glm_env_flag_enabled("DS4_GLM_PREFILL_BATCH_LIVE")) {
-        if (prompt_len <= 16u) {
-            glm_metal_fwd_ctx *live = (glm_metal_fwd_ctx *)ctx;
+    if (step == glm_gen_metal_step && prompt_len > 0) {
+        glm_metal_fwd_ctx *live = (glm_metal_fwd_ctx *)ctx;
+        const char *live_prefill_env = getenv("DS4_GLM_PREFILL_BATCH_LIVE");
+        const bool live_prefill_requested = live_prefill_env
+            ? glm_env_flag_enabled("DS4_GLM_PREFILL_BATCH_LIVE")
+            : live->fast;
+        if (live_prefill_requested && prompt_len <= 16u) {
             glm_metal_fwd_ctx scratch;
             memset(&scratch, 0, sizeof(scratch));
             float *batch_logits = xmalloc((size_t)prompt_len * vocab * sizeof(float));
@@ -31045,7 +31048,7 @@ static int glm_generate_loop(const char *label,
                     scratch.batch_fast_moe ? " fast-moe=on" : " fast-moe=off");
             free(batch_logits);
             if (scratch.m) glm_metal_fwd_free(&scratch);
-        } else {
+        } else if (live_prefill_requested) {
             fprintf(stderr,
                     "ds4: %s: prefill batch live skipped (%u rows > max 16)\n",
                     label ? label : "glm-generate", prompt_len);
