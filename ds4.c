@@ -31046,7 +31046,8 @@ static int glm_generate_loop(const char *label,
         const bool live_prefill_requested = live_prefill_env
             ? glm_env_flag_enabled("DS4_GLM_PREFILL_BATCH_LIVE")
             : live->fast;
-        if (live_prefill_requested && prompt_len <= 16u) {
+        const uint32_t live_prefill_max = 32u;
+        if (live_prefill_requested && prompt_len <= live_prefill_max) {
             glm_metal_fwd_ctx scratch;
             memset(&scratch, 0, sizeof(scratch));
             float *batch_logits = xmalloc((size_t)prompt_len * vocab * sizeof(float));
@@ -31075,8 +31076,8 @@ static int glm_generate_loop(const char *label,
             if (scratch.m) glm_metal_fwd_free(&scratch);
         } else if (live_prefill_requested) {
             fprintf(stderr,
-                    "ds4: %s: prefill batch live skipped (%u rows > max 16)\n",
-                    label ? label : "glm-generate", prompt_len);
+                    "ds4: %s: prefill batch live skipped (%u rows > max %u)\n",
+                    label ? label : "glm-generate", prompt_len, live_prefill_max);
         }
     }
 #endif

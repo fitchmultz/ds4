@@ -415,7 +415,7 @@ The core GLM port is complete and verified. The active work is usability/speed:
   also matches `seq_next=batch_next=100461`, `cont_max_abs=0`) and
   `The meaning of life is` (`seq_top=batch_top=264`, maxabs `3.96e-5`).
   The guarded live batched-prefill path is now the default inside
-  `DS4_GLM_FAST=1` for short Metal prompts (`<=16` prompt tokens), with
+  `DS4_GLM_FAST=1` for short Metal prompts (`<=32` prompt tokens), with
   `DS4_GLM_PREFILL_BATCH_LIVE=0/off/false/no` as the escape hatch and
   `DS4_GLM_PREFILL_BATCH_LIVE=1` as an explicit force-enable outside fast mode.
   It batch-prefills a fresh scratch ctx, copies KV/final hidden/logits into the
@@ -433,7 +433,9 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `108714 100461 21` / `123456` with `target_batches=1`. A broader short-prompt
   sweep also matched plain greedy for `Once upon a time` (`11 1052`, prefill
   `45.33s -> 13.42s`), `Q: 2+2 =` (`220 20`, `71.45s -> 16.73s`), and
-  `def add(a, b):` (`220 671`, `60.41s -> 15.46s`). The chat path is covered too:
+  `def add(a, b):` (`220 671`, `60.41s -> 15.46s`). The cap was then raised
+  to 32 after an 18-token raw prompt matched the escape-hatch sequential path
+  (`1096` / ` This`) while prefill dropped `185.65s -> 41.32s`. The chat path is covered too:
   `--glm-chat -p Hi -n 2` has a 13-token templated prompt, matches generated ids
   `13041 1052` / `Hi there`, and drops prefill `136.95s -> 23.18s`.
   LM head is only ~0.5–0.6s/token and is not the next target.
