@@ -30555,13 +30555,42 @@ static int glm_generate_loop(const char *label,
                     label ? label : "glm-generate", draft_env);
         }
 #endif
+        glm_verify_after_bonus_fn verify_fn = NULL;
+        void *verify_ctx = NULL;
+#ifndef DS4_NO_GPU
+        glm_metal_fwd_ctx verify_scratch;
+        memset(&verify_scratch, 0, sizeof(verify_scratch));
+        glm_metal_verify_ctx verify_pair = {0};
+        bool verify_scratch_ready = false;
+        if (step == glm_gen_metal_step) {
+            glm_metal_fwd_ctx *live = (glm_metal_fwd_ctx *)ctx;
+            verify_scratch_ready = glm_metal_fwd_init(&verify_scratch,
+                                                      live->m, live->shape,
+                                                      live->n_layer, live->n_dense,
+                                                      live->seq_n);
+            if (verify_scratch_ready) {
+                verify_pair.live = live;
+                verify_pair.scratch = &verify_scratch;
+                verify_fn = glm_spec_verify_after_bonus_metal_scratch;
+                verify_ctx = &verify_pair;
+                fprintf(stderr, "ds4: %s: nextn verifier=metal-scratch-batch-head\n",
+                        label ? label : "glm-generate");
+            } else {
+                fprintf(stderr, "ds4: %s: nextn verifier scratch init failed; using single-step verifier\n",
+                        label ? label : "glm-generate");
+            }
+        }
+#endif
         fprintf(stderr, "ds4: %s: nextn draft backend=%s prefix_cache_rows=%u\n",
                 label ? label : "glm-generate", draft_backend, ds.cache_cap);
         int rc = glm_spec_decode(label, step, hnorm, ctx, prompt, prompt_len,
                                  n_predict, logits, vocab, e, eos_id, out,
                                  out_generated, gen_ids_out, out_decode_s,
                                  spec_depth, draft_fn, &ds, glm_nextn_draft_commit,
-                                 NULL, NULL, NULL);
+                                 verify_fn, verify_ctx, NULL);
+#ifndef DS4_NO_GPU
+        if (verify_scratch_ready) glm_metal_fwd_free(&verify_scratch);
+#endif
         fprintf(stderr,
                 "ds4: %s: nextn draft prefix commits=%llu resets=%llu live_rows=%u\n",
                 label ? label : "glm-generate",
