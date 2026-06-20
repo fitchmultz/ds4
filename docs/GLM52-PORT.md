@@ -357,7 +357,12 @@ The core GLM port is complete and verified. The active work is usability/speed:
   but uses the same production fast routed-MoE gate/up/down kernels as normal
   decode; the same smoke keeps ids/trace and measures `attn=6.725s ffn=4.719s
   head=0.463s total=11.907s`, so the remaining production-speed blocker shifts
-  from routed FFN to F32 attention/MLA. Default remains the pure F32 proof path,
+  from routed FFN to F32 attention/MLA. A fair no-profile run on the same prompt
+  measured plain greedy `DS4_GLM_FAST=1 --glm-raw -n 3` at decode `21.21s` and
+  opt-in `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1
+  DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at decode `12.30s`, with identical ids/stdout
+  and `target_steps=2,target_batches=1`; this is a narrow accepted-round opt-in
+  measurement, not a default production speed claim. Default remains the pure F32 proof path,
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and
