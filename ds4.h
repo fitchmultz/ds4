@@ -431,6 +431,8 @@ int ds4_glm_spec_generate_synth(int n_steps, int *out_full, int *out_partial,
                                 int *out_miss);
 int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
                                     int *out_partial, int *out_miss);
+int ds4_glm_metal_target_batch_synth(int *out_match, float *out_hidden_max,
+                                      float *out_logits_max);
 int ds4_glm_spec_batch_verify_synth(int n_steps, int *out_match,
                                     int *out_verify_calls);
 int ds4_glm_nextn_prefix_synth(int *out_commit, int *out_reset);

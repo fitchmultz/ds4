@@ -325,8 +325,13 @@ The core GLM port is complete and verified. The active work is usability/speed:
   those cases through a rollback-safe Metal scratch verifier callback using a
   persistent scratch context, KV-copy reset per verify, verified-KV-slot copyback
   instead of live replay, a batched GLM LM head, and Metal batch-argmax over
-  collected target hidden rows (target layer rows are still produced by
-  single-token steps; no speed claim),
+  collected target hidden rows (production target layer rows are still produced
+  by single-token steps; no speed claim),
+  `--glm-metal-target-batch-synth` now proves a full F32 layer-major Metal target
+  batch (attention/MLA, dense FFN, routed MoE, output norm, LM head) matches
+  sequential Metal target rows on the tiny synthetic GLM model and leaves KV
+  cache state usable for the next decode row, but is not yet wired into
+  production `target_batches` accounting,
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and

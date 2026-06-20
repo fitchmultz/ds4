@@ -29484,6 +29484,238 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
     return true;
 }
 
+static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
+                                    const int *tokens,
+                                    uint32_t pos0,
+                                    uint32_t n_tok,
+                                    bool want_logits,
+                                    float *logits_rows,
+                                    float *hidden_rows) {
+    if (!c || !tokens || n_tok == 0 || pos0 > c->seq_n || c->seq_n - pos0 < n_tok)
+        return false;
+    if (want_logits && !logits_rows) return false;
+
+    const ds4_model *m = c->m;
+    const glm_cpu_shape *shape = c->shape;
+    const uint32_t H = c->H, nh = c->nh, ql = shape->q_lora;
+    const uint32_t kvl = c->kvl, nope = c->nope, rope = c->rope, vd = c->vd;
+    const uint32_t qhd = c->qhd, E = c->E, K = c->K;
+    const uint32_t n_layer = c->n_layer, n_dense = c->n_dense;
+    const size_t h_rows = (size_t)n_tok * H;
+    const size_t ql_rows = (size_t)n_tok * ql;
+    const size_t kvl_rows = (size_t)n_tok * kvl;
+    const size_t q_rows = (size_t)n_tok * nh * qhd;
+    const size_t nope_rows = (size_t)n_tok * nh * nope;
+    const size_t rope_rows = (size_t)n_tok * nh * rope;
+    const size_t vd_rows = (size_t)n_tok * nh * vd;
+
+    float *x = xmalloc(h_rows * sizeof(float));
+    float *xn = xmalloc(h_rows * sizeof(float));
+    float *res = xmalloc(h_rows * sizeof(float));
+    float *mla_out = xmalloc(h_rows * sizeof(float));
+    float *ffn_out = xmalloc(h_rows * sizeof(float));
+    float *bqa = xmalloc(ql_rows * sizeof(float));
+    float *bqa_n = xmalloc(ql_rows * sizeof(float));
+    float *bq = xmalloc(q_rows * sizeof(float));
+    float *bkva = xmalloc((size_t)n_tok * (kvl + rope) * sizeof(float));
+    float *bkv_lat = xmalloc(kvl_rows * sizeof(float));
+    float *bkvln = xmalloc(kvl_rows * sizeof(float));
+    float *bk = xmalloc(nope_rows * sizeof(float));
+    float *bv = xmalloc(vd_rows * sizeof(float));
+    float *bqr = xmalloc(rope_rows * sizeof(float));
+    float *bqr_r = xmalloc(rope_rows * sizeof(float));
+    float *bkr_raw = xmalloc(rope_rows * sizeof(float));
+    float *bkr_r = xmalloc(rope_rows * sizeof(float));
+    float *bQ = xmalloc(q_rows * sizeof(float));
+    float *battn = xmalloc(vd_rows * sizeof(float));
+    float *router_logits = xmalloc((size_t)n_tok * E * sizeof(float));
+    int *route_idx = xmalloc((size_t)n_tok * K * sizeof(int));
+    float *route_w = xmalloc((size_t)n_tok * K * sizeof(float));
+    const uint32_t max_inter = shape->ff_inter;
+    float *bg = xmalloc((size_t)n_tok * max_inter * sizeof(float));
+    float *bu = xmalloc((size_t)n_tok * max_inter * sizeof(float));
+    float *bact = xmalloc((size_t)n_tok * max_inter * sizeof(float));
+    float *head_norm = want_logits ? xmalloc(h_rows * sizeof(float)) : NULL;
+    float *batch_chunk_logits = want_logits ? xmalloc((size_t)n_tok * c->chunk_rows * sizeof(float)) : NULL;
+    bool ok = true;
+
+    for (uint32_t t = 0; t < n_tok; t++)
+        glm_dequant_count(m, c->t_embd, (uint64_t)tokens[t] * c->embd_row_bytes,
+                          H, x + (size_t)t * H);
+
+    for (uint32_t il = 0; il < n_layer && ok; il++) {
+        memcpy(res, x, h_rows * sizeof(float));
+        const ds4_tensor *anorm_t = glm_layer_tensor(m, il, "attn_norm");
+        const ds4_tensor *q_a  = glm_layer_tensor(m, il, "attn_q_a");
+        const ds4_tensor *q_b  = glm_layer_tensor(m, il, "attn_q_b");
+        const ds4_tensor *kv_a = glm_layer_tensor(m, il, "attn_kv_a_mqa");
+        const ds4_tensor *k_b  = glm_layer_tensor(m, il, "attn_k_b");
+        const ds4_tensor *v_b  = glm_layer_tensor(m, il, "attn_v_b");
+        const ds4_tensor *wop  = glm_layer_tensor(m, il, "attn_output");
+        const ds4_tensor *qa_norm_t = glm_layer_tensor(m, il, "attn_q_a_norm");
+        const ds4_tensor *kv_norm_t = glm_layer_tensor(m, il, "attn_kv_a_norm");
+        if (!anorm_t || !q_a || !q_b || !kv_a || !k_b || !v_b || !wop ||
+            !qa_norm_t || !kv_norm_t) { ok = false; break; }
+        glm_dequant_weight(m, q_a, c->WqA);
+        glm_dequant_weight(m, q_b, c->WqB);
+        glm_dequant_weight(m, kv_a, c->WkvA);
+        glm_dequant_weight(m, k_b, c->WkBn);
+        glm_k_b_reorder(c->WkB, c->WkBn, nope, kvl, nh);
+        glm_dequant_weight(m, v_b, c->WvB);
+        glm_dequant_weight(m, wop, c->Wo);
+
+        ok = ds4_gpu_glm_rmsnorm_batch_f32(x, (const float *)tensor_data(m, anorm_t),
+                                           xn, H, n_tok, shape->rms_eps) != 0;
+        if (ok) ok = ds4_gpu_glm_matmul_f32(c->WqA, xn, bqa, ql, H, n_tok) != 0;
+        if (ok) ok = ds4_gpu_glm_rmsnorm_batch_f32(bqa, (const float *)tensor_data(m, qa_norm_t),
+                                                   bqa_n, ql, n_tok, shape->rms_eps) != 0;
+        if (ok) ok = ds4_gpu_glm_matmul_f32(c->WqB, bqa_n, bq, nh * qhd, ql, n_tok) != 0;
+        if (ok) ok = ds4_gpu_glm_matmul_f32(c->WkvA, xn, bkva, kvl + rope, H, n_tok) != 0;
+        for (uint32_t t = 0; ok && t < n_tok; t++) {
+            memcpy(bkv_lat + (size_t)t * kvl,
+                   bkva + (size_t)t * (kvl + rope),
+                   (size_t)kvl * sizeof(float));
+            for (uint32_t h = 0; h < nh; h++) {
+                memcpy(bqr + ((size_t)t * nh + h) * rope,
+                       bq + (size_t)t * nh * qhd + (size_t)h * qhd + nope,
+                       (size_t)rope * sizeof(float));
+                memcpy(bkr_raw + ((size_t)t * nh + h) * rope,
+                       bkva + (size_t)t * (kvl + rope) + kvl,
+                       (size_t)rope * sizeof(float));
+            }
+        }
+        if (ok) ok = ds4_gpu_glm_rmsnorm_batch_f32(bkv_lat, (const float *)tensor_data(m, kv_norm_t),
+                                                   bkvln, kvl, n_tok, shape->rms_eps) != 0;
+        if (ok) ok = ds4_gpu_glm_matmul_f32(c->WkB, bkvln, bk, nh * nope, kvl, n_tok) != 0;
+        if (ok) ok = ds4_gpu_glm_matmul_f32(c->WvB, bkvln, bv, nh * vd, kvl, n_tok) != 0;
+        if (ok) ok = ds4_gpu_glm_rope_interleaved_batch_f32(bqr, bqr_r, rope, nh,
+                                                            shape->rope_base, pos0, n_tok) != 0;
+        if (ok) ok = ds4_gpu_glm_rope_interleaved_batch_f32(bkr_raw, bkr_r, rope, nh,
+                                                            shape->rope_base, pos0, n_tok) != 0;
+        for (uint32_t t = 0; ok && t < n_tok; t++) {
+            const uint32_t p = pos0 + t;
+            for (uint32_t h = 0; h < nh; h++) {
+                memcpy(bQ + ((size_t)t * nh + h) * qhd,
+                       bq + (size_t)t * nh * qhd + (size_t)h * qhd,
+                       (size_t)nope * sizeof(float));
+                memcpy(bQ + ((size_t)t * nh + h) * qhd + nope,
+                       bqr_r + ((size_t)t * nh + h) * rope,
+                       (size_t)rope * sizeof(float));
+                memcpy(c->Knope[il] + ((size_t)h * c->seq_n + p) * nope,
+                       bk + ((size_t)t * nh + h) * nope,
+                       (size_t)nope * sizeof(float));
+                memcpy(c->Krop[il] + ((size_t)h * c->seq_n + p) * rope,
+                       bkr_r + ((size_t)t * nh + h) * rope,
+                       (size_t)rope * sizeof(float));
+                memcpy(c->Vc[il] + ((size_t)h * c->seq_n + p) * vd,
+                       bv + ((size_t)t * nh + h) * vd,
+                       (size_t)vd * sizeof(float));
+            }
+        }
+        if (ok) ok = ds4_gpu_glm_attn_decode_batch_f32(bQ, c->Knope[il], c->Krop[il], c->Vc[il],
+                                                       battn, nh, nope, rope, vd, qhd,
+                                                       c->seq_n, pos0, n_tok) != 0;
+        if (ok) ok = ds4_gpu_glm_matmul_f32(c->Wo, battn, mla_out, H, nh * vd, n_tok) != 0;
+        if (ok) ok = ds4_gpu_glm_add_batch_f32(res, mla_out, x, H, n_tok) != 0;
+
+        memcpy(res, x, h_rows * sizeof(float));
+        const ds4_tensor *fnorm_t = glm_layer_tensor(m, il, "ffn_norm");
+        if (!fnorm_t) { ok = false; break; }
+        ok = ds4_gpu_glm_rmsnorm_batch_f32(x, (const float *)tensor_data(m, fnorm_t),
+                                           xn, H, n_tok, shape->rms_eps) != 0;
+        if (!ok) break;
+        if (il < n_dense) {
+            const ds4_tensor *g = glm_layer_tensor(m, il, "ffn_gate");
+            const ds4_tensor *u = glm_layer_tensor(m, il, "ffn_up");
+            const ds4_tensor *d = glm_layer_tensor(m, il, "ffn_down");
+            if (!g || !u || !d) { ok = false; break; }
+            const uint32_t I = shape->ff_inter;
+            glm_dequant_weight(m, g, c->fgate);
+            glm_dequant_weight(m, u, c->fup);
+            glm_dequant_weight(m, d, c->fdown);
+            ok = ds4_gpu_glm_matmul_f32(c->fgate, xn, bg, I, H, n_tok) != 0;
+            if (ok) ok = ds4_gpu_glm_matmul_f32(c->fup, xn, bu, I, H, n_tok) != 0;
+            if (ok) ok = ds4_gpu_glm_swiglu_f32(bg, bu, bact, (uint64_t)n_tok * I) != 0;
+            if (ok) ok = ds4_gpu_glm_matmul_f32(c->fdown, bact, ffn_out, H, I, n_tok) != 0;
+        } else {
+            const ds4_tensor *ge  = glm_layer_tensor(m, il, "ffn_gate_exps");
+            const ds4_tensor *ue  = glm_layer_tensor(m, il, "ffn_up_exps");
+            const ds4_tensor *de  = glm_layer_tensor(m, il, "ffn_down_exps");
+            const ds4_tensor *ginp= glm_layer_tensor(m, il, "ffn_gate_inp");
+            const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
+            const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
+            const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
+            char bias_name[64];
+            snprintf(bias_name, sizeof(bias_name), "blk.%u.exp_probs_b.bias", il);
+            const ds4_tensor *bias_t = model_find_tensor(m, bias_name);
+            if (!ge || !ue || !de || !ginp || !gsh || !ush || !dsh || !bias_t) {
+                ok = false; break;
+            }
+            const uint32_t ei = (uint32_t)ge->dim[1];
+            if (ei > max_inter) { ok = false; break; }
+            const uint64_t pe_gate = ge->bytes / ge->dim[2];
+            const uint64_t pe_up   = ue->bytes / ue->dim[2];
+            const uint64_t pe_down = de->bytes / de->dim[2];
+            glm_dequant_weight(m, ginp, c->router_gate);
+            ok = ds4_gpu_glm_matmul_f32(c->router_gate, xn, router_logits, E, H, n_tok) != 0;
+            if (ok) ok = ds4_gpu_glm_moe_route_batch_f32(router_logits,
+                                                         (const float *)tensor_data(m, bias_t),
+                                                         route_idx, route_w,
+                                                         E, K, n_tok, shape->moe_scale) != 0;
+            if (!ok) break;
+            memset(ffn_out, 0, h_rows * sizeof(float));
+            for (uint32_t t = 0; t < n_tok && ok; t++) {
+                const float *xnt = xn + (size_t)t * H;
+                float *outt = ffn_out + (size_t)t * H;
+                for (uint32_t k = 0; k < K; k++) {
+                    const uint32_t e = (uint32_t)route_idx[(size_t)t * K + k];
+                    const float wk = route_w[(size_t)t * K + k];
+                    glm_dequant_count(m, ge, (uint64_t)e * pe_gate, (size_t)ei * H, c->fgate);
+                    glm_dequant_count(m, ue, (uint64_t)e * pe_up,   (size_t)ei * H, c->fup);
+                    glm_dequant_count(m, de, (uint64_t)e * pe_down, (size_t)H * ei, c->fdown);
+                    if (!glm_swiglu_metal(xnt, c->fgate, c->fup, c->fdown,
+                                          H, ei, c->etmp, c->sg, c->su)) {
+                        ok = false; break;
+                    }
+                    for (uint32_t d0 = 0; d0 < H; d0++) outt[d0] += wk * c->etmp[d0];
+                }
+            }
+            if (!ok) break;
+            glm_dequant_weight(m, gsh, c->fgate);
+            glm_dequant_weight(m, ush, c->fup);
+            glm_dequant_weight(m, dsh, c->fdown);
+            for (uint32_t t = 0; t < n_tok && ok; t++) {
+                const float *xnt = xn + (size_t)t * H;
+                float *outt = ffn_out + (size_t)t * H;
+                if (!glm_swiglu_metal(xnt, c->fgate, c->fup, c->fdown,
+                                      H, ei, c->etmp, c->sg, c->su)) {
+                    ok = false; break;
+                }
+                for (uint32_t d0 = 0; d0 < H; d0++) outt[d0] += c->etmp[d0];
+            }
+        }
+        if (ok) ok = ds4_gpu_glm_add_batch_f32(res, ffn_out, x, H, n_tok) != 0;
+    }
+
+    if (ok && hidden_rows) memcpy(hidden_rows, x, h_rows * sizeof(float));
+    if (ok && want_logits) {
+        ok = glm_lm_head_metal_batch_logits(m, x, (const float *)tensor_data(m, c->t_onorm),
+                                            c->t_out, c->vocab, shape, n_tok,
+                                            logits_rows, head_norm,
+                                            c->chunk_w, batch_chunk_logits,
+                                            c->chunk_rows);
+        if (ok) memcpy(c->xn, head_norm + (size_t)(n_tok - 1u) * H, (size_t)H * sizeof(float));
+    }
+    if (ok) memcpy(c->x, x + (size_t)(n_tok - 1u) * H, (size_t)H * sizeof(float));
+
+    free(batch_chunk_logits); free(head_norm); free(bact); free(bu); free(bg);
+    free(route_w); free(route_idx); free(router_logits); free(battn); free(bQ);
+    free(bkr_r); free(bkr_raw); free(bqr_r); free(bqr); free(bv); free(bk);
+    free(bkvln); free(bkv_lat); free(bkva); free(bq); free(bqa_n); free(bqa);
+    free(ffn_out); free(mla_out); free(res); free(xn); free(x);
+    return ok;
+}
+
 /* One-shot Metal forward over a fixed prompt: prefill [0..n_tokens-1], compute
  * logits at the last position.  Thin wrapper over the persistent ctx so the
  * validated single-shot Metal oracle (ds4_glm_metal_forward_synth) shares the
@@ -31197,6 +31429,87 @@ int ds4_glm_spec_metal_target_synth(int n_steps, int *out_full,
     if (out_partial) *out_partial = cases[1].ok;
     if (out_miss) *out_miss = cases[2].ok;
     return all_ok ? 0 : 1;
+#endif
+}
+
+int ds4_glm_metal_target_batch_synth(int *out_match, float *out_hidden_max,
+                                      float *out_logits_max) {
+#ifdef DS4_NO_GPU
+    if (out_match) *out_match = 0;
+    if (out_hidden_max) *out_hidden_max = 1.0e30f;
+    if (out_logits_max) *out_logits_max = 1.0e30f;
+    return 1;
+#else
+    glm_synth_ctx sc;
+    glm_synth_build(&sc);
+    const int prompt[3] = { 1, 5, 9 };
+    const uint32_t plen = 3;
+    const int chain[3] = { 4, 7, 11 };
+    const uint32_t n_batch = 3;
+    const uint32_t cap = plen + n_batch + 2;
+    float *seq_logits = xmalloc((size_t)n_batch * sc.vocab * sizeof(float));
+    float *bat_logits = xmalloc((size_t)n_batch * sc.vocab * sizeof(float));
+    float *seq_hidden = xmalloc((size_t)n_batch * sc.shape.hidden * sizeof(float));
+    float *bat_hidden = xmalloc((size_t)n_batch * sc.shape.hidden * sizeof(float));
+    float *seq_cont_logits = xmalloc((size_t)sc.vocab * sizeof(float));
+    float *bat_cont_logits = xmalloc((size_t)sc.vocab * sizeof(float));
+    glm_metal_fwd_ctx seq, bat;
+    memset(&seq, 0, sizeof(seq));
+    memset(&bat, 0, sizeof(bat));
+    bool ok = glm_metal_fwd_init(&seq, &sc.model, &sc.shape, sc.n_layer,
+                                 sc.n_dense, cap);
+    if (ok) ok = glm_metal_fwd_init(&bat, &sc.model, &sc.shape, sc.n_layer,
+                                    sc.n_dense, cap);
+    float *tmp_logits = xmalloc((size_t)sc.vocab * sizeof(float));
+    for (uint32_t t = 0; ok && t < plen; t++) {
+        ok = glm_metal_fwd_step(&seq, prompt[t], t, false, NULL) &&
+             glm_metal_fwd_step(&bat, prompt[t], t, false, NULL);
+    }
+    for (uint32_t r = 0; ok && r < n_batch; r++) {
+        ok = glm_metal_fwd_step(&seq, chain[r], plen + r, true, tmp_logits);
+        if (ok) {
+            memcpy(seq_hidden + (size_t)r * sc.shape.hidden, seq.x,
+                   (size_t)sc.shape.hidden * sizeof(float));
+            memcpy(seq_logits + (size_t)r * sc.vocab, tmp_logits,
+                   (size_t)sc.vocab * sizeof(float));
+        }
+    }
+    if (ok) ok = glm_metal_fwd_batch_f32(&bat, chain, plen, n_batch, true,
+                                         bat_logits, bat_hidden);
+    if (ok) ok = glm_metal_fwd_step(&seq, 13, plen + n_batch, true, seq_cont_logits) &&
+                 glm_metal_fwd_step(&bat, 13, plen + n_batch, true, bat_cont_logits);
+    const float hdiff = ok ? max_abs_diff(seq_hidden, bat_hidden,
+                                          (uint64_t)n_batch * sc.shape.hidden) : 1.0e30f;
+    const float ldiff = ok ? max_abs_diff(seq_logits, bat_logits,
+                                          (uint64_t)n_batch * sc.vocab) : 1.0e30f;
+    const float cdiff = ok ? max_abs_diff(seq_cont_logits, bat_cont_logits,
+                                          sc.vocab) : 1.0e30f;
+    bool top_ok = ok;
+    for (uint32_t r = 0; top_ok && r < n_batch; r++) {
+        const int st = sample_argmax(seq_logits + (size_t)r * sc.vocab, sc.vocab);
+        const int bt = sample_argmax(bat_logits + (size_t)r * sc.vocab, sc.vocab);
+        if (st != bt) top_ok = false;
+    }
+    if (top_ok) {
+        const int st = sample_argmax(seq_cont_logits, sc.vocab);
+        const int bt = sample_argmax(bat_cont_logits, sc.vocab);
+        if (st != bt) top_ok = false;
+    }
+    const bool pass = ok && top_ok && hdiff < 2e-5f && ldiff < 2e-5f && cdiff < 2e-5f;
+    fprintf(stderr,
+            "  glm-metal-target-batch-synth: %s (rows=%u hidden_max=%g logits_max=%g cont_logits_max=%g top_match=%s)\n",
+            pass ? "PASS" : "FAIL", n_batch, (double)hdiff, (double)ldiff,
+            (double)cdiff, top_ok ? "yes" : "no");
+    if (out_match) *out_match = pass ? 1 : 0;
+    if (out_hidden_max) *out_hidden_max = hdiff;
+    if (out_logits_max) *out_logits_max = ldiff;
+    free(tmp_logits);
+    if (bat.m) glm_metal_fwd_free(&bat);
+    if (seq.m) glm_metal_fwd_free(&seq);
+    free(bat_cont_logits); free(seq_cont_logits);
+    free(bat_hidden); free(seq_hidden); free(bat_logits); free(seq_logits);
+    glm_synth_free(&sc);
+    return pass ? 0 : 1;
 #endif
 }
 
