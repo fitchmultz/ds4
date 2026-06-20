@@ -382,8 +382,9 @@ The core GLM port is complete and verified. The active work is usability/speed:
   The stronger path is `DS4_GLM_MLA_DIRECT_OUT_QK=1`: benchmark-only Q5_K/Q6_K
   direct Metal kernels measured `blk.0.attn_output` `0.0060s`/call and `blk.8`
   `0.0065s`/call versus cached F32 `~0.030s`, with max abs versus F32 of
-  `2.2e-6` / `8.5e-6`. Wired into live fast contexts for `attn_output` only,
-  it preserves `asdfqwer -n 5` ids/stdout and improves no-profile decode
+  `2.2e-6` / `8.5e-6`. It is now default inside `DS4_GLM_FAST=1` live contexts
+  for `attn_output` only, with opt-out `DS4_GLM_MLA_DIRECT_OUT_QK=0/off`.
+  It preserves `asdfqwer -n 5` ids/stdout and improves no-profile decode
   `40.61s -> 29.30s`; profiled `-n 3` improves decode `20.33s -> 15.00s`
   and MLA avg/call `0.0514s -> 0.0322s`. Direct QK supersedes the host-F32
   `attn_output` cache when both env flags are set. `./ds4_test --glm-qk-direct`

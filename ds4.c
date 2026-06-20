@@ -29203,7 +29203,10 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
             }
         }
         c->fast = ok;
-        c->direct_out_qk = ok && predequant_shared_experts && glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_OUT_QK");
+        if (ok && predequant_shared_experts) {
+            const char *dqk = getenv("DS4_GLM_MLA_DIRECT_OUT_QK");
+            c->direct_out_qk = dqk ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_OUT_QK") : true;
+        }
         if (ok) {
             const bool shexp_resident = predequant_shared_experts &&
                                         getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
@@ -29250,7 +29253,7 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
                             now_sec() - shp_t0);
             }
             if (c->direct_out_qk && glm_env_flag_enabled("DS4_GLM_MLA_CACHE_OUT_F32")) {
-                fprintf(stderr, "ds4: glm-fast: DS4_GLM_MLA_DIRECT_OUT_QK=1 supersedes DS4_GLM_MLA_CACHE_OUT_F32=1\n");
+                fprintf(stderr, "ds4: glm-fast: direct attn_output QK supersedes DS4_GLM_MLA_CACHE_OUT_F32=1\n");
             } else if (predequant_shared_experts && glm_env_flag_enabled("DS4_GLM_MLA_CACHE_OUT_F32")) {
                 if (getenv("DS4_GLM_EXPERT_CACHE_PRESET") ||
                     getenv("DS4_GLM_EXPERT_CACHE_MIB") ||
