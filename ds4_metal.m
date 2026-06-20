@@ -27177,6 +27177,75 @@ int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
     }
 }
 
+static int ds4_gpu_glm_expert_pread_enabled(void) {
+    const char *e = getenv("DS4_GLM_EXPERT_PREAD");
+    return e && atoi(e) == 1;
+}
+
+static int ds4_gpu_glm_stage_selected_slabs(
+        ds4_gpu_tensor *dst,
+        const void *map,
+        int fd,
+        uint64_t map_size,
+        uint64_t base_off,
+        uint64_t tensor_bytes,
+        uint64_t slot_bytes,
+        uint32_t n_total_expert,
+        const int32_t *selected_ids,
+        uint32_t K,
+        const char *label) {
+    if (!dst || !map || !selected_ids || slot_bytes == 0 || n_total_expert == 0)
+        return 0;
+    if ((uint64_t)n_total_expert * slot_bytes != tensor_bytes) return 0;
+    const int use_pread = ds4_gpu_glm_expert_pread_enabled() && fd >= 0;
+    char *pread_buf = NULL;
+    if (use_pread) {
+        pread_buf = (char *)malloc((size_t)slot_bytes);
+        if (!pread_buf) return 0;
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "ds4: glm-fast: selected expert staging uses pread (DS4_GLM_EXPERT_PREAD=1)\n");
+            warned = 1;
+        }
+    }
+    int ok = 1;
+    for (uint32_t k = 0; k < K && ok; k++) {
+        const uint64_t e = (uint64_t)(uint32_t)selected_ids[k];
+        const uint64_t rel = e * slot_bytes;
+        if (e >= n_total_expert ||
+            rel > tensor_bytes - slot_bytes ||
+            base_off > map_size ||
+            rel > map_size - base_off ||
+            slot_bytes > map_size - base_off - rel) {
+            ok = 0;
+            break;
+        }
+        const uint64_t dst_off = (uint64_t)k * slot_bytes;
+        if (use_pread) {
+            const uint64_t off = base_off + rel;
+            size_t done = 0;
+            while (done < slot_bytes) {
+                const size_t want = (size_t)(slot_bytes - done);
+                const ssize_t got = pread(fd, pread_buf + done, want, (off_t)(off + done));
+                if (got <= 0) {
+                    fprintf(stderr, "ds4: glm-fast: pread failed while staging %s expert %llu: %s\n",
+                            label ? label : "selected", (unsigned long long)e,
+                            got == 0 ? "short read" : strerror(errno));
+                    ok = 0;
+                    break;
+                }
+                done += (size_t)got;
+            }
+            if (ok) ds4_gpu_tensor_write(dst, dst_off, pread_buf, slot_bytes);
+        } else {
+            const char *src = (const char *)map + base_off + rel;
+            ds4_gpu_tensor_write(dst, dst_off, src, slot_bytes);
+        }
+    }
+    free(pread_buf);
+    return ok;
+}
+
 /* GLM top-K MoE fused gate/up via the existing IQ2_XXS pair+SwiGLU kernel.
  * See ds4_gpu.h for the contract.  This is a thin host wrapper: it wraps the
  * two IQ2_XXS expert tensor bases through the registered model view (weights
@@ -27186,9 +27255,9 @@ int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
  * The down projection (no fused IQ3_XXS/IQ4_XS kernel) stays on the caller's
  * F32 fallback. */
 int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
-        const void    *gate_map, uint64_t gate_map_size,
+        const void    *gate_map, int gate_fd, uint64_t gate_map_size,
         uint64_t gate_base_off, uint64_t gate_tensor_bytes,
-        const void    *up_map, uint64_t up_map_size,
+        const void    *up_map, int up_fd, uint64_t up_map_size,
         uint64_t up_base_off, uint64_t up_tensor_bytes,
         uint64_t expert_stride, uint32_t n_total_expert,
         const float   *x,
@@ -27221,31 +27290,18 @@ int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
          * selection order). */
         const uint64_t slot_bytes = expert_stride;
         const uint64_t stage_bytes = (uint64_t)K * slot_bytes;
-        const char *gate_base = (const char *)gate_map + gate_base_off;
-        const char *up_base   = (const char *)up_map   + up_base_off;
         ds4_gpu_tensor *tgate = ds4_gpu_tensor_alloc(stage_bytes);
         ds4_gpu_tensor *tup   = ds4_gpu_tensor_alloc(stage_bytes);
         if (!tgate || !tup) {
             ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
             return 0;
         }
-        int range_ok = 1;
-        for (uint32_t k = 0; k < K && range_ok; k++) {
-            const uint64_t e = (uint64_t)(uint32_t)selected_ids[k];
-            if (e >= n_total_expert ||
-                e * slot_bytes > gate_tensor_bytes - slot_bytes ||
-                e * slot_bytes > up_tensor_bytes - slot_bytes ||
-                gate_base_off + e * slot_bytes > gate_map_size - slot_bytes ||
-                up_base_off   + e * slot_bytes > up_map_size   - slot_bytes) {
-                range_ok = 0;
-                break;
-            }
-            ds4_gpu_tensor_write(tgate, (uint64_t)k * slot_bytes,
-                                 gate_base + e * slot_bytes, slot_bytes);
-            ds4_gpu_tensor_write(tup, (uint64_t)k * slot_bytes,
-                                 up_base + e * slot_bytes, slot_bytes);
-        }
-        if (!range_ok) {
+        if (!ds4_gpu_glm_stage_selected_slabs(tgate, gate_map, gate_fd,
+                    gate_map_size, gate_base_off, gate_tensor_bytes,
+                    slot_bytes, n_total_expert, selected_ids, K, "gate") ||
+            !ds4_gpu_glm_stage_selected_slabs(tup, up_map, up_fd,
+                    up_map_size, up_base_off, up_tensor_bytes,
+                    slot_bytes, n_total_expert, selected_ids, K, "up")) {
             ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup);
             return 0;
         }
@@ -27351,7 +27407,7 @@ struct ds4_gpu_glm_moe_down_args {
 static int ds4_gpu_glm_moe_down_fused_impl(
         id<MTLComputePipelineState> pipe,
         uint32_t block_bytes,
-        const void    *down_map, uint64_t down_map_size,
+        const void    *down_map, int down_fd, uint64_t down_map_size,
         uint64_t down_base_off, uint64_t down_tensor_bytes,
         uint64_t expert_stride, uint32_t n_total_expert,
         const int32_t *selected_ids,
@@ -27373,22 +27429,14 @@ static int ds4_gpu_glm_moe_down_fused_impl(
     @autoreleasepool {
         const uint64_t slot_bytes = expert_stride;
         const uint64_t stage_bytes = (uint64_t)K * slot_bytes;
-        const char *down_base = (const char *)down_map + down_base_off;
         ds4_gpu_tensor *tdown = ds4_gpu_tensor_alloc(stage_bytes);
         if (!tdown) return 0;
-        int range_ok = 1;
-        for (uint32_t k = 0; k < K && range_ok; k++) {
-            const uint64_t e = (uint64_t)(uint32_t)selected_ids[k];
-            if (e >= n_total_expert ||
-                e * slot_bytes > down_tensor_bytes - slot_bytes ||
-                down_base_off + e * slot_bytes > down_map_size - slot_bytes) {
-                range_ok = 0;
-                break;
-            }
-            ds4_gpu_tensor_write(tdown, (uint64_t)k * slot_bytes,
-                                 down_base + e * slot_bytes, slot_bytes);
+        if (!ds4_gpu_glm_stage_selected_slabs(tdown, down_map, down_fd,
+                    down_map_size, down_base_off, down_tensor_bytes,
+                    slot_bytes, n_total_expert, selected_ids, K, "down")) {
+            ds4_gpu_tensor_free(tdown);
+            return 0;
         }
-        if (!range_ok) { ds4_gpu_tensor_free(tdown); return 0; }
 
         const uint64_t mid_bytes  = (uint64_t)K * inter * sizeof(float);
         const uint64_t out_bytes  = (uint64_t)hidden * sizeof(float);
@@ -27442,7 +27490,7 @@ static int ds4_gpu_glm_moe_down_fused_impl(
 /* GLM top-K MoE FUSED down projection for IQ3_XXS down experts (the common
  * case).  See ds4_gpu.h for the full contract. */
 int ds4_gpu_glm_moe_down_iq3xxs_fused(
-        const void    *down_map, uint64_t down_map_size,
+        const void    *down_map, int down_fd, uint64_t down_map_size,
         uint64_t down_base_off, uint64_t down_tensor_bytes,
         uint64_t expert_stride, uint32_t n_total_expert,
         const int32_t *selected_ids,
@@ -27451,7 +27499,7 @@ int ds4_gpu_glm_moe_down_iq3xxs_fused(
         uint32_t hidden, uint32_t inter, uint32_t K) {
     return ds4_gpu_glm_moe_down_fused_impl(g_glm_moe_down_iq3xxs_pipeline,
             /*block_bytes=*/98u,
-            down_map, down_map_size, down_base_off, down_tensor_bytes,
+            down_map, down_fd, down_map_size, down_base_off, down_tensor_bytes,
             expert_stride, n_total_expert,
             selected_ids, mid, ffn_out, hidden, inter, K);
 }
@@ -27459,7 +27507,7 @@ int ds4_gpu_glm_moe_down_iq3xxs_fused(
 /* GLM top-K MoE FUSED down projection for IQ4_XS down experts (blk.8 +
  * blk.75..77).  See ds4_gpu.h. */
 int ds4_gpu_glm_moe_down_iq4xs_fused(
-        const void    *down_map, uint64_t down_map_size,
+        const void    *down_map, int down_fd, uint64_t down_map_size,
         uint64_t down_base_off, uint64_t down_tensor_bytes,
         uint64_t expert_stride, uint32_t n_total_expert,
         const int32_t *selected_ids,
@@ -27468,7 +27516,7 @@ int ds4_gpu_glm_moe_down_iq4xs_fused(
         uint32_t hidden, uint32_t inter, uint32_t K) {
     return ds4_gpu_glm_moe_down_fused_impl(g_glm_moe_down_iq4xs_pipeline,
             /*block_bytes=*/136u,
-            down_map, down_map_size, down_base_off, down_tensor_bytes,
+            down_map, down_fd, down_map_size, down_base_off, down_tensor_bytes,
             expert_stride, n_total_expert,
             selected_ids, mid, ffn_out, hidden, inter, K);
 }

@@ -1087,15 +1087,17 @@ int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
  * gate/up expert tensors share shape [inter, in_dim] expert-major last dim,
  * each expert slab = expert_stride bytes; the full expert tensor
  * [inter, in_dim, n_total_expert] = expert_stride*n_total_expert bytes.
- * gate_map/up_map may be the same or different GGUF parts.
+ * gate_map/up_map may be the same or different GGUF parts.  When
+ * DS4_GLM_EXPERT_PREAD=1 and the supplied part fds are valid, staging reads the
+ * selected slabs via pread from SSD instead of faulting them through mmap.
  *
  * The DOWN projection (IQ3_XXS/IQ4_XS, no fused kernel) stays on the caller's
  * F32 fallback: for each k, dequant down_e and dot against mid+k*inter.
  * Returns 1 on success.  Behind DS4_GLM_FAST=1 (Step 4). */
 int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
-        const void    *gate_map, uint64_t gate_map_size,
+        const void    *gate_map, int gate_fd, uint64_t gate_map_size,
         uint64_t gate_base_off, uint64_t gate_tensor_bytes,
-        const void    *up_map,   uint64_t up_map_size,
+        const void    *up_map,   int up_fd,   uint64_t up_map_size,
         uint64_t up_base_off,   uint64_t up_tensor_bytes,
         uint64_t expert_stride, uint32_t n_total_expert,
         const float   *x,             /* [in_dim]  F32 activation */
@@ -1114,7 +1116,8 @@ int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
  * `mid` is the route-WEIGHTED SwiGLU mid from the fused gate/up path
  * (ds4_gpu_glm_moe_gate_up_iq2xxs_fused), so the K dots are accumulated
  * UNWEIGHTED.  The K selected experts' quantized down slabs are STAGED (CPU
- * memcpy, no dequant) into a hot shared GPU buffer, then one fused dispatch
+ * memcpy or DS4_GLM_EXPERT_PREAD=1 pread, no dequant) into a hot shared GPU
+ * buffer, then one fused dispatch
  * dequants ON the GPU (IQ3_XXS or IQ4_XS) and sums the K dots -- replacing
  * the F32 fallback's per-expert CPU dequant + F32 upload + F32 matvec.
  *
@@ -1124,7 +1127,7 @@ int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
  * layers; iq4xs covers blk.8 + blk.75..77.  Returns 1 on success.
  * Behind DS4_GLM_FAST=1 (Step 6). */
 int ds4_gpu_glm_moe_down_iq3xxs_fused(
-        const void    *down_map, uint64_t down_map_size,
+        const void    *down_map, int down_fd, uint64_t down_map_size,
         uint64_t down_base_off, uint64_t down_tensor_bytes,
         uint64_t expert_stride, uint32_t n_total_expert,
         const int32_t *selected_ids,  /* [K]       expert ids            */
@@ -1133,7 +1136,7 @@ int ds4_gpu_glm_moe_down_iq3xxs_fused(
         uint32_t hidden, uint32_t inter, uint32_t K);
 
 int ds4_gpu_glm_moe_down_iq4xs_fused(
-        const void    *down_map, uint64_t down_map_size,
+        const void    *down_map, int down_fd, uint64_t down_map_size,
         uint64_t down_base_off, uint64_t down_tensor_bytes,
         uint64_t expert_stride, uint32_t n_total_expert,
         const int32_t *selected_ids,  /* [K]       expert ids            */

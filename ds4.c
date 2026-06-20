@@ -28432,10 +28432,10 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
             if (moe_fast) {
                 const double gu0 = moe_prof ? now_sec() : 0.0;
                 if (!ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
-                        m->parts[ge->part].map, m->parts[ge->part].size,
-                        ge->abs_offset, ge->bytes,
-                        m->parts[ue->part].map, m->parts[ue->part].size,
-                        ue->abs_offset, ue->bytes,
+                        m->parts[ge->part].map, m->parts[ge->part].fd,
+                        m->parts[ge->part].size, ge->abs_offset, ge->bytes,
+                        m->parts[ue->part].map, m->parts[ue->part].fd,
+                        m->parts[ue->part].size, ue->abs_offset, ue->bytes,
                         pe_gate, (uint32_t)ge->dim[2],
                         xn, c->idx, c->w, c->moe_mid, H, ei, K))
                     return false;
@@ -28451,13 +28451,13 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
                 const int df_ok =
                     (down_fast_type == GLM_DOWN_TYPE_IQ3_XXS)
                       ? ds4_gpu_glm_moe_down_iq3xxs_fused(
-                            m->parts[de->part].map, m->parts[de->part].size,
-                            de->abs_offset, de->bytes, pe_down,
+                            m->parts[de->part].map, m->parts[de->part].fd,
+                            m->parts[de->part].size, de->abs_offset, de->bytes, pe_down,
                             (uint32_t)de->dim[2], c->idx, c->moe_mid,
                             ffn_out, H, ei, K)
                       : ds4_gpu_glm_moe_down_iq4xs_fused(
-                            m->parts[de->part].map, m->parts[de->part].size,
-                            de->abs_offset, de->bytes, pe_down,
+                            m->parts[de->part].map, m->parts[de->part].fd,
+                            m->parts[de->part].size, de->abs_offset, de->bytes, pe_down,
                             (uint32_t)de->dim[2], c->idx, c->moe_mid,
                             ffn_out, H, ei, K);
                 if (!df_ok) return false;
