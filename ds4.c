@@ -29002,6 +29002,11 @@ typedef struct {
     uint32_t  H, nh, kvl, nope, rope, vd, qhd, E, K;
     /* MLA weight scratch (dequanted per layer, reused). */
     float *WqA, *WqB, *WkvA, *WkBn, *WkB, *WvB, *Wo;
+    /* Opt-in host-F32 attn_output cache. Large (~29.25 GiB real model), so
+     * never default; used to prove whether skipping K-quant dequant is worth
+     * wiring a leaner projection path. */
+    float **Wo_cache;
+    uint64_t Wo_cache_bytes;
     /* FFN scratch. */
     float *fgate, *fup, *fdown, *sg, *su;
     /* Activation + residual stream. */
@@ -29222,10 +29227,43 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
                             (double)sh_total_bytes / (1024.0*1024.0*1024.0),
                             now_sec() - shp_t0);
             }
-            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s "
+            if (predequant_shared_experts && glm_env_flag_enabled("DS4_GLM_MLA_CACHE_OUT_F32")) {
+                if (getenv("DS4_GLM_EXPERT_CACHE_PRESET") ||
+                    getenv("DS4_GLM_EXPERT_CACHE_MIB") ||
+                    getenv("DS4_GLM_EXPERT_CACHE_GIB")) {
+                    fprintf(stderr, "ds4: glm-fast: warning: MLA attn_output F32 cache competes with routed expert cache memory\n");
+                }
+                const size_t wo_bytes = (size_t)H * nh * vd * sizeof(float);
+                c->Wo_cache = xcalloc(n_layer, sizeof(float *));
+                const double wo_t0 = now_sec();
+                for (uint32_t il = 0; il < n_layer; il++) {
+                    const ds4_tensor *wop = glm_layer_tensor(m, il, "attn_output");
+                    if (!wop || wop->elements != (uint64_t)H * nh * vd) { ok = false; break; }
+                    c->Wo_cache[il] = malloc(wo_bytes);
+                    if (!c->Wo_cache[il]) { ok = false; break; }
+                    glm_dequant_weight(m, wop, c->Wo_cache[il]);
+                    c->Wo_cache_bytes += wo_bytes;
+                }
+                if (!ok) {
+                    fprintf(stderr, "ds4: glm-fast: MLA attn_output F32 cache failed; continuing without it\n");
+                    if (c->Wo_cache) {
+                        for (uint32_t il = 0; il < n_layer; il++) free(c->Wo_cache[il]);
+                        free(c->Wo_cache);
+                    }
+                    c->Wo_cache = NULL;
+                    c->Wo_cache_bytes = 0;
+                    ok = true;
+                } else {
+                    fprintf(stderr, "ds4: glm-fast: cached MLA attn_output to %.2f GiB host F32 in %.1fs (DS4_GLM_MLA_CACHE_OUT_F32=1)\n",
+                            (double)c->Wo_cache_bytes / (1024.0*1024.0*1024.0),
+                            now_sec() - wo_t0);
+                }
+            }
+            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s%s "
                                 "+ IQ3_XXS/IQ4_XS MoE down paths enabled (DS4_GLM_FAST=1; "
                                 "MLA stays F32 oracle on UD-IQ2_M)\n",
-                    shexp_resident ? " + resident shared-expert" : "");
+                    shexp_resident ? " + resident shared-expert" : "",
+                    c->Wo_cache ? " + attn_output F32 cache" : "");
         }
     }
     return true;
@@ -29255,6 +29293,7 @@ static bool glm_metal_fwd_borrow_shared_experts(glm_metal_fwd_ctx *dst,
 static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
     for (uint32_t l = 0; l < c->n_layer; l++) { free(c->Knope[l]); free(c->Vc[l]); free(c->Krop[l]); }
     free(c->Knope); free(c->Vc); free(c->Krop);
+    if (c->Wo_cache) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->Wo_cache[l]); free(c->Wo_cache); }
     free(c->WqA); free(c->WqB); free(c->WkvA); free(c->WkBn); free(c->WkB); free(c->WvB); free(c->Wo);
     free(c->fgate); free(c->fup); free(c->fdown); free(c->sg); free(c->su);
     free(c->x); free(c->xn); free(c->res); free(c->mla_out); free(c->ffn_out); free(c->etmp);
@@ -29393,12 +29432,14 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
         const bool mla_detail = getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL;
         double mla_detail_t0 = mla_detail ? now_sec() : 0.0;
         glm_dequant_weight(m, k_b, c->WkBn);
+        const float *Wo_use = c->Wo;
         if (!fast_l) {
             glm_dequant_weight(m, q_a, c->WqA);
             glm_dequant_weight(m, q_b, c->WqB);
             glm_dequant_weight(m, kv_a, c->WkvA);
             glm_dequant_weight(m, v_b, c->WvB);
-            glm_dequant_weight(m, wop, c->Wo);
+            if (c->Wo_cache && c->Wo_cache[il]) Wo_use = c->Wo_cache[il];
+            else glm_dequant_weight(m, wop, c->Wo);
         }
         if (mla_detail) {
             c->mla_dequant_s += now_sec() - mla_detail_t0;
@@ -29411,7 +29452,7 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
         const bool mla_time = getenv("DS4_GLM_MLA_TIME") != NULL;
         const double mla_t0 = (mla_time || dec_prof) ? now_sec() : 0.0;
         if (!glm_mla_forward_token_metal(xn, m, il, fast_l,
-                                         c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, c->Wo,
+                                         c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, Wo_use,
                                          qa_norm, kv_norm,
                                          c->Knope[il], c->Vc[il], c->Krop[il],
                                          c->seq_n, pos, shape, mla_out,

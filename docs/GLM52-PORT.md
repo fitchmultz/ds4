@@ -373,8 +373,12 @@ The core GLM port is complete and verified. The active work is usability/speed:
   real projection tensors before any decode integration: on `blk.0.attn_output`
   (Q5_K, `6144x16384`), 5 warmed iterations measured current dequant+F32 helper
   `0.0536s`/call versus cached-host-F32 helper `0.0294s`/call; on Q6_K `blk.8`
-  it measured `0.0737s` versus `0.0296s`. A full host-F32 `attn_output` cache
-  would cost ~29.25 GiB, so it is an opt-in/benchmark candidate, not a default.
+  it measured `0.0737s` versus `0.0296s`. `DS4_GLM_MLA_CACHE_OUT_F32=1` now
+  tests that cache in live fast contexts only: it pre-dequants all backbone
+  `attn_output` tensors to ~29.25 GiB host F32, does not touch scratch verifier
+  contexts, and is intentionally not default because it competes with routed
+  expert-cache memory. On `asdfqwer -n 5` it preserved ids/stdout and improved
+  no-profile decode `41.32s -> 36.51s` while adding ~2.1s startup cache build.
   A fair no-profile run on the same prompt
   measured plain greedy `DS4_GLM_FAST=1 --glm-raw -n 3` at decode `21.21s` and
   opt-in `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1
