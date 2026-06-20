@@ -29027,12 +29027,14 @@ typedef struct {
      * cost.  Reused via the unchanged glm_swiglu_metal (same F32 kernel as the
      * oracle), so the result is byte-identical to the F32 path. */
     float **sh_g, **sh_u, **sh_d;
+    bool sh_borrowed;
 } glm_metal_fwd_ctx;
 
-static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
-                               const glm_cpu_shape *shape,
-                               uint32_t n_layer, uint32_t n_dense,
-                               uint32_t seq_n) {
+static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
+                                  const glm_cpu_shape *shape,
+                                  uint32_t n_layer, uint32_t n_dense,
+                                  uint32_t seq_n,
+                                  bool predequant_shared_experts) {
     memset(c, 0, sizeof(*c));
     c->m = m; c->shape = shape; c->n_layer = n_layer; c->n_dense = n_dense;
     c->seq_n = seq_n;
@@ -29128,7 +29130,8 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
         }
         c->fast = ok;
         if (ok) {
-            const bool shexp_resident = getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
+            const bool shexp_resident = predequant_shared_experts &&
+                                        getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
             if (shexp_resident) {
                 /* Step 5: pre-dequant every MoE layer's shared-expert gate/up/down
                  * to resident F32 ONCE, so the per-token decode skips the K-quant
@@ -29180,6 +29183,27 @@ static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
     return true;
 }
 
+static bool glm_metal_fwd_init(glm_metal_fwd_ctx *c, const ds4_model *m,
+                               const glm_cpu_shape *shape,
+                               uint32_t n_layer, uint32_t n_dense,
+                               uint32_t seq_n) {
+    return glm_metal_fwd_init_ex(c, m, shape, n_layer, n_dense, seq_n, true);
+}
+
+static bool glm_metal_fwd_borrow_shared_experts(glm_metal_fwd_ctx *dst,
+                                                const glm_metal_fwd_ctx *src) {
+    if (!dst || !src || dst->n_layer != src->n_layer ||
+        !src->sh_g || !src->sh_u || !src->sh_d) {
+        return false;
+    }
+    if (dst->sh_g || dst->sh_u || dst->sh_d) return false;
+    dst->sh_g = src->sh_g;
+    dst->sh_u = src->sh_u;
+    dst->sh_d = src->sh_d;
+    dst->sh_borrowed = true;
+    return true;
+}
+
 static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
     for (uint32_t l = 0; l < c->n_layer; l++) { free(c->Knope[l]); free(c->Vc[l]); free(c->Krop[l]); }
     free(c->Knope); free(c->Vc); free(c->Krop);
@@ -29191,9 +29215,11 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
     free(c->router_gate); free(c->moe_logits); free(c->idx); free(c->w);
     free(c->moe_mid);
     free(c->down_ref);
-    if (c->sh_g) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_g[l]); free(c->sh_g); }
-    if (c->sh_u) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_u[l]); free(c->sh_u); }
-    if (c->sh_d) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_d[l]); free(c->sh_d); }
+    if (!c->sh_borrowed) {
+        if (c->sh_g) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_g[l]); free(c->sh_g); }
+        if (c->sh_u) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_u[l]); free(c->sh_u); }
+        if (c->sh_d) { for (uint32_t l = 0; l < c->n_layer; l++) free(c->sh_d[l]); free(c->sh_d); }
+    }
     free(c->chunk_w); free(c->chunk_logits);
     if (c->mla_calls && getenv("DS4_GLM_MLA_TIME"))
         fprintf(stderr, "ds4: glm-metal MLA-block: %.3fs total, %.6fs avg/call "
@@ -30852,11 +30878,16 @@ static int glm_generate_loop(const char *label,
         bool verify_scratch_ready = false;
         if (step == glm_gen_metal_step) {
             glm_metal_fwd_ctx *live = (glm_metal_fwd_ctx *)ctx;
-            verify_scratch_ready = glm_metal_fwd_init(&verify_scratch,
-                                                      live->m, live->shape,
-                                                      live->n_layer, live->n_dense,
-                                                      live->seq_n);
+            verify_scratch_ready = glm_metal_fwd_init_ex(&verify_scratch,
+                                                         live->m, live->shape,
+                                                         live->n_layer, live->n_dense,
+                                                         live->seq_n,
+                                                         false);
             if (verify_scratch_ready) {
+                if (glm_metal_fwd_borrow_shared_experts(&verify_scratch, live)) {
+                    fprintf(stderr, "ds4: %s: nextn verifier scratch borrows resident shared expert\n",
+                            label ? label : "glm-generate");
+                }
                 verify_pair.live = live;
                 verify_pair.scratch = &verify_scratch;
                 verify_pair.batch_f32 = glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_F32");
