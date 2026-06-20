@@ -27715,7 +27715,13 @@ static void ds4_gpu_glm_expert_cache_clear(void) {
 }
 
 static int ds4_gpu_glm_expert_pread_enabled(void) {
-    return ds4_gpu_env_bool("DS4_GLM_EXPERT_PREAD") > 0;
+    const int env = ds4_gpu_env_bool("DS4_GLM_EXPERT_PREAD");
+    /* GLM routed-expert staging is reached only from the explicit
+     * DS4_GLM_FAST path.  Use explicit pread by default there so selected
+     * expert slabs are read through the part fd instead of faulting sparse mmap
+     * pages.  Keep DS4_GLM_EXPERT_PREAD=0/off as the A/B and compatibility
+     * opt-out. */
+    return env == 0 ? 0 : 1;
 }
 
 static int ds4_gpu_glm_stage_selected_slabs(
@@ -27743,7 +27749,7 @@ static int ds4_gpu_glm_stage_selected_slabs(
     if (use_pread) {
         static int warned = 0;
         if (!warned) {
-            fprintf(stderr, "ds4: glm-fast: selected expert staging uses pread (DS4_GLM_EXPERT_PREAD enabled)\n");
+            fprintf(stderr, "ds4: glm-fast: selected expert staging uses pread (default; set DS4_GLM_EXPERT_PREAD=0 to disable)\n");
             warned = 1;
         }
     }

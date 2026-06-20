@@ -1111,9 +1111,10 @@ int ds4_gpu_glm_swiglu_f32(const float * gate_x, const float * up_x,
  * gate/up expert tensors share shape [inter, in_dim] expert-major last dim,
  * each expert slab = expert_stride bytes; the full expert tensor
  * [inter, in_dim, n_total_expert] = expert_stride*n_total_expert bytes.
- * gate_map/up_map may be the same or different GGUF parts.  When
- * DS4_GLM_EXPERT_PREAD=1 and the supplied part fds are valid, staging reads the
- * selected slabs via pread from SSD instead of faulting them through mmap.
+ * gate_map/up_map may be the same or different GGUF parts.  With DS4_GLM_FAST,
+ * staging reads selected slabs via pread from valid part fds by default instead
+ * of faulting them through mmap; DS4_GLM_EXPERT_PREAD=0/off restores the mmap
+ * A/B path.
  *
  * The DOWN projection (IQ3_XXS/IQ4_XS, no fused kernel) stays on the caller's
  * F32 fallback: for each k, dequant down_e and dot against mid+k*inter.
@@ -1140,9 +1141,9 @@ int ds4_gpu_glm_moe_gate_up_iq2xxs_fused(
  * `mid` is the route-WEIGHTED SwiGLU mid from the fused gate/up path
  * (ds4_gpu_glm_moe_gate_up_iq2xxs_fused), so the K dots are accumulated
  * UNWEIGHTED.  The K selected experts' quantized down slabs are STAGED (CPU
- * memcpy or DS4_GLM_EXPERT_PREAD=1 pread, no dequant) into a hot shared GPU
- * buffer, then one fused dispatch
- * dequants ON the GPU (IQ3_XXS or IQ4_XS) and sums the K dots -- replacing
+ * memcpy or default-on GLM pread, no dequant) into a hot shared GPU buffer;
+ * DS4_GLM_EXPERT_PREAD=0/off restores the mmap A/B path. One fused dispatch
+ * then dequants ON the GPU (IQ3_XXS or IQ4_XS) and sums the K dots -- replacing
  * the F32 fallback's per-expert CPU dequant + F32 upload + F32 matvec.
  *
  * Down expert tensor native layout is [inter, hidden, expert] (inter

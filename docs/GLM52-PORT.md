@@ -2,9 +2,9 @@
 
 Status: **CORE PORT COMPLETE & WORKING; FAST PATH IN PROGRESS.** GLM-5.2 runs locally: load + glm4 tokenize + oracle-correct forward (CPU & Metal, logit-corr 0.9993 vs llama.cpp) + coherent multi-token chat generation (`--glm-chat`/`--glm-chat-cpu`), matching llama.cpp greedy token-for-token (11/12 on 'Say hello.' -> 'Hello! How can I help you today?'). The 238 GiB UD_IQ2_M model runs in bounded RAM on this 128 GiB Mac via mmap/on-demand streaming plus resident fast-path caches.
 
-VERIFIED DONE: P0 scaffolding; P1 loader/split-GGUF/metadata/tensor-inventory (1809/1809); P2 glm4 BPE+chat (oracle); P3 SSD cache-plan (8359 experts); P4b all 10 quant dequant types bit-exact vs llama.cpp, including blk.78 NextN-only Q2_K/Q3_K and the IQ2_S full-tensor bugfix; P4a/P4a-full CPU forward (oracle-validated); P4c-i/ii Metal kernels (40/40, including GLM F32 batch matmul/RMSNorm/RoPE/attention/MoE-router, layer-major MLA, dense-FFN, and F32 routed-MoE batch composites); P4c-iv Metal forward (corr 1.0 vs CPU); P4e incremental-KV chat generation; routed MoE fast path (IQ2_XXS gate/up + IQ3_XXS/IQ4_XS down + resident shared expert) with decode improving from ~27s/token to ~9–12s/token on warm runs; env-gated selected-expert SSD pread staging (`DS4_GLM_EXPERT_PREAD=1/on/true/yes`) validated on the real model; CLI GLM generation skips the unnecessary post-final-token target forward, so one-token raw completions return after prefill while preserving emitted tokens. DeepSeek path byte-identical at every commit; full ds4_test green.
+VERIFIED DONE: P0 scaffolding; P1 loader/split-GGUF/metadata/tensor-inventory (1809/1809); P2 glm4 BPE+chat (oracle); P3 SSD cache-plan (8359 experts); P4b all 10 quant dequant types bit-exact vs llama.cpp, including blk.78 NextN-only Q2_K/Q3_K and the IQ2_S full-tensor bugfix; P4a/P4a-full CPU forward (oracle-validated); P4c-i/ii Metal kernels (40/40, including GLM F32 batch matmul/RMSNorm/RoPE/attention/MoE-router, layer-major MLA, dense-FFN, and F32 routed-MoE batch composites); P4c-iv Metal forward (corr 1.0 vs CPU); P4e incremental-KV chat generation; routed MoE fast path (IQ2_XXS gate/up + IQ3_XXS/IQ4_XS down + resident shared expert) with decode improving from ~27s/token to ~9–12s/token on warm runs; default-on selected-expert SSD pread staging in `DS4_GLM_FAST` (`DS4_GLM_EXPERT_PREAD=0/off` restores mmap A/B) validated on the real model; CLI GLM generation skips the unnecessary post-final-token target forward, so one-token raw completions return after prefill while preserving emitted tokens. DeepSeek path byte-identical at every commit; full ds4_test green.
 
-REMAINING (usability/speed, not correctness): batched/persistent GLM graph or speculation to avoid one full model pass per token; smarter prefetch/concurrency tuning on top of the explicit selected-expert pread and opt-in LRU slab cache; MLA still uses the F32 materialization path on UD_IQ2_M because q_a/attn_output are Q5_K/Q6_K and tested one-off Q5/Q6/Q8 wrappers were slower; DSA sparse indexer (deferred — dense MLA matches llama.cpp); NextN/MTP blk.78 (loaded, Q2_K/Q3_K dequant covered, post-output-norm target hidden dump exposed by `DS4_GLM_H_NEXTN_OUT`, `nextn.eh_proj` CPU/Metal synth diagnostics, one-token blk.78 decoder diagnostic exposed by `DS4_GLM_NEXTN_H_OUT`/`DS4_GLM_NEXTN_LOGITS_OUT` and validated when fed by either CPU or Metal target hidden, no-model synthetic regressions `--glm-nextn-synth`/`--glm-nextn-metal-synth`, non-mutating one-draft acceptance probe exposed by `DS4_GLM_NEXTN_PROBE=1`, and an OPT-IN default-off correctness-first speculative greedy scaffold exposed by `--glm-nextn`/`--glm-nextn-draft` that is greedy-identical by construction but NOT yet a speed claim — it now uses the Metal NextN drafter by default, but still verifies one target token per emitted token, so batched target verification remains the speed work).
+REMAINING (usability/speed, not correctness): batched/persistent GLM graph or speculation to avoid one full model pass per token; smarter cache sizing/prefetch/concurrency tuning on top of the default selected-expert pread and opt-in LRU slab cache; MLA still uses the F32 materialization path on UD_IQ2_M because q_a/attn_output are Q5_K/Q6_K and tested one-off Q5/Q6/Q8 wrappers were slower; DSA sparse indexer (deferred — dense MLA matches llama.cpp); NextN/MTP blk.78 (loaded, Q2_K/Q3_K dequant covered, post-output-norm target hidden dump exposed by `DS4_GLM_H_NEXTN_OUT`, `nextn.eh_proj` CPU/Metal synth diagnostics, one-token blk.78 decoder diagnostic exposed by `DS4_GLM_NEXTN_H_OUT`/`DS4_GLM_NEXTN_LOGITS_OUT` and validated when fed by either CPU or Metal target hidden, no-model synthetic regressions `--glm-nextn-synth`/`--glm-nextn-metal-synth`, non-mutating one-draft acceptance probe exposed by `DS4_GLM_NEXTN_PROBE=1`, and an OPT-IN default-off correctness-first speculative greedy scaffold exposed by `--glm-nextn`/`--glm-nextn-draft` that is greedy-identical by construction but NOT yet a speed claim — it now uses the Metal NextN drafter by default, but still verifies one target token per emitted token, so batched target verification remains the speed work).
 Target: run GLM-5.2 (`glm-dsa`) on a
 128 GiB RAM Mac with SSD-streamed routed experts, without breaking the existing
 DeepSeek-V4 SSD / CUDA / distributed / default-Metal paths.
@@ -225,9 +225,12 @@ The core GLM port is complete and verified. The active work is usability/speed:
 - Current fastest chat path is `DS4_GLM_FAST=1 --glm-chat`: routed MoE gate/up/down
   fused plus resident shared expert. Warm decode is about **9–12s/token** on the
   128 GiB Mac; short chat prefill is still about one full pass per prompt token.
-- `DS4_GLM_EXPERT_PREAD=1/on/true/yes` switches selected routed-expert staging for the fused
-  GLM MoE path from mmap page faults to explicit `pread` from each split GGUF
-  part fd. It is validated with the real model and keeps the same oracle token.
+- The fused GLM MoE path now uses explicit `pread` from each split GGUF part fd
+  by default inside `DS4_GLM_FAST=1`, so selected routed-expert staging avoids
+  sparse mmap page faults without another env flag. `DS4_GLM_EXPERT_PREAD=0`
+  (or `off`/`false`/`no`) restores the older mmap-fault staging path for A/B
+  tests. The pread path is validated with the real model and keeps the same
+  oracle token.
 - `DS4_GLM_EXPERT_CACHE_MIB=<n>` or `DS4_GLM_EXPERT_CACHE_GIB=<n>` enables a
   bounded LRU CPU slab cache for the quantized routed-expert slabs staged by the
   fused GLM MoE gate/up/down kernels. `DS4_GLM_EXPERT_CACHE_PRESET=decode` (or
@@ -236,7 +239,7 @@ The core GLM port is complete and verified. The active work is usability/speed:
   3 8359-expert / ~88 GiB plan. Explicit MIB/GIB settings win over presets.
   The cache key is map identity + tensor offset + expert id + slab geometry, so
   gate/up/down tensors and split-GGUF parts stay isolated; defaults stay off.
-  Validation: `DS4_GLM_FAST=1 DS4_GLM_EXPERT_PREAD=1 DS4_GLM_EXPERT_CACHE_MIB=256
+  Validation: `DS4_GLM_FAST=1 DS4_GLM_EXPERT_CACHE_MIB=256
   --glm-metal-ref -p Hello` keeps token `154820` and reports cache
   stores/evictions (`1776` stores, `1719` evictions for this small smoke
   budget). With `DS4_GLM_EXPERT_CACHE_GIB=8`, `--glm-raw -p asdfqwer -n 2`
@@ -363,9 +366,9 @@ The core GLM port is complete and verified. The active work is usability/speed:
 - Batched/persistent GLM graph work remains the largest speed risk: prefill still
   runs one full per-token forward, and the NextN verifier still uses one target
   forward per emitted token.
-- Runtime SSD streaming is validated through selected-expert pread and the
-  opt-in routed-expert slab cache, but production defaults/prefetch/concurrency
-  policy still needs more measurement.
+- Runtime SSD streaming is validated through default-on selected-expert pread
+  inside `DS4_GLM_FAST` and the opt-in routed-expert slab cache, but cache
+  sizing/prefetch/concurrency policy still needs more measurement.
 - DSA sparse-index correctness remains deferred because dense MLA matches the
   llama.cpp oracle; revisit only with a long-context quality/perf oracle.
 - No official 128 GiB SSD recipe exists; throughput/prefetch policy remains
