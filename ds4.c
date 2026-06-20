@@ -30748,6 +30748,52 @@ static bool glm_spec_verify_after_bonus_metal_scratch(void *verify_ctx,
     free(row_hidden);
     return ok;
 }
+
+static void glm_metal_prefill_batch_check(const char *label,
+                                          const glm_metal_fwd_ctx *live,
+                                          const int *prompt,
+                                          uint32_t prompt_len,
+                                          const float *seq_logits,
+                                          uint32_t vocab) {
+    if (!glm_env_flag_enabled("DS4_GLM_PREFILL_BATCH_CHECK")) return;
+    if (!live || !prompt || !seq_logits || prompt_len == 0 || vocab == 0) return;
+    const uint32_t max_rows = 16;
+    if (prompt_len > max_rows) {
+        fprintf(stderr,
+                "ds4: %s: prefill batch check skipped (%u rows > max %u)\n",
+                label ? label : "glm-generate", prompt_len, max_rows);
+        return;
+    }
+    glm_metal_fwd_ctx bat;
+    memset(&bat, 0, sizeof(bat));
+    bool ready = glm_metal_fwd_init_ex(&bat, live->m, live->shape,
+                                       live->n_layer, live->n_dense,
+                                       live->seq_n, false);
+    if (ready) (void)glm_metal_fwd_borrow_shared_experts(&bat, live);
+    float *batch_logits = ready ? xmalloc((size_t)prompt_len * vocab * sizeof(float)) : NULL;
+    const double t0 = now_sec();
+    const bool ok = ready &&
+        glm_metal_fwd_batch_f32(&bat, prompt, 0, prompt_len, true,
+                                batch_logits, NULL, NULL);
+    const double elapsed = now_sec() - t0;
+    if (ok) {
+        const float *last = batch_logits + (size_t)(prompt_len - 1u) * vocab;
+        const int seq_top = sample_argmax(seq_logits, vocab);
+        const int batch_top = sample_argmax(last, vocab);
+        const float max_abs = max_abs_diff(seq_logits, last, vocab);
+        fprintf(stderr,
+                "ds4: %s: prefill batch check rows=%u ok=%s seq_top=%d batch_top=%d max_abs=%g time=%.3fs%s\n",
+                label ? label : "glm-generate", prompt_len,
+                seq_top == batch_top ? "yes" : "no", seq_top, batch_top,
+                (double)max_abs, elapsed,
+                glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE") ? " fast-moe=on" : " fast-moe=off");
+    } else {
+        fprintf(stderr, "ds4: %s: prefill batch check failed rows=%u time=%.3fs\n",
+                label ? label : "glm-generate", prompt_len, elapsed);
+    }
+    free(batch_logits);
+    if (bat.m) glm_metal_fwd_free(&bat);
+}
 #endif
 
 /* Opt-in GLM NextN speculative decode. Correctness-first, NOT a
@@ -30937,6 +30983,11 @@ static int glm_generate_loop(const char *label,
     for (uint32_t t = 0; t < prompt_len; t++)
         if (!step(ctx, prompt[t], t, t + 1 == prompt_len, logits)) return 1;
     const double prefill_s = now_sec() - pf0;
+#ifndef DS4_NO_GPU
+    if (step == glm_gen_metal_step)
+        glm_metal_prefill_batch_check(label, (const glm_metal_fwd_ctx *)ctx,
+                                      prompt, prompt_len, logits, vocab);
+#endif
 
     /* Opt-in NextN speculative path (default-off).  It reuses the shared
      * correctness-first verifier below and is byte-for-byte identical to
