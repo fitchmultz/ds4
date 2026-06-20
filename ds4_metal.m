@@ -26881,6 +26881,7 @@ typedef struct { uint32_t rows; uint32_t cols; uint32_t n_tok; } ds4_gpu_glm_mat
 typedef struct { uint32_t n; float eps; }        ds4_gpu_glm_rmsnorm_args;
 typedef struct { uint32_t n; uint32_t n_tok; float eps; } ds4_gpu_glm_rmsnorm_batch_args;
 typedef struct { uint32_t d; uint32_t n_head; float base; uint32_t t; } ds4_gpu_glm_rope_args;
+typedef struct { uint32_t d; uint32_t n_head; float base; uint32_t pos0; uint32_t n_tok; } ds4_gpu_glm_rope_batch_args;
 typedef struct {
     uint32_t nh; uint32_t nope; uint32_t rope; uint32_t vd;
     uint32_t qhd; uint32_t seq_n; uint32_t t; float kq_scale;
@@ -27107,6 +27108,49 @@ int ds4_gpu_glm_rope_interleaved_f32(const float * x, float * out,
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm rope");
+        if (ok) ds4_gpu_tensor_read(to, 0, out, xb);
+        ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+        return ok;
+    }
+}
+
+int ds4_gpu_glm_rope_interleaved_batch_f32(const float * x, float * out,
+                                           uint32_t d, uint32_t n_head,
+                                           float base, uint32_t pos0,
+                                           uint32_t n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_glm_rope_batch_args args = { d, n_head, base, pos0, n_tok };
+    const uint32_t total = (d / 2u) * n_head * n_tok;
+    @autoreleasepool {
+        const uint64_t xb = (uint64_t)d * n_head * n_tok * sizeof(float);
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(xb);
+        ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(xb);
+        if (!tx || !to) {
+            ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tx, 0, x, xb);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline("kernel_glm_rope_interleaved_batch_f32");
+        int ok = 0;
+        if (pipe) {
+            [enc setComputePipelineState:pipe];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            ds4_gpu_glm_bind(enc, tx, 1);
+            ds4_gpu_glm_bind(enc, to, 2);
+            NSUInteger ntg = 256;
+            const NSUInteger maxt = pipe.maxTotalThreadsPerThreadgroup;
+            if (maxt && ntg > maxt) ntg = maxt;
+            if (ntg == 0) ntg = 1;
+            const NSUInteger groups = ((NSUInteger)total + ntg - 1u) / ntg;
+            [enc dispatchThreadgroups:MTLSizeMake(groups ? groups : 1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(ntg, 1, 1)];
+            ok = 1;
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm rope batch");
         if (ok) ds4_gpu_tensor_read(to, 0, out, xb);
         ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
         return ok;

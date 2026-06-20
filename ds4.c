@@ -27026,6 +27026,16 @@ void glm_rope_interleaved_f32(float *out, const float *x,
     }
 }
 
+void glm_rope_interleaved_batch_f32(float *out, const float *x,
+                                    uint32_t d, uint32_t n_head,
+                                    float base, uint32_t pos0,
+                                    uint32_t n_tok) {
+    const size_t row = (size_t)n_head * d;
+    for (uint32_t t = 0; t < n_tok; t++)
+        glm_rope_interleaved_f32(out + (size_t)t * row, x + (size_t)t * row,
+                                 d, n_head, base, pos0 + t);
+}
+
 void glm_matvec_f32(float *out, const float *W, const float *x,
                     uint32_t rows, uint32_t cols) {
     /* out[r] = sum_c W[r*cols + c] * x[c].  F32 accumulation matches numpy's

@@ -3194,6 +3194,15 @@ static void test_glm_metal_components(void) {
     glm_rope_interleaved_f32(cqr, qr_in, rope, nh, shape.rope_base, t_pos);
     TEST_ASSERT(ds4_gpu_glm_rope_interleaved_f32(qr_in, mqr, rope, nh, shape.rope_base, t_pos));
     glm_metal_cmp("rope q (interleaved)", mqr, cqr, (size_t)nh * rope, tol_abs, tol_rel);
+    const size_t rope_row = (size_t)nh * rope;
+    float *qr_b = malloc((size_t)batch_n * rope_row * sizeof(float));
+    float *cqr_b = malloc((size_t)batch_n * rope_row * sizeof(float));
+    float *mqr_b = malloc((size_t)batch_n * rope_row * sizeof(float));
+    memcpy(qr_b, qr_in, rope_row * sizeof(float));
+    for (uint32_t i = 0; i < rope_row; i++) qr_b[rope_row + i] = qr_in[i] * 0.75f - 0.02f * (float)((int)i - 2);
+    glm_rope_interleaved_batch_f32(cqr_b, qr_b, rope, nh, shape.rope_base, t_pos, batch_n);
+    TEST_ASSERT(ds4_gpu_glm_rope_interleaved_batch_f32(qr_b, mqr_b, rope, nh, shape.rope_base, t_pos, batch_n));
+    glm_metal_cmp("rope q batch2 contiguous-pos", mqr_b, cqr_b, (size_t)batch_n * rope_row, tol_abs, tol_rel);
 
     float *kr_in = malloc(sizeof(float) * (size_t)nh * rope);
     for (uint32_t h = 0; h < nh; h++)
@@ -3410,7 +3419,8 @@ static void test_glm_metal_components(void) {
     free(ones); free(cqa); free(mqa); free(xb); free(cqa_b); free(mqa_b);
     free(cqa_bn); free(mqa_bn); free(cqa_n); free(mqa_n); free(cq); free(mq);
     free(ckva); free(mkva); free(ckvln); free(mkvln); free(ck); free(mk); free(cv); free(mv);
-    free(qr_in); free(cqr); free(mqr); free(kr_in); free(ckr); free(mkr);
+    free(qr_in); free(cqr); free(mqr); free(qr_b); free(cqr_b); free(mqr_b);
+    free(kr_in); free(ckr); free(mkr);
     free(Qm); free(Qc); free(cattn); free(mattn); free(co); free(mo);
     free(Kc_n); free(Kc_r); free(Vc); free(mattn2); free(mout);
     free(Kc2_n); free(Kc2_r); free(Vc2); free(cout); free(ref_mla_out);
@@ -3442,7 +3452,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},
     {"--glm-nextn-metal-synth", "glm-nextn-metal-synth", "GLM-5.2 Metal NextN/MTP path on a tiny synthetic block (no model needed)", test_glm_nextn_metal_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
-    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/batch matmul/batch RMSNorm/attention) vs CPU reference", test_glm_metal_components},
+    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/batch RoPE/MLA projections/batch matmul/batch RMSNorm/attention) vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
     {"--glm-spec-batch-verify-synth", "glm-spec-batch-verify-synth", "GLM-5.2 NextN batched-verifier contract == naive greedy (no model needed)", test_glm_spec_batch_verify_synth},

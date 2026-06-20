@@ -1047,6 +1047,10 @@ int ds4_gpu_glm_rmsnorm_batch_f32(const float * x, const float * w, float * out,
 int ds4_gpu_glm_rope_interleaved_f32(const float * x, float * out,
                                      uint32_t d, uint32_t n_head,
                                      float base, uint32_t t);
+int ds4_gpu_glm_rope_interleaved_batch_f32(const float * x, float * out,
+                                           uint32_t d, uint32_t n_head,
+                                           float base, uint32_t pos0,
+                                           uint32_t n_tok);
 
 /* MLA decode attention for one query token over cached tokens n in [0,t].
  * Q is [nh, qhd] with the rope slice ALREADY rotated; kq_scale = 1/sqrt(qhd).

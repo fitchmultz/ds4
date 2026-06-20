@@ -116,6 +116,14 @@ struct ds4_metal_args_glm_rope {
     uint32_t t;       // position
 };
 
+struct ds4_metal_args_glm_rope_batch {
+    uint32_t d;       // rope slice width (even)
+    uint32_t n_head;  // independent rows per token
+    float    base;    // theta base (8e6)
+    uint32_t pos0;    // first absolute position; row t uses pos0+t
+    uint32_t n_tok;   // token batch
+};
+
 // Standard interleaved RoPE on n_head rows of width d.  Mirrors
 // glm_rope_interleaved_f32: pairs (x[2i], x[2i+1]) rotate by
 // theta_i = 1/base^(2i/d), ang = t*theta_i.  One thread per (head, pair).
@@ -139,6 +147,32 @@ kernel void kernel_glm_rope_interleaved_f32(
     const float b = xh[1];
     oh[0] = a * c - b * s;
     oh[1] = a * s + b * c;
+}
+
+// Batched contiguous-position RoPE. Input/output layout is
+// [n_tok, n_head, d]; row tok rotates at absolute position pos0+tok.
+kernel void kernel_glm_rope_interleaved_batch_f32(
+        constant ds4_metal_args_glm_rope_batch & args,
+        device const float * x,
+        device       float * out,
+        uint gid [[thread_position_in_grid]]) {
+    const uint32_t npair = args.d / 2u;
+    const uint32_t per_tok = args.n_head * npair;
+    const uint32_t total = args.n_tok * per_tok;
+    if (gid >= total) return;
+    const uint32_t tok = gid / per_tok;
+    const uint32_t rem = gid - tok * per_tok;
+    const uint32_t h = rem / npair;
+    const uint32_t i = rem - h * npair;
+    const float theta = 1.0f / pow(args.base, (float)(2u * i) / (float)args.d);
+    const float ang = (float)(args.pos0 + tok) * theta;
+    const float c = cos(ang);
+    const float s = sin(ang);
+    const uint64_t off = ((uint64_t)tok * args.n_head + h) * args.d + 2u * i;
+    const float a = x[off];
+    const float b = x[off + 1u];
+    out[off] = a * c - b * s;
+    out[off + 1u] = a * s + b * c;
 }
 
 struct ds4_metal_args_glm_attn {

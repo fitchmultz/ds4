@@ -237,6 +237,10 @@ typedef struct {
 void glm_rope_interleaved_f32(float *out, const float *x,
                               uint32_t d, uint32_t n_head,
                               float base, uint32_t t);
+void glm_rope_interleaved_batch_f32(float *out, const float *x,
+                                    uint32_t d, uint32_t n_head,
+                                    float base, uint32_t pos0,
+                                    uint32_t n_tok);
 
 /* Standard RMSNorm with learned per-channel scale. */
 void glm_rmsnorm_f32(float *out, const float *x, const float *weight,
