@@ -3523,8 +3523,37 @@ static void test_glm_metal_components(void) {
             glm_metal_cmp("FFN composite (Metal vs CPU)", mff_out, cff2, H, tol_abs, tol_rel);
             glm_metal_cmp("FFN composite (Metal vs numpy)", mff_out, ref_ff_out, H, tol_abs, tol_rel);
 
+            /* Batch-2 dense FFN composite: the layer-major verifier/prefill
+             * path needs gate/up/down projections over token batches with a
+             * flat SwiGLU activation in between. */
+            float *bcgh = malloc((size_t)batch_n * ff * sizeof(float));
+            float *bmgh = malloc((size_t)batch_n * ff * sizeof(float));
+            float *bcuh = malloc((size_t)batch_n * ff * sizeof(float));
+            float *bmuh = malloc((size_t)batch_n * ff * sizeof(float));
+            float *bcact = malloc((size_t)batch_n * ff * sizeof(float));
+            float *bmact = malloc((size_t)batch_n * ff * sizeof(float));
+            float *bcff = malloc((size_t)batch_n * H * sizeof(float));
+            float *bmff = malloc((size_t)batch_n * H * sizeof(float));
+            TEST_ASSERT(bcgh && bmgh && bcuh && bmuh && bcact && bmact && bcff && bmff);
+            glm_matmul_f32(bcgh, ff_gate, xb, ff, H, batch_n);
+            glm_matmul_f32(bcuh, ff_up, xb, ff, H, batch_n);
+            for (uint32_t t = 0; t < batch_n; t++) {
+                glm_silu_f32(bcact + (size_t)t * ff, bcgh + (size_t)t * ff, ff);
+                for (uint32_t i = 0; i < ff; i++)
+                    bcact[(size_t)t * ff + i] *= bcuh[(size_t)t * ff + i];
+            }
+            glm_matmul_f32(bcff, ff_down, bcact, H, ff, batch_n);
+            TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_gate, xb, bmgh, ff, H, batch_n));
+            TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_up, xb, bmuh, ff, H, batch_n));
+            TEST_ASSERT(ds4_gpu_glm_swiglu_f32(bmgh, bmuh, bmact, batch_n * ff));
+            TEST_ASSERT(ds4_gpu_glm_matmul_f32(ff_down, bmact, bmff, H, ff, batch_n));
+            glm_metal_cmp("FFN batch2 dense composite", bmff, bcff,
+                          (size_t)batch_n * H, tol_abs, tol_rel);
+
             free(cgh); free(mgh); free(cuh); free(muh); free(cact); free(mact);
             free(cff_out); free(mff_out); free(cff2);
+            free(bcgh); free(bmgh); free(bcuh); free(bmuh); free(bcact); free(bmact);
+            free(bcff); free(bmff);
         }
 
         free(gate); free(bias); free(ref_logits); free(ref_w); free(ref_idx);
