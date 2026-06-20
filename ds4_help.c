@@ -262,6 +262,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "DS4_GLM_MLA_DIRECT_OUT_QK=0/off", "GLM fast path: disable the default direct Q5_K/Q6_K MLA attn_output projection used by DS4_GLM_FAST=1. Set =1 to force it when testing env handling.");
     opt(fp, c, "DS4_GLM_MLA_DIRECT_QB_Q8=0/off", "GLM fast path: disable the default direct Q8_0 MLA attn_q_b projection used by DS4_GLM_FAST=1. Set =1 to force it when testing env handling.");
     opt(fp, c, "DS4_GLM_MLA_DIRECT_KV_Q8=0/off", "GLM fast path: disable the default direct Q8_0 MLA attn_kv_a_mqa and attn_v_b projections used by DS4_GLM_FAST=1. Set =1 to force it when testing env handling.");
+    opt(fp, c, "DS4_GLM_MLA_DIRECT_KB_Q8=0/off", "GLM fast path: disable the default native-layout direct Q8_0 MLA attn_k_b projection used by DS4_GLM_FAST=1. Set =1 to force it when testing env handling.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_FAST_MOE=1", "GLM diagnostic: with DS4_GLM_VERIFY_BATCH_F32=1 and DS4_GLM_FAST=1, let the batch verifier use production fast routed-MoE kernels; default keeps the pure F32 proof path.");
     opt(fp, c, "DS4_GLM_PREFILL_BATCH_CHECK=1", "GLM diagnostic: for short Metal prompts, compare sequential prefill and layer-major batch prefill final/continuation logits in scratch ctxs; does not affect output.");
     opt(fp, c, "DS4_GLM_PREFILL_BATCH_LIVE=0/off", "GLM fast path: disable the default short-prompt live batched prefill used by DS4_GLM_FAST=1. Set =1 to force the guarded scratch-copy prefill outside DS4_GLM_FAST.");

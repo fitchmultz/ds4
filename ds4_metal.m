@@ -26878,6 +26878,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 /* Host-side mirror of metal/glm.metal ds4_metal_args_glm_matvec (same layout). */
 typedef struct { uint32_t rows; uint32_t cols; } ds4_gpu_glm_matvec_args;
 typedef struct { uint32_t rows; uint32_t cols; uint64_t row_bytes; } ds4_gpu_glm_qk_matvec_args;
+typedef struct { uint32_t nope; uint32_t kvl; uint32_t nh; } ds4_gpu_glm_k_b_q8_matvec_args;
 typedef struct { uint32_t rows; uint32_t cols; uint32_t n_tok; } ds4_gpu_glm_matmul_args;
 typedef struct { uint32_t n; uint32_t n_tok; } ds4_gpu_glm_add_batch_args;
 typedef struct { uint32_t n_vocab; uint32_t n_tok; } ds4_gpu_glm_argmax_batch_args;
@@ -27033,6 +27034,56 @@ int ds4_gpu_glm_matvec_q8_0_f32(const void *Wq, uint64_t Wq_bytes,
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm q8_0 matvec");
+        if (ok) ds4_gpu_tensor_read(to, 0, out, ob);
+        ds4_gpu_tensor_free(tW); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+        return ok;
+    }
+}
+
+int ds4_gpu_glm_matvec_k_b_q8_0_f32(const void *Wq, uint64_t Wq_bytes,
+                                    const float *x, float *out,
+                                    uint32_t nope, uint32_t kvl, uint32_t nh) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!Wq || !x || !out || !nope || !kvl || !nh || (nope & 31u) != 0) return 0;
+    const uint64_t row_bytes = ((uint64_t)nope / 32u) * 34u;
+    const uint64_t rows_native = (uint64_t)nh * kvl;
+    const uint64_t out_rows = (uint64_t)nh * nope;
+    if (Wq_bytes < rows_native * row_bytes || out_rows > UINT32_MAX) return 0;
+    ds4_gpu_glm_k_b_q8_matvec_args args = { nope, kvl, nh };
+    @autoreleasepool {
+        const uint64_t xb = (uint64_t)kvl * sizeof(float);
+        const uint64_t ob = out_rows * sizeof(float);
+        ds4_gpu_tensor *tW = ds4_gpu_tensor_alloc(Wq_bytes);
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(xb);
+        ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(ob);
+        if (!tW || !tx || !to) {
+            ds4_gpu_tensor_free(tW); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+            return 0;
+        }
+        ds4_gpu_tensor_write(tW, 0, Wq, Wq_bytes);
+        ds4_gpu_tensor_write(tx, 0, x, xb);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline("kernel_glm_matvec_k_b_q8_0_f32");
+        int ok = 0;
+        if (pipe) {
+            [enc setComputePipelineState:pipe];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            ds4_gpu_glm_bind(enc, tW, 1);
+            ds4_gpu_glm_bind(enc, tx, 2);
+            ds4_gpu_glm_bind(enc, to, 3);
+            NSUInteger ntg = 256;
+            const NSUInteger maxt = pipe.maxTotalThreadsPerThreadgroup;
+            if (maxt && ntg > maxt) ntg = maxt;
+            if (ntg == 0) ntg = 1;
+            const NSUInteger groups = ((NSUInteger)out_rows + ntg - 1u) / ntg;
+            [enc dispatchThreadgroups:MTLSizeMake(groups ? groups : 1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(ntg, 1, 1)];
+            ok = 1;
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "glm k_b q8_0 matvec");
         if (ok) ds4_gpu_tensor_read(to, 0, out, ob);
         ds4_gpu_tensor_free(tW); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
         return ok;

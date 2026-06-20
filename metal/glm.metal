@@ -52,6 +52,12 @@ struct ds4_metal_args_glm_qk_matvec {
     uint64_t row_bytes;
 };
 
+struct ds4_metal_args_glm_k_b_q8_matvec {
+    uint32_t nope;
+    uint32_t kvl;
+    uint32_t nh;
+};
+
 struct ds4_metal_block_q5_K {
     half d;
     half dmin;
@@ -66,6 +72,30 @@ struct ds4_metal_block_q6_K {
     char  scales[DS4_GLM_QK_K / 16];
     half d;
 };
+
+kernel void kernel_glm_matvec_k_b_q8_0_f32(
+        constant ds4_metal_args_glm_k_b_q8_matvec & args,
+        device const char  * src0,
+        device const float * x,
+        device       float * out,
+        uint gid [[thread_position_in_grid]]) {
+    const uint32_t rows = args.nh * args.nope;
+    if (gid >= rows || args.nope == 0 || args.kvl == 0) return;
+    const uint32_t h = gid / args.nope;
+    const uint32_t d = gid - h * args.nope;
+    const uint32_t block = d / 32u;
+    const uint32_t q = d & 31u;
+    const uint32_t row_blocks = args.nope / 32u;
+    float acc = 0.0f;
+    for (uint32_t c = 0; c < args.kvl; c++) {
+        const uint64_t row = (uint64_t)h * args.kvl + c;
+        const uint64_t off = (row * row_blocks + block) * 34u;
+        const float scale = (float)(*(device const half *)(src0 + off));
+        const int8_t v = *(device const int8_t *)(src0 + off + 2u + q);
+        acc += scale * (float)v * x[c];
+    }
+    out[gid] = acc;
+}
 
 kernel void kernel_glm_matvec_q5_k_f32(
         constant ds4_metal_args_glm_qk_matvec & args,

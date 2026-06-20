@@ -405,23 +405,28 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `kv_a` direct about `0.00055-0.00078s`/call and `v_b` direct about
   `0.00115-0.00131s`/call, both faster than cached F32, and the prompt sweep
   preserved output while improving no-profile `-n 3` decode by about `1.1-2.2s`.
+  Native-layout direct Q8_0 `attn_k_b` is also defaulted inside `DS4_GLM_FAST=1`
+  (`DS4_GLM_MLA_DIRECT_KB_Q8=0/off` opt-out): isolated layer sweep measured
+  direct Q8_0 about `0.0011-0.0014s`/call versus current dequant+reorder+F32
+  about `0.0062-0.0064s`, with exact F32-baseline outputs; prompt sweep
+  preserved output while improving no-profile `-n 3` decode by about `0.9-3.6s`.
   Rejected
   broader direct-MLA probe: direct `attn_q_a` alone benchmarks faster
   (`0.0011s` direct vs `0.0048s` cached F32 on `blk.0`), but trying to route
   Q8_0 `attn_q_b`/`attn_kv_a_mqa`/`attn_v_b` through the existing tensor-map
   Q8 helper made real decode much slower (`14.89s -> 68.16s` for profiled
   `asdfqwer -n 3`), so do not wire that path without a separate Q8 benchmark win.
-  After direct `attn_output`, `attn_q_a`, `attn_q_b`, `attn_kv_a_mqa`, and
-  `attn_v_b` became `DS4_GLM_FAST=1` defaults, fresh no-profile accepted-round
-  checks on `asdfqwer -n 3` measured plain greedy decode `9.25s` and opt-in
+  After all decode MLA projections except the surrounding norms/attention were
+  switched to direct quantized defaults, fresh no-profile accepted-round checks on
+  `asdfqwer -n 3` measured plain greedy decode `8.60s` and opt-in
   `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1
-  DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at `12.91s` (`target_steps=2,
+  DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at `13.21s` (`target_steps=2,
   target_batches=1`, identical ids/stdout). The accepted round is no longer a
   speed win after the plain path improvements, so NextN stays correctness-first
   only. A second prompt, `The meaning of life is -n 3`, kept identical ids/stdout
   (`264 27066 323`, ` a profound and`) but missed the draft
-  (`target_steps=2,target_batches=2`) and measured NextN decode `18.74s` vs
-  plain greedy about `10.4s`, confirming verifier cost and acceptance rate still
+  (`target_steps=2,target_batches=2`) and measured NextN decode `17.38s` vs
+  plain greedy about `8.51s`, confirming verifier cost and acceptance rate still
   gate speed. A naive adaptive miss-budget probe was rejected for now:
   on `The meaning of life is -n 5`, disabling drafts after the first miss kept
   ids/stdout but slowed decode to `44.92s` versus `36.24s` with normal NextN,
