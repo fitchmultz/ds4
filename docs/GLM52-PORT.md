@@ -293,7 +293,8 @@ The core GLM port is complete and verified. The active work is usability/speed:
   A/B fallback), but verification still reuses the single-token target step
   (one target forward per emitted token), so the speedup still needs batched
   target verification. `DS4_GLM_NEXTN_TRACE_OUT=<path>` writes a per-round CSV
-  trace for acceptance-rate analysis. After correcting the scaffold to SGLang's
+  trace for acceptance-rate and target-step accounting (`target_steps`) analysis.
+  After correcting the scaffold to SGLang's
   bonus-token semantics (the current verified target token is always emitted,
   and drafts are checked against following target tokens), real `asdfqwer -n 2`
   emits identical ids `108714 100461` with `draft0=100461` accepted as a full
@@ -319,7 +320,7 @@ The core GLM port is complete and verified. The active work is usability/speed:
   future batched-verifier contract to the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and
   `--glm-spec-trace-synth` pins the CSV trace shape, including the final
-  no-draft row.
+  no-draft row and `target_steps` accounting.
 - `--glm-raw` / `--glm-raw-cpu` bypass the GLM chat template and raw-tokenize
   `-p/--prompt`. This is a usability/benchmark mode, not chat: a one-token raw
   prompt avoids the 13-token chat-template prefill while batched prefill is
