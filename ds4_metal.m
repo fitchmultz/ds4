@@ -27289,7 +27289,7 @@ int ds4_gpu_glm_attn_decode_batch_f32(const float * Q,
 }
 
 /* Host-side mirror of metal/glm.metal ds4_metal_args_glm_moe (same layout). */
-typedef struct { uint32_t n_expert; uint32_t top_k; float scale; } ds4_gpu_glm_moe_args;
+typedef struct { uint32_t n_expert; uint32_t top_k; uint32_t n_tok; float scale; } ds4_gpu_glm_moe_args;
 
 /* Sigmoid MoE router on PRECOMPUTED logits (gate@x is the caller's job, done
  * via ds4_gpu_glm_matvec_f32).  prob=sigmoid(logits); sel=prob+bias; stable
@@ -27299,7 +27299,7 @@ int ds4_gpu_glm_moe_route_f32(const float * logits, const float * bias,
                               int * out_idx, float * out_w,
                               uint32_t n_expert, uint32_t top_k, float scale) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    ds4_gpu_glm_moe_args args = { n_expert, top_k, scale };
+    ds4_gpu_glm_moe_args args = { n_expert, top_k, 0, scale };
     @autoreleasepool {
         const uint64_t lb = (uint64_t)n_expert * sizeof(float);
         const uint64_t bb = (uint64_t)n_expert * sizeof(float);
@@ -27351,7 +27351,8 @@ int ds4_gpu_glm_moe_route_batch_f32(const float * logits, const float * bias,
                                     uint32_t n_expert, uint32_t top_k,
                                     uint32_t n_tok, float scale) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    ds4_gpu_glm_moe_args args = { n_expert, top_k, scale };
+    if (n_tok == 0) return 1;
+    ds4_gpu_glm_moe_args args = { n_expert, top_k, n_tok, scale };
     @autoreleasepool {
         const uint64_t lb = (uint64_t)n_tok * n_expert * sizeof(float);
         const uint64_t bb = (uint64_t)n_expert * sizeof(float);

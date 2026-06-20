@@ -319,6 +319,7 @@ kernel void kernel_glm_attn_decode_batch_f32(
 struct ds4_metal_args_glm_moe {
     uint32_t n_expert;   // E (256 real, 8 fixture)
     uint32_t top_k;      // K (8 real, 2 fixture); bounded by GLM_MOE_MAX_K
+    uint32_t n_tok;      // token rows for batch router; ignored by single route
     float    scale;      // moe_scale (2.5)
 };
 
@@ -382,6 +383,7 @@ kernel void kernel_glm_moe_route_batch_f32(
         device int   * out_idx,
         device float * out_w,
         uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_tok) return;
     const uint32_t E = args.n_expert;
     const uint32_t K = args.top_k;
     device const float * row = logits + (uint64_t)gid * E;

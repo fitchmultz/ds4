@@ -3511,6 +3511,7 @@ static void test_glm_metal_components(void) {
                 for (uint32_t k = 0; k < K; k++) w_row[k] = prob[(uint32_t)idx_row[k]] * inv;
             }
             TEST_ASSERT(ds4_gpu_glm_moe_route_batch_f32(blogits, bias, bmidx, bmw, E, K, batch_n, scale));
+            TEST_ASSERT(ds4_gpu_glm_moe_route_batch_f32(blogits, bias, bmidx, bmw, E, K, 0, scale));
             {
                 bool idx_ok = true;
                 for (uint32_t i = 0; i < batch_n * K; i++)
