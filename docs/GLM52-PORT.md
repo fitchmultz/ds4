@@ -423,8 +423,10 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `108714 100461 21` / `123456` with `target_batches=1`. A broader short-prompt
   sweep also matched plain greedy for `Once upon a time` (`11 1052`, prefill
   `45.33s -> 13.42s`), `Q: 2+2 =` (`220 20`, `71.45s -> 16.73s`), and
-  `def add(a, b):` (`220 671`, `60.41s -> 15.46s`). It is not default and needs
-  broader real-prompt validation before it can become production behavior.
+  `def add(a, b):` (`220 671`, `60.41s -> 15.46s`). The chat path is covered too:
+  `--glm-chat -p Hi -n 2` has a 13-token templated prompt, matches generated ids
+  `13041 1052` / `Hi there`, and drops prefill `136.95s -> 23.18s`. It is not
+  default and needs broader real-prompt validation before it can become production behavior.
   LM head is only ~0.5–0.6s/token and is not the next target.
   A measured top-1-only verifier readback experiment was discarded: on
   `asdfqwer -n 2` the full-logit path reported lm-head ~0.462s while the
