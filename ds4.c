@@ -29898,7 +29898,8 @@ typedef bool (*glm_verify_after_bonus_fn)(void *verify_ctx,
                                           int *accepted,
                                           bool *fallback_emitted,
                                           int *fallback_token,
-                                          int *next_out);
+                                          int *next_out,
+                                          uint32_t *target_batches_out);
 
 typedef struct {
     const ds4_model *m;
@@ -30073,15 +30074,18 @@ static bool glm_spec_verify_after_bonus_single(glm_gen_step_fn step,
                                                int *accepted,
                                                bool *fallback_emitted,
                                                int *fallback_token,
-                                               int *next_out) {
+                                               int *next_out,
+                                               uint32_t *target_batches_out) {
     *emit_count = 0;
     *accepted = 0;
     *fallback_emitted = false;
     *fallback_token = -1;
     if (next_out) *next_out = -1;
+    if (target_batches_out) *target_batches_out = 0;
     if (remaining_after_bonus <= 0) return true;
 
     uint32_t pos = *pos_io;
+    const uint32_t pos0 = pos;
     if (!step(ctx, bonus_token, pos, true, logits)) return false;
     pos++;
     int next = sample_argmax(logits, vocab);
@@ -30111,6 +30115,7 @@ static bool glm_spec_verify_after_bonus_single(glm_gen_step_fn step,
 
     *pos_io = pos;
     if (next_out) *next_out = next;
+    if (target_batches_out) *target_batches_out = pos - pos0;
     return true;
 }
 
@@ -30211,14 +30216,15 @@ static int glm_spec_decode(const char *label,
                 ? verify_fn(verify_ctx, bonus_token, draft, active_depth, &pos,
                             remaining_after_bonus, logits, vocab, eos_id,
                             emit_after, &emit_count, &acc, &fallback_emitted,
-                            &fallback_token, &next)
+                            &fallback_token, &next, &round_target_batches)
                 : glm_spec_verify_after_bonus_single(step, ctx, bonus_token, draft,
                                                      active_depth, &pos,
                                                      remaining_after_bonus,
                                                      logits, vocab, eos_id,
                                                      emit_after, &emit_count,
                                                      &acc, &fallback_emitted,
-                                                     &fallback_token, &next);
+                                                     &fallback_token, &next,
+                                                     &round_target_batches);
             if (!verified) {
                 if (trace) fclose(trace);
                 free(draft);
@@ -30227,7 +30233,6 @@ static int glm_spec_decode(const char *label,
                 return 1;
             }
             round_target_steps = pos - verify_pos0;
-            round_target_batches = round_target_steps ? (verify_fn ? 1u : round_target_steps) : 0u;
             target_steps_total += round_target_steps;
             target_batches_total += round_target_batches;
             if (draft_commit_fn && active_depth > 0 &&
@@ -30727,7 +30732,8 @@ static bool glm_spec_mock_verify_after_bonus(void *vc,
                                              int *accepted,
                                              bool *fallback_emitted,
                                              int *fallback_token,
-                                             int *next_out) {
+                                             int *next_out,
+                                             uint32_t *target_batches_out) {
     (void)bonus_token; (void)logits; (void)vocab;
     glm_spec_mock_ctx *mc = (glm_spec_mock_ctx *)vc;
     if (!mc || !mc->greedy || !mc->generated_ptr || !pos_io ||
@@ -30739,6 +30745,7 @@ static bool glm_spec_mock_verify_after_bonus(void *vc,
     *fallback_emitted = false;
     *fallback_token = -1;
     *next_out = -1;
+    if (target_batches_out) *target_batches_out = 0;
     if (remaining_after_bonus <= 0) return true;
 
     uint32_t pos = *pos_io;
@@ -30769,6 +30776,7 @@ static bool glm_spec_mock_verify_after_bonus(void *vc,
     }
     *pos_io = pos;
     *next_out = next;
+    if (target_batches_out) *target_batches_out = 1;
     return true;
 }
 

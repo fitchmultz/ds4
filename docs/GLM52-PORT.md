@@ -322,9 +322,9 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and
   `--glm-spec-trace-synth` pins the CSV trace shape, including the final
   no-draft row plus `target_steps`/`target_batches` accounting. `target_batches`
-  is the physical verifier-launch counter: the current single-step verifier
-  counts one batch per target step, while the batched-verifier contract counts
-  one batch per verify call.
+  is the physical verifier-launch counter reported by the verifier contract: the
+  current single-step verifier counts one batch per target step, while the
+  batched-verifier contract counts one batch per verify call.
 - `--glm-raw` / `--glm-raw-cpu` bypass the GLM chat template and raw-tokenize
   `-p/--prompt`. This is a usability/benchmark mode, not chat: a one-token raw
   prompt avoids the 13-token chat-template prefill while batched prefill is
