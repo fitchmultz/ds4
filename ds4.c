@@ -27955,6 +27955,52 @@ static bool glm_nextn_draft_chain_cpu(const ds4_model *m,
                                            depth, vocab, out_drafts);
 }
 
+static bool glm_nextn_draft_cache_delta_cpu_layer(const ds4_model *m,
+                                                  const glm_cpu_shape *shape,
+                                                  uint32_t il,
+                                                  int seed_token,
+                                                  const float *seed_h,
+                                                  uint32_t vocab,
+                                                  float *out_maxabs) {
+    if (!m || !shape || !seed_h || !out_maxabs || vocab == 0) return false;
+    const uint32_t H = shape->hidden, nhead = shape->n_head;
+    const uint32_t nope = shape->qk_nope, rope = shape->qk_rope, vd = shape->v_dim;
+    float *eh0 = xmalloc((size_t)H * sizeof(float));
+    float *h0 = xmalloc((size_t)H * sizeof(float));
+    float *logits0 = xmalloc((size_t)vocab * sizeof(float));
+    float *eh1 = xmalloc((size_t)H * sizeof(float));
+    float *h_cached = xmalloc((size_t)H * sizeof(float));
+    float *h_reset = xmalloc((size_t)H * sizeof(float));
+    float *Knope = xmalloc((size_t)nhead * 2u * nope * sizeof(float));
+    float *Vc = xmalloc((size_t)nhead * 2u * vd * sizeof(float));
+    float *Krop = xmalloc((size_t)nhead * 2u * rope * sizeof(float));
+    bool ok = false;
+    *out_maxabs = 0.0f;
+    if (!glm_nextn_eh_project_cpu_layer(m, shape, il, seed_token, seed_h, eh0) ||
+        !glm_nextn_decoder_cpu_layer_cached(m, shape, il, eh0, h0,
+                                            Knope, Vc, Krop, 2, 0) ||
+        !glm_nextn_logits_cpu(m, shape, h0, logits0, vocab)) {
+        goto done;
+    }
+    int draft0 = sample_argmax(logits0, vocab);
+    if (!glm_nextn_eh_project_cpu_layer(m, shape, il, draft0, h0, eh1) ||
+        !glm_nextn_decoder_cpu_layer_cached(m, shape, il, eh1, h_cached,
+                                            Knope, Vc, Krop, 2, 1) ||
+        !glm_nextn_decoder_cpu_layer(m, shape, il, eh1, h_reset)) {
+        goto done;
+    }
+    for (uint32_t i = 0; i < H; i++) {
+        const float d = fabsf(h_cached[i] - h_reset[i]);
+        if (d > *out_maxabs) *out_maxabs = d;
+    }
+    ok = true;
+
+done:
+    free(Krop); free(Vc); free(Knope);
+    free(h_reset); free(h_cached); free(eh1); free(logits0); free(h0); free(eh0);
+    return ok;
+}
+
 static void glm_nextn_run_diagnostic(const char *label,
                                      const ds4_model *m,
                                      const glm_cpu_shape *shape,
@@ -29410,8 +29456,12 @@ int ds4_glm_nextn_metal_synth(int *out_token, float *out_top_logit, bool *out_fi
     bool chain_match = metal_chain_ok && cpu_chain_ok;
     for (int i = 0; chain_match && i < DS4_GLM_NEXTN_MAX_DEPTH; i++)
         if (metal_chain[i] != cpu_chain[i]) chain_match = false;
+    float cache_delta = 0.0f;
+    const bool cache_delta_ok = glm_nextn_draft_cache_delta_cpu_layer(
+        &c.model, &c.shape, il, accepted, target_h, c.vocab, &cache_delta);
 
-    const bool ok = metal_ok && cpu_ok && maxabs < 1e-5f && chain_match;
+    const bool ok = metal_ok && cpu_ok && maxabs < 1e-5f && chain_match &&
+                    cache_delta_ok && cache_delta > 1e-7f;
     int argmax = 0;
     float top = metal_ok ? logits[0] : 0.0f;
     bool finite = metal_ok && isfinite(logits[0]);
@@ -29422,9 +29472,9 @@ int ds4_glm_nextn_metal_synth(int *out_token, float *out_top_logit, bool *out_fi
     if (out_token) *out_token = argmax;
     if (out_top_logit) *out_top_logit = top;
     if (out_finite) *out_finite = finite;
-    fprintf(stderr, "  glm-nextn-metal-synth: token=%d top_logit=%.6f finite=%s maxabs_vs_cpu=%.3g chain_match=%s (blk.%u)\n",
+    fprintf(stderr, "  glm-nextn-metal-synth: token=%d top_logit=%.6f finite=%s maxabs_vs_cpu=%.3g chain_match=%s cache_delta=%.3g (blk.%u)\n",
             argmax, (double)top, finite ? "yes" : "no", (double)maxabs,
-            chain_match ? "yes" : "no", il);
+            chain_match ? "yes" : "no", (double)cache_delta, il);
     free(chunk_logits); free(chunk_w);
     free(cpu_logits); free(cpu_nh); free(cpu_eh);
     free(logits); free(nh); free(eh); free(target_h);
