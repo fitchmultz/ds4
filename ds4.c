@@ -28491,6 +28491,7 @@ static bool glm_mla_forward_token_metal_pos(
         const float *x,
         const ds4_model *m, uint32_t il, bool fast,
         bool direct_qa_qk, bool direct_out_qk, bool direct_qb_q8,
+        bool direct_kv_q8,
         const float *WqA, const float *WqB, const float *WkvA,
         const float *WkB, const float *WvB, const float *Wo,
         const float *w_q_a_norm, const float *w_kv_a_norm,
@@ -28516,8 +28517,8 @@ static bool glm_mla_forward_token_metal_pos(
      * uses the F32 WkB below (its native layout needs glm_k_b_reorder). */
     const ds4_tensor *tq_a  = (fast || direct_qa_qk) ? glm_layer_tensor(m, il, "attn_q_a") : NULL;
     const ds4_tensor *tq_b  = (fast || direct_qb_q8) ? glm_layer_tensor(m, il, "attn_q_b") : NULL;
-    const ds4_tensor *tkv_a = fast ? glm_layer_tensor(m, il, "attn_kv_a_mqa") : NULL;
-    const ds4_tensor *tv_b  = fast ? glm_layer_tensor(m, il, "attn_v_b")      : NULL;
+    const ds4_tensor *tkv_a = (fast || direct_kv_q8) ? glm_layer_tensor(m, il, "attn_kv_a_mqa") : NULL;
+    const ds4_tensor *tv_b  = (fast || direct_kv_q8) ? glm_layer_tensor(m, il, "attn_v_b")      : NULL;
 
     /* q path: WqA@x -> RMSNorm(learned) -> WqB@ -> q_flat [nh, qhd]. */
     if (fast) {
@@ -28555,6 +28556,13 @@ static bool glm_mla_forward_token_metal_pos(
     if (fast) {
         if (!glm_fused_q8_matvec(m->parts[tkv_a->part].map, m->parts[tkv_a->part].size,
                                  tkv_a->abs_offset, H, kvl + rope, x, kva)) return false;
+    } else if (direct_kv_q8 && tkv_a && tkv_a->type == DS4_TENSOR_Q8_0) {
+        const bool prof = getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL;
+        const double t0 = prof ? now_sec() : 0.0;
+        const bool ok = ds4_gpu_glm_matvec_q8_0_f32(tensor_data(m, tkv_a), tkv_a->bytes,
+                                                    x, kva, kvl + rope, H) != 0;
+        if (prof) { g_glm_qk_out_s += now_sec() - t0; g_glm_qk_out_calls++; }
+        if (!ok) return false;
     } else if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
                                             &g_glm_f32_kva_s, &g_glm_f32_kva_calls,
                                             WkvA, x, kva, kvl + rope, H)) return false;
@@ -28567,6 +28575,13 @@ static bool glm_mla_forward_token_metal_pos(
     if (fast) {
         if (!glm_fused_q8_matvec(m->parts[tv_b->part].map, m->parts[tv_b->part].size,
                                  tv_b->abs_offset, kvl, nh * vd, kvln, v)) return false;
+    } else if (direct_kv_q8 && tv_b && tv_b->type == DS4_TENSOR_Q8_0) {
+        const bool prof = getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL;
+        const double t0 = prof ? now_sec() : 0.0;
+        const bool ok = ds4_gpu_glm_matvec_q8_0_f32(tensor_data(m, tv_b), tv_b->bytes,
+                                                    kvln, v, nh * vd, kvl) != 0;
+        if (prof) { g_glm_qk_out_s += now_sec() - t0; g_glm_qk_out_calls++; }
+        if (!ok) return false;
     } else if (!glm_mla_matvec_f32_profiled(getenv("DS4_GLM_MLA_DETAIL_TIME") != NULL,
                                             &g_glm_f32_vb_s, &g_glm_f32_vb_calls,
                                             WvB, kvln, v, nh * vd, kvl)) return false;
@@ -28635,6 +28650,7 @@ static bool glm_mla_forward_token_metal(
         const float *x,
         const ds4_model *m, uint32_t il, bool fast,
         bool direct_qa_qk, bool direct_out_qk, bool direct_qb_q8,
+        bool direct_kv_q8,
         const float *WqA, const float *WqB, const float *WkvA,
         const float *WkB, const float *WvB, const float *Wo,
         const float *w_q_a_norm, const float *w_kv_a_norm,
@@ -28645,7 +28661,7 @@ static bool glm_mla_forward_token_metal(
         float *wqa, float *wqa_n, float *q_flat, float *kva, float *kvln,
         float *k_nope, float *v, float *qrope, float *krope,
         float *attn_o, float *Q_combined) {
-    return glm_mla_forward_token_metal_pos(x, m, il, fast, direct_qa_qk, direct_out_qk, direct_qb_q8,
+    return glm_mla_forward_token_metal_pos(x, m, il, fast, direct_qa_qk, direct_out_qk, direct_qb_q8, direct_kv_q8,
                                            WqA, WqB, WkvA, WkB, WvB, Wo,
                                            w_q_a_norm, w_kv_a_norm,
                                            K_nope_cache, V_cache, K_rope_cache,
@@ -28853,7 +28869,7 @@ static bool glm_nextn_decoder_metal_layer_cached(const ds4_model *m,
     glm_k_b_reorder(WkB, WkBn, nope, kvl, nh);
     glm_dequant_weight(m, v_b, WvB);
     glm_dequant_weight(m, wop, Wo);
-    if (!glm_mla_forward_token_metal_pos(xn, m, il, false, false, false, false,
+    if (!glm_mla_forward_token_metal_pos(xn, m, il, false, false, false, false, false,
                                          WqA, WqB, WkvA, WkB, WvB, Wo,
                                          (const float *)tensor_data(m, qa_norm_t),
                                          (const float *)tensor_data(m, kv_norm_t),
@@ -29077,6 +29093,7 @@ typedef struct {
     bool direct_qa_qk;
     bool direct_out_qk;
     bool direct_qb_q8;
+    bool direct_kv_q8;
     /* Batch helper fast MoE bridge. Defaults to the verifier env for existing
      * NextN diagnostics; live batched prefill can enable it per scratch ctx. */
     bool batch_fast_moe;
@@ -29209,6 +29226,7 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
     c->direct_qa_qk = false;
     c->direct_out_qk = false;
     c->direct_qb_q8 = false;
+    c->direct_kv_q8 = false;
     c->batch_fast_moe = glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE");
     if (glm_fast_enabled()) {
         ds4_gpu_set_ssd_streaming(true);
@@ -29233,6 +29251,8 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
             c->direct_out_qk = dqk ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_OUT_QK") : true;
             const char *dqb = getenv("DS4_GLM_MLA_DIRECT_QB_Q8");
             c->direct_qb_q8 = dqb ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_QB_Q8") : true;
+            const char *dkv = getenv("DS4_GLM_MLA_DIRECT_KV_Q8");
+            c->direct_kv_q8 = dkv ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_KV_Q8") : true;
         }
         if (ok) {
             const bool shexp_resident = predequant_shared_experts &&
@@ -29313,14 +29333,15 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
                             now_sec() - wo_t0);
                 }
             }
-            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s%s%s%s%s "
+            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s%s%s%s%s%s "
                                 "+ IQ3_XXS/IQ4_XS MoE down paths enabled (DS4_GLM_FAST=1; "
                                 "MLA stays F32 oracle on UD-IQ2_M)\n",
                     shexp_resident ? " + resident shared-expert" : "",
                     c->Wo_cache ? " + attn_output F32 cache" : "",
                     c->direct_qa_qk ? " + direct q_a QK" : "",
                     c->direct_out_qk ? " + direct attn_output QK" : "",
-                    c->direct_qb_q8 ? " + direct q_b Q8" : "");
+                    c->direct_qb_q8 ? " + direct q_b Q8" : "",
+                    c->direct_kv_q8 ? " + direct kv Q8" : "");
         }
     }
     return true;
@@ -29496,11 +29517,13 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
         const bool direct_qa_qk = c->direct_qa_qk && q_a && (q_a->type == 13 || q_a->type == 14);
         const bool direct_out_qk = c->direct_out_qk && wop && (wop->type == 13 || wop->type == 14);
         const bool direct_qb_q8 = c->direct_qb_q8 && q_b && q_b->type == DS4_TENSOR_Q8_0;
+        const bool direct_kv_q8 = c->direct_kv_q8 && kv_a && kv_a->type == DS4_TENSOR_Q8_0 &&
+                                  v_b && v_b->type == DS4_TENSOR_Q8_0;
         if (!fast_l) {
             if (!direct_qa_qk) glm_dequant_weight(m, q_a, c->WqA);
             if (!direct_qb_q8) glm_dequant_weight(m, q_b, c->WqB);
-            glm_dequant_weight(m, kv_a, c->WkvA);
-            glm_dequant_weight(m, v_b, c->WvB);
+            if (!direct_kv_q8) glm_dequant_weight(m, kv_a, c->WkvA);
+            if (!direct_kv_q8) glm_dequant_weight(m, v_b, c->WvB);
             if (direct_out_qk) {
                 /* skipped: direct Q5/Q6 kernel reads the quant tensor */
             } else if (c->Wo_cache && c->Wo_cache[il]) Wo_use = c->Wo_cache[il];
@@ -29516,7 +29539,7 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
         const float *kv_norm = (const float *)tensor_data(m, glm_layer_tensor(m, il, "attn_kv_a_norm"));
         const bool mla_time = getenv("DS4_GLM_MLA_TIME") != NULL;
         const double mla_t0 = (mla_time || dec_prof) ? now_sec() : 0.0;
-        if (!glm_mla_forward_token_metal(xn, m, il, fast_l, direct_qa_qk, direct_out_qk, direct_qb_q8,
+        if (!glm_mla_forward_token_metal(xn, m, il, fast_l, direct_qa_qk, direct_out_qk, direct_qb_q8, direct_kv_q8,
                                          c->WqA, c->WqB, c->WkvA, c->WkB, c->WvB, Wo_use,
                                          qa_norm, kv_norm,
                                          c->Knope[il], c->Vc[il], c->Krop[il],
