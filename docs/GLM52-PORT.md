@@ -418,6 +418,12 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `DS4_GLM_FAST=1` for short Metal prompts (`<=32` prompt tokens), with
   `DS4_GLM_PREFILL_BATCH_LIVE=0/off/false/no` as the escape hatch and
   `DS4_GLM_PREFILL_BATCH_LIVE=1` as an explicit force-enable outside fast mode.
+  `DS4_GLM_PREFILL_BATCH_CHECK=1` works on both sides: after sequential prefill
+  it compares a batch scratch ctx, and after live batch prefill it compares a
+  sequential scratch ctx, including one-token continuation, without changing output.
+  On default-fast `asdfqwer -n 1`, the live check reports
+  `seq_top=batch_top=108714`, `max_abs=0`, `seq_next=batch_next=100461`,
+  `cont_max_abs=0`.
   It batch-prefills a fresh scratch ctx, copies KV/final hidden/logits into the
   live ctx only after success, and falls back to sequential prefill on failure or
   over-limit prompts. With `DS4_GLM_FAST=1`, the live-prefill scratch ctx enables

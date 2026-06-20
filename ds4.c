@@ -30785,7 +30785,7 @@ static void glm_metal_prefill_batch_check(const char *label,
                                           uint32_t vocab) {
     if (!glm_env_flag_enabled("DS4_GLM_PREFILL_BATCH_CHECK")) return;
     if (!live || !prompt || !seq_logits || prompt_len == 0 || vocab == 0) return;
-    const uint32_t max_rows = 16;
+    const uint32_t max_rows = 32;
     if (prompt_len > max_rows) {
         fprintf(stderr,
                 "ds4: %s: prefill batch check skipped (%u rows > max %u)\n",
@@ -30851,6 +30851,80 @@ static void glm_metal_prefill_batch_check(const char *label,
     }
     free(batch_logits);
     if (bat.m) glm_metal_fwd_free(&bat);
+}
+
+static void glm_metal_prefill_live_check(const char *label,
+                                         const glm_metal_fwd_ctx *live,
+                                         const int *prompt,
+                                         uint32_t prompt_len,
+                                         const float *batch_logits,
+                                         uint32_t vocab) {
+    if (!glm_env_flag_enabled("DS4_GLM_PREFILL_BATCH_CHECK")) return;
+    if (!live || !prompt || !batch_logits || prompt_len == 0 || vocab == 0) return;
+    const uint32_t max_rows = 32;
+    if (prompt_len > max_rows) {
+        fprintf(stderr,
+                "ds4: %s: prefill live check skipped (%u rows > max %u)\n",
+                label ? label : "glm-generate", prompt_len, max_rows);
+        return;
+    }
+    glm_metal_fwd_ctx seq;
+    memset(&seq, 0, sizeof(seq));
+    bool ready = glm_metal_fwd_init_ex(&seq, live->m, live->shape,
+                                       live->n_layer, live->n_dense,
+                                       live->seq_n, false);
+    if (ready) (void)glm_metal_fwd_borrow_shared_experts(&seq, live);
+    float *seq_logits = ready ? xmalloc((size_t)vocab * sizeof(float)) : NULL;
+    const double t0 = now_sec();
+    bool ok = ready;
+    for (uint32_t t = 0; ok && t < prompt_len; t++)
+        ok = glm_metal_fwd_step(&seq, prompt[t], t, t + 1u == prompt_len, seq_logits);
+    const double elapsed = now_sec() - t0;
+    if (ok) {
+        const int seq_top = sample_argmax(seq_logits, vocab);
+        const int batch_top = sample_argmax(batch_logits, vocab);
+        const float max_abs = max_abs_diff(seq_logits, batch_logits, vocab);
+        bool cont_ok = false;
+        int seq_cont_top = -1, batch_cont_top = -1;
+        float cont_max_abs = 1.0e30f;
+        if (seq_top == batch_top && prompt_len < live->seq_n) {
+            glm_metal_fwd_ctx batch_cont;
+            memset(&batch_cont, 0, sizeof(batch_cont));
+            float *seq_next = xmalloc((size_t)vocab * sizeof(float));
+            float *batch_next = xmalloc((size_t)vocab * sizeof(float));
+            bool cok = glm_metal_fwd_init_ex(&batch_cont, live->m, live->shape,
+                                             live->n_layer, live->n_dense,
+                                             live->seq_n, false);
+            if (cok) (void)glm_metal_fwd_borrow_shared_experts(&batch_cont, live);
+            if (cok) cok = glm_metal_fwd_copy_kv(&batch_cont, live);
+            if (cok) {
+                memcpy(batch_cont.x, live->x, (size_t)live->H * sizeof(float));
+                memcpy(batch_cont.xn, live->xn, (size_t)live->H * sizeof(float));
+                cok = glm_metal_fwd_step(&seq, seq_top, prompt_len, true, seq_next) &&
+                      glm_metal_fwd_step(&batch_cont, batch_top, prompt_len, true, batch_next);
+            }
+            if (cok) {
+                seq_cont_top = sample_argmax(seq_next, vocab);
+                batch_cont_top = sample_argmax(batch_next, vocab);
+                cont_max_abs = max_abs_diff(seq_next, batch_next, vocab);
+                cont_ok = seq_cont_top == batch_cont_top;
+            }
+            free(batch_next);
+            free(seq_next);
+            if (batch_cont.m) glm_metal_fwd_free(&batch_cont);
+        }
+        fprintf(stderr,
+                "ds4: %s: prefill live check rows=%u ok=%s seq_top=%d batch_top=%d max_abs=%g cont_ok=%s seq_next=%d batch_next=%d cont_max_abs=%g time=%.3fs\n",
+                label ? label : "glm-generate", prompt_len,
+                seq_top == batch_top ? "yes" : "no", seq_top, batch_top,
+                (double)max_abs, cont_ok ? "yes" : "no",
+                seq_cont_top, batch_cont_top, (double)cont_max_abs, elapsed);
+    } else {
+        fprintf(stderr, "ds4: %s: prefill live check failed rows=%u time=%.3fs\n",
+                label ? label : "glm-generate", prompt_len, elapsed);
+    }
+    free(seq_logits);
+    if (seq.m) glm_metal_fwd_free(&seq);
 }
 #endif
 
@@ -31087,9 +31161,14 @@ static int glm_generate_loop(const char *label,
     }
     const double prefill_s = now_sec() - pf0;
 #ifndef DS4_NO_GPU
-    if (!batch_prefill && step == glm_gen_metal_step)
-        glm_metal_prefill_batch_check(label, (const glm_metal_fwd_ctx *)ctx,
-                                      prompt, prompt_len, logits, vocab);
+    if (step == glm_gen_metal_step) {
+        if (batch_prefill)
+            glm_metal_prefill_live_check(label, (const glm_metal_fwd_ctx *)ctx,
+                                         prompt, prompt_len, logits, vocab);
+        else
+            glm_metal_prefill_batch_check(label, (const glm_metal_fwd_ctx *)ctx,
+                                          prompt, prompt_len, logits, vocab);
+    }
 #endif
 
     /* Opt-in NextN speculative path (default-off).  It reuses the shared

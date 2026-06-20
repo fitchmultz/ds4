@@ -256,7 +256,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_F32=1", "GLM diagnostic: opt --glm-nextn verification into the full F32 layer-major Metal target-batch path; 0/off/false/no disable. Correctness/proof path, not a default speed claim.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_TIME=1", "GLM diagnostic: time the GLM batch helper by alloc/embed/attention/FFN/head plus attention dequant/proj/cache/decode/out detail; 0/off/false/no disable.");
     opt(fp, c, "DS4_GLM_VERIFY_BATCH_FAST_MOE=1", "GLM diagnostic: with DS4_GLM_VERIFY_BATCH_F32=1 and DS4_GLM_FAST=1, let the batch verifier use production fast routed-MoE kernels; default keeps the pure F32 proof path.");
-    opt(fp, c, "DS4_GLM_PREFILL_BATCH_CHECK=1", "GLM diagnostic: after normal short Metal prefill, run the layer-major batch helper in a scratch ctx and report final/continuation top+max-diff; does not affect output.");
+    opt(fp, c, "DS4_GLM_PREFILL_BATCH_CHECK=1", "GLM diagnostic: for short Metal prompts, compare sequential prefill and layer-major batch prefill final/continuation logits in scratch ctxs; does not affect output.");
     opt(fp, c, "DS4_GLM_PREFILL_BATCH_LIVE=0/off", "GLM fast path: disable the default short-prompt live batched prefill used by DS4_GLM_FAST=1. Set =1 to force the guarded scratch-copy prefill outside DS4_GLM_FAST.");
     opt(fp, c, "DS4_GLM_FAST=1", "GLM-5.2 Metal fast path: fused routed MoE gate/up/down plus resident shared experts.");
     opt(fp, c, "DS4_GLM_EXPERT_PREAD=0/off", "GLM fast path: disable default selected-expert pread and restore mmap page-fault staging for A/B tests.");
