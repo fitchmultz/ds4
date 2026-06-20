@@ -29020,6 +29020,8 @@ typedef struct {
      * verifier batch helper.  This is proof/diagnostic data for the remaining
      * production-speed NextN work; it does not change math or routing. */
     double batch_alloc_s, batch_embed_s, batch_attn_s, batch_ffn_s, batch_head_s;
+    double batch_attn_dequant_s, batch_attn_proj_s, batch_attn_cache_s;
+    double batch_attn_decode_s, batch_attn_out_s;
     uint64_t batch_calls, batch_rows, batch_layers;
     /* Step 5 diagnostic: count MoE layers that took the fused shared-expert
      * path (for verifying eligibility + A/B attribution). */
@@ -29256,6 +29258,11 @@ static void glm_metal_fwd_free(glm_metal_fwd_ctx *c) {
                 c->batch_alloc_s, c->batch_embed_s, c->batch_attn_s,
                 c->batch_ffn_s, c->batch_head_s, total,
                 total / calls, total / rows);
+        fprintf(stderr, "ds4: glm-metal batch-f32 attn detail: "
+                        "dequant=%.3fs proj=%.3fs cache=%.3fs decode=%.3fs out=%.3fs\n",
+                c->batch_attn_dequant_s, c->batch_attn_proj_s,
+                c->batch_attn_cache_s, c->batch_attn_decode_s,
+                c->batch_attn_out_s);
     }
     if (c->dec_steps && getenv("DS4_GLM_DECODE_TIME")) {
         const double n = (double)c->dec_steps;
@@ -29625,6 +29632,7 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
         const ds4_tensor *kv_norm_t = glm_layer_tensor(m, il, "attn_kv_a_norm");
         if (!anorm_t || !q_a || !q_b || !kv_a || !k_b || !v_b || !wop ||
             !qa_norm_t || !kv_norm_t) { ok = false; break; }
+        double attn_stage_t0 = batch_prof ? now_sec() : 0.0;
         glm_dequant_weight(m, q_a, c->WqA);
         glm_dequant_weight(m, q_b, c->WqB);
         glm_dequant_weight(m, kv_a, c->WkvA);
@@ -29632,6 +29640,10 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
         glm_k_b_reorder(c->WkB, c->WkBn, nope, kvl, nh);
         glm_dequant_weight(m, v_b, c->WvB);
         glm_dequant_weight(m, wop, c->Wo);
+        if (batch_prof) {
+            c->batch_attn_dequant_s += now_sec() - attn_stage_t0;
+            attn_stage_t0 = now_sec();
+        }
 
         ok = ds4_gpu_glm_rmsnorm_batch_f32(x, (const float *)tensor_data(m, anorm_t),
                                            xn, H, n_tok, shape->rms_eps) != 0;
@@ -29661,6 +29673,10 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
                                                             shape->rope_base, pos0, n_tok) != 0;
         if (ok) ok = ds4_gpu_glm_rope_interleaved_batch_f32(bkr_raw, bkr_r, rope, nh,
                                                             shape->rope_base, pos0, n_tok) != 0;
+        if (batch_prof) {
+            c->batch_attn_proj_s += now_sec() - attn_stage_t0;
+            attn_stage_t0 = now_sec();
+        }
         for (uint32_t t = 0; ok && t < n_tok; t++) {
             const uint32_t p = pos0 + t;
             for (uint32_t h = 0; h < nh; h++) {
@@ -29681,12 +29697,21 @@ static bool glm_metal_fwd_batch_f32(glm_metal_fwd_ctx *c,
                        (size_t)vd * sizeof(float));
             }
         }
+        if (batch_prof) {
+            c->batch_attn_cache_s += now_sec() - attn_stage_t0;
+            attn_stage_t0 = now_sec();
+        }
         if (ok) ok = ds4_gpu_glm_attn_decode_batch_f32(bQ, c->Knope[il], c->Krop[il], c->Vc[il],
                                                        battn, nh, nope, rope, vd, qhd,
                                                        c->seq_n, pos0, n_tok) != 0;
+        if (batch_prof) {
+            c->batch_attn_decode_s += now_sec() - attn_stage_t0;
+            attn_stage_t0 = now_sec();
+        }
         if (ok) ok = ds4_gpu_glm_matmul_f32(c->Wo, battn, mla_out, H, nh * vd, n_tok) != 0;
         if (ok) ok = ds4_gpu_glm_add_batch_f32(res, mla_out, x, H, n_tok) != 0;
         if (batch_prof) {
+            c->batch_attn_out_s += now_sec() - attn_stage_t0;
             c->batch_attn_s += now_sec() - prof_t0;
             prof_t0 = now_sec();
         }
