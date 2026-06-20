@@ -362,7 +362,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   opt-in `--glm-nextn --glm-nextn-draft 1` with `DS4_GLM_VERIFY_BATCH_F32=1
   DS4_GLM_VERIFY_BATCH_FAST_MOE=1` at decode `12.30s`, with identical ids/stdout
   and `target_steps=2,target_batches=1`; this is a narrow accepted-round opt-in
-  measurement, not a default production speed claim. Default remains the pure F32 proof path,
+  measurement, not a default production speed claim. A second prompt,
+  `The meaning of life is -n 3`, kept identical ids/stdout (`264 27066 323`,
+  ` a profound and`) but missed the draft (`target_steps=2,target_batches=2`) and
+  measured NextN decode `22.55s` vs plain greedy `20.36s`, confirming acceptance
+  rate still gates speed. Default remains the pure F32 proof path,
   `--glm-spec-batch-verify-synth` pins the future batched-verifier contract to
   the same sequence,
   `--glm-nextn-prefix-synth` pins draft-prefix commit/reset bookkeeping, and
