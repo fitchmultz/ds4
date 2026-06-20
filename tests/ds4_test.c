@@ -3028,6 +3028,49 @@ static void test_glm_spec_generate_synth(void) {
     TEST_ASSERT(miss == 1);
 }
 
+static void test_glm_spec_trace_synth(void) {
+    const char *path = "/tmp/ds4_glm_spec_trace_synth.csv";
+    char *saved = test_save_env("DS4_GLM_NEXTN_TRACE_OUT");
+    remove(path);
+    setenv("DS4_GLM_NEXTN_TRACE_OUT", path, 1);
+    int full = 0, partial = 0, miss = 0;
+    int rc = ds4_glm_spec_generate_synth(8, &full, &partial, &miss);
+    test_restore_env("DS4_GLM_NEXTN_TRACE_OUT", saved);
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(full == 1 && partial == 1 && miss == 1);
+
+    FILE *f = fopen(path, "r");
+    TEST_ASSERT(f != NULL);
+    char line[512];
+    TEST_ASSERT(fgets(line, sizeof(line), f) != NULL);
+    TEST_ASSERT(strstr(line, "round,generated_before,seed_token,active_depth") != NULL);
+    int rows = 0;
+    int last_active_depth = -1, last_generated_after = -1, last_fallback = -1;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long round = 0;
+        int generated_before = 0, seed_token = 0, active_depth = 0, first_target = 0;
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0, accepted = 0;
+        int fallback_emitted = 0, fallback_token = 0, generated_after = 0;
+        int n = sscanf(line, "%llu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+                       &round, &generated_before, &seed_token, &active_depth,
+                       &first_target, &d0, &d1, &d2, &d3, &accepted,
+                       &fallback_emitted, &fallback_token, &generated_after);
+        TEST_ASSERT(n == 13);
+        rows++;
+        last_active_depth = active_depth;
+        last_generated_after = generated_after;
+        last_fallback = fallback_emitted;
+    }
+    fclose(f);
+    remove(path);
+    TEST_ASSERT(rows == 8);
+    TEST_ASSERT(last_active_depth == 0);
+    TEST_ASSERT(last_generated_after == 8);
+    TEST_ASSERT(last_fallback == 1);
+    fprintf(stderr, "  glm-spec-trace-synth: PASS (%d rows, final active_depth=%d generated_after=%d)\n",
+            rows, last_active_depth, last_generated_after);
+}
+
 static void test_glm_metal_components(void) {
 #ifdef DS4_NO_GPU
     fprintf(stderr, "  glm-metal: SKIP (built without GPU/Metal)\n");
@@ -3363,6 +3406,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/MLA projections/latent RMSNorm/attention) vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
+    {"--glm-spec-trace-synth", "glm-spec-trace-synth", "GLM-5.2 NextN speculative CSV trace includes every round including final no-draft row (no model needed)", test_glm_spec_trace_synth},
 };
 
 static void test_print_help(const char *prog) {
