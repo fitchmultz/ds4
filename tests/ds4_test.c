@@ -3287,6 +3287,106 @@ static void test_glm_metal_components(void) {
     float *ref_mla_out = glm_ref_load_floats(dir, "mla_out.txt", H);
     if (ref_mla_out) glm_metal_cmp("MLA composite (Metal vs numpy)", mout, ref_mla_out, H, tol_abs, tol_rel);
 
+    /* ---- layer-major MLA microbatch skeleton: two contiguous tokens ----
+     * This exercises the F32 batch matmul/RMSNorm/RoPE/attention primitives in
+     * the exact order a real batched verifier/prefill path needs, while the CPU
+     * side remains the existing sequential oracle with cache mutation. */
+    {
+        const uint32_t pos0 = t_pos - 1u;
+        float *bx = malloc((size_t)batch_n * H * sizeof(float));
+        float *bcpu = malloc((size_t)batch_n * H * sizeof(float));
+        float *bqa = malloc((size_t)batch_n * ql * sizeof(float));
+        float *bqa_n = malloc((size_t)batch_n * ql * sizeof(float));
+        float *bq = malloc((size_t)batch_n * nh * qhd * sizeof(float));
+        float *bkva = malloc((size_t)batch_n * (kvl + rope) * sizeof(float));
+        float *bkv_lat = malloc((size_t)batch_n * kvl * sizeof(float));
+        float *bkvln = malloc((size_t)batch_n * kvl * sizeof(float));
+        float *bk = malloc((size_t)batch_n * nh * nope * sizeof(float));
+        float *bv = malloc((size_t)batch_n * nh * vd * sizeof(float));
+        float *bqr = malloc((size_t)batch_n * nh * rope * sizeof(float));
+        float *bqr_r = malloc((size_t)batch_n * nh * rope * sizeof(float));
+        float *bkr = malloc((size_t)batch_n * nh * rope * sizeof(float));
+        float *bkr_r = malloc((size_t)batch_n * nh * rope * sizeof(float));
+        float *bQ = malloc((size_t)batch_n * nh * qhd * sizeof(float));
+        float *bKc_n = malloc((size_t)nh * seq_n * nope * sizeof(float));
+        float *bKc_r = malloc((size_t)nh * seq_n * rope * sizeof(float));
+        float *bVc = malloc((size_t)nh * seq_n * vd * sizeof(float));
+        float *battn = malloc((size_t)batch_n * nh * vd * sizeof(float));
+        float *bmetal = malloc((size_t)batch_n * H * sizeof(float));
+        float *bcpu_kn = malloc((size_t)nh * seq_n * nope * sizeof(float));
+        float *bcpu_kr = malloc((size_t)nh * seq_n * rope * sizeof(float));
+        float *bcpu_v = malloc((size_t)nh * seq_n * vd * sizeof(float));
+        TEST_ASSERT(bx && bcpu && bqa && bqa_n && bq && bkva && bkv_lat && bkvln && bk && bv);
+        TEST_ASSERT(bqr && bqr_r && bkr && bkr_r && bQ && bKc_n && bKc_r && bVc && battn && bmetal);
+        TEST_ASSERT(bcpu_kn && bcpu_kr && bcpu_v);
+        for (uint32_t i = 0; i < H; i++) bx[i] = x[i] * 0.9f + 0.02f * (float)((int)i - 5);
+        memcpy(bx + (size_t)H, x, (size_t)H * sizeof(float));
+        memcpy(bcpu_kn, K_nope_ref, (size_t)nh * seq_n * nope * sizeof(float));
+        memcpy(bcpu_kr, K_rope_ref, (size_t)nh * seq_n * rope * sizeof(float));
+        memcpy(bcpu_v, V_ref, (size_t)nh * seq_n * vd * sizeof(float));
+        for (uint32_t t = 0; t < batch_n; t++)
+            glm_mla_forward_token_f32(bcpu + (size_t)t * H, bx + (size_t)t * H,
+                                      WqA, WqB, WkvA, WkB, WvB, Wo,
+                                      NULL, NULL, bcpu_kn, bcpu_v, bcpu_kr,
+                                      seq_n, pos0 + t, &shape, NULL);
+
+        TEST_ASSERT(ds4_gpu_glm_matmul_f32(WqA, bx, bqa, ql, H, batch_n));
+        TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(bqa, ones, bqa_n, ql, batch_n, shape.rms_eps));
+        TEST_ASSERT(ds4_gpu_glm_matmul_f32(WqB, bqa_n, bq, nh * qhd, ql, batch_n));
+        TEST_ASSERT(ds4_gpu_glm_matmul_f32(WkvA, bx, bkva, kvl + rope, H, batch_n));
+        for (uint32_t t = 0; t < batch_n; t++)
+            memcpy(bkv_lat + (size_t)t * kvl, bkva + (size_t)t * (kvl + rope), (size_t)kvl * sizeof(float));
+        TEST_ASSERT(ds4_gpu_glm_rmsnorm_batch_f32(bkv_lat, ones, bkvln, kvl, batch_n, shape.rms_eps));
+        TEST_ASSERT(ds4_gpu_glm_matmul_f32(WkB, bkvln, bk, nh * nope, kvl, batch_n));
+        TEST_ASSERT(ds4_gpu_glm_matmul_f32(WvB, bkvln, bv, nh * vd, kvl, batch_n));
+        for (uint32_t t = 0; t < batch_n; t++) {
+            for (uint32_t h = 0; h < nh; h++) {
+                memcpy(bqr + ((size_t)t * nh + h) * rope,
+                       bq + (size_t)t * nh * qhd + (size_t)h * qhd + nope,
+                       (size_t)rope * sizeof(float));
+                memcpy(bkr + ((size_t)t * nh + h) * rope,
+                       bkva + (size_t)t * (kvl + rope) + kvl,
+                       (size_t)rope * sizeof(float));
+            }
+        }
+        TEST_ASSERT(ds4_gpu_glm_rope_interleaved_batch_f32(bqr, bqr_r, rope, nh, shape.rope_base, pos0, batch_n));
+        TEST_ASSERT(ds4_gpu_glm_rope_interleaved_batch_f32(bkr, bkr_r, rope, nh, shape.rope_base, pos0, batch_n));
+        for (uint32_t t = 0; t < batch_n; t++) {
+            for (uint32_t h = 0; h < nh; h++) {
+                memcpy(bQ + ((size_t)t * nh + h) * qhd,
+                       bq + (size_t)t * nh * qhd + (size_t)h * qhd,
+                       (size_t)nope * sizeof(float));
+                memcpy(bQ + ((size_t)t * nh + h) * qhd + nope,
+                       bqr_r + ((size_t)t * nh + h) * rope,
+                       (size_t)rope * sizeof(float));
+            }
+        }
+        memcpy(bKc_n, K_nope_ref, (size_t)nh * seq_n * nope * sizeof(float));
+        memcpy(bKc_r, K_rope_ref, (size_t)nh * seq_n * rope * sizeof(float));
+        memcpy(bVc, V_ref, (size_t)nh * seq_n * vd * sizeof(float));
+        for (uint32_t t = 0; t < batch_n; t++) {
+            const uint32_t p = pos0 + t;
+            for (uint32_t h = 0; h < nh; h++) {
+                memcpy(bKc_n + ((size_t)h * seq_n + p) * nope,
+                       bk + ((size_t)t * nh + h) * nope, (size_t)nope * sizeof(float));
+                memcpy(bKc_r + ((size_t)h * seq_n + p) * rope,
+                       bkr_r + ((size_t)t * nh + h) * rope, (size_t)rope * sizeof(float));
+                memcpy(bVc + ((size_t)h * seq_n + p) * vd,
+                       bv + ((size_t)t * nh + h) * vd, (size_t)vd * sizeof(float));
+            }
+        }
+        TEST_ASSERT(ds4_gpu_glm_attn_decode_batch_f32(bQ, bKc_n, bKc_r, bVc, battn,
+                                                      nh, nope, rope, vd, qhd,
+                                                      seq_n, pos0, batch_n));
+        TEST_ASSERT(ds4_gpu_glm_matmul_f32(Wo, battn, bmetal, H, nh * vd, batch_n));
+        glm_metal_cmp("MLA batch2 layer-major composite", bmetal, bcpu,
+                      (size_t)batch_n * H, tol_abs, tol_rel);
+        free(bx); free(bcpu); free(bqa); free(bqa_n); free(bq); free(bkva);
+        free(bkv_lat); free(bkvln); free(bk); free(bv); free(bqr); free(bqr_r);
+        free(bkr); free(bkr_r); free(bQ); free(bKc_n); free(bKc_r); free(bVc);
+        free(battn); free(bmetal); free(bcpu_kn); free(bcpu_kr); free(bcpu_v);
+    }
+
     /* =============================================================
      * Phase 4c-ii: sigmoid MoE router + dense/shared-expert SwiGLU FFN.
      * Same component-then-composite pattern as the MLA block above: each
@@ -3467,7 +3567,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-nextn-synth", "glm-nextn-synth", "GLM-5.2 NextN/MTP blk.78 path on a tiny synthetic block (no model needed)", test_glm_nextn_synth},
     {"--glm-nextn-metal-synth", "glm-nextn-metal-synth", "GLM-5.2 Metal NextN/MTP path on a tiny synthetic block (no model needed)", test_glm_nextn_metal_synth},
     {"--glm-metal-forward-synth", "glm-metal-forward-synth", "GLM-5.2 full Metal forward (Phase 4c-iv) on a tiny synthetic model: argmax == CPU synth (no model needed)", test_glm_metal_forward_synth},
-    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels (RoPE/batch RoPE/MLA projections/batch matmul/batch RMSNorm/batch attention) vs CPU reference", test_glm_metal_components},
+    {"--glm-metal-components", "glm-metal-components", "GLM-5.2 Metal component kernels and layer-major MLA batch composite vs CPU reference", test_glm_metal_components},
     {"--glm-generate-synth", "glm-generate-synth", "GLM-5.2 incremental generation: greedy argmax == naive full forward every step (CPU), and Metal incremental == CPU (no model needed)", test_glm_generate_synth},
     {"--glm-spec-generate-synth", "glm-spec-generate-synth", "GLM-5.2 NextN speculative accept/rollback: full/partial/miss cases == naive greedy (no model needed)", test_glm_spec_generate_synth},
     {"--glm-spec-batch-verify-synth", "glm-spec-batch-verify-synth", "GLM-5.2 NextN batched-verifier contract == naive greedy (no model needed)", test_glm_spec_batch_verify_synth},
