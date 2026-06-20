@@ -298,8 +298,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   `Once upon a time` accepted 1/7, and `2+2=` accepted 2/6. All accepted real
   sweeps were partial rounds (mostly first-draft hits); this means target
   batched/tree verify can reduce overhead, but deeper speedup likely also needs
-  better acceptance from fuller draft-worker state/prefix handling. The
-  single-step target verifier is now isolated in
+  better acceptance from fuller draft-worker state/prefix handling. Current
+  SGLang `EagleDraftInputV2Mixin.prepare_for_v2_draft` seeds draft positions
+  from `batch.seq_lens` and writes draft KV into request-token pools; ds4's
+  drafter now has recursive local draft KV, but not persistent prefix/absolute-
+  position draft KV yet. The single-step target verifier is now isolated in
   `glm_spec_verify_after_bonus_single`, giving the future Metal verifier
   microbatch a concrete contract to replace without changing accept/rollback
   semantics. `ds4_test --glm-spec-generate-synth` pins full/partial/miss cases
@@ -336,8 +339,8 @@ The core GLM port is complete and verified. The active work is usability/speed:
   traceable greedy verification. Current recorded raw smokes now show real draft
   hits after the SGLang bonus-token semantics fix, but speed is still limited by
   one target forward per emitted token. Real speed still needs batched target
-  verification and/or higher acceptance; do not present the scaffold alone as a
-  speed win.
+  verification and higher acceptance from persistent prefix/absolute-position
+  draft KV; do not present the scaffold alone as a speed win.
 - Batched/persistent GLM graph work remains the largest speed risk: prefill still
   runs one full per-token forward, and the NextN verifier still uses one target
   forward per emitted token.
