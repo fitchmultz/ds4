@@ -28693,6 +28693,17 @@ static bool glm_swiglu_metal(const float *x,
     return true;
 }
 
+static bool glm_shexp_direct_quant_metal(const ds4_model *m,
+                                         const ds4_tensor *gsh,
+                                         const ds4_tensor *ush,
+                                         const ds4_tensor *dsh,
+                                         const float *x,
+                                         uint32_t H,
+                                         uint32_t I,
+                                         float *out,
+                                         float *sg,
+                                         float *su);
+
 /* LM head: output_norm (RMSNorm) then chunked row-matvec over the output
  * weight.  The full dequanted output [vocab,H] is ~3.8 GiB, so it is processed
  * in bounded row-chunks (dequant chunk -> Metal matvec -> store logits),
@@ -29103,6 +29114,7 @@ typedef struct {
     bool direct_qb_q8;
     bool direct_kv_q8;
     bool direct_kb_q8;
+    bool shexp_direct_qk;
     /* Batch helper fast MoE bridge. Defaults to the verifier env for existing
      * NextN diagnostics; live batched prefill can enable it per scratch ctx. */
     bool batch_fast_moe;
@@ -29237,6 +29249,7 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
     c->direct_qb_q8 = false;
     c->direct_kv_q8 = false;
     c->direct_kb_q8 = false;
+    c->shexp_direct_qk = false;
     c->batch_fast_moe = glm_env_flag_enabled("DS4_GLM_VERIFY_BATCH_FAST_MOE");
     if (glm_fast_enabled()) {
         ds4_gpu_set_ssd_streaming(true);
@@ -29254,6 +29267,10 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
             }
         }
         c->fast = ok;
+        if (ok) {
+            const char *dshqk = getenv("DS4_GLM_SHEXP_DIRECT_QK");
+            c->shexp_direct_qk = dshqk ? glm_env_flag_enabled("DS4_GLM_SHEXP_DIRECT_QK") : true;
+        }
         if (ok && predequant_shared_experts) {
             const char *dqa = getenv("DS4_GLM_MLA_DIRECT_QA_QK");
             c->direct_qa_qk = dqa ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_QA_QK") : true;
@@ -29267,7 +29284,7 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
             c->direct_kb_q8 = dkb ? glm_env_flag_enabled("DS4_GLM_MLA_DIRECT_KB_Q8") : true;
         }
         if (ok) {
-            const bool shexp_resident = predequant_shared_experts &&
+            const bool shexp_resident = predequant_shared_experts && !c->shexp_direct_qk &&
                                         getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
             if (shexp_resident) {
                 /* Step 5: pre-dequant every MoE layer's shared-expert gate/up/down
@@ -29345,10 +29362,11 @@ static bool glm_metal_fwd_init_ex(glm_metal_fwd_ctx *c, const ds4_model *m,
                             now_sec() - wo_t0);
                 }
             }
-            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s%s%s%s%s%s%s "
+            fprintf(stderr, "ds4: glm-fast: IQ2_XXS MoE gate/up%s%s%s%s%s%s%s%s "
                                 "+ IQ3_XXS/IQ4_XS MoE down paths enabled (DS4_GLM_FAST=1; "
                                 "MLA stays F32 oracle on UD-IQ2_M)\n",
                     shexp_resident ? " + resident shared-expert" : "",
+                    c->shexp_direct_qk ? " + direct shexp QK" : "",
                     c->Wo_cache ? " + attn_output F32 cache" : "",
                     c->direct_qa_qk ? " + direct q_a QK" : "",
                     c->direct_out_qk ? " + direct attn_output QK" : "",
@@ -29715,10 +29733,16 @@ static bool glm_metal_fwd_step(glm_metal_fwd_ctx *c, int token, uint32_t pos,
              * attribution (same binary, identical SSD warmth). */
             if (moe_prof) down_t = now_sec() - down0;
             const double sh0 = moe_prof ? now_sec() : 0.0;
+            const bool shexp_direct = c->fast && c->shexp_direct_qk &&
+                                       getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
             const bool shexp_fast = c->fast && c->sh_g && c->sh_u && c->sh_d &&
                                     c->sh_g[il] != NULL &&
                                     getenv("DS4_GLM_NO_SHEXP_FAST") == NULL;
-            if (shexp_fast) {
+            if (shexp_direct) {
+                c->shexp_fast_calls++;
+                if (!glm_shexp_direct_quant_metal(m, gsh, ush, dsh, xn, H, ei, etmp, c->sg, c->su))
+                    return false;
+            } else if (shexp_fast) {
                 c->shexp_fast_calls++;
                 if (!glm_swiglu_metal(xn, c->sh_g[il], c->sh_u[il], c->sh_d[il],
                                       H, ei, etmp, c->sg, c->su))
@@ -31759,6 +31783,180 @@ int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
     free(logits);
     free(toks.v);
     return rc;
+}
+
+static bool glm_direct_qk_kernel_for_tensor(const ds4_tensor *t, const char **kernel, uint32_t *nr0) {
+    if (!t || !kernel || !nr0) return false;
+    if (t->type == 13) { *kernel = "kernel_glm_matvec_q5_k_f32"; *nr0 = 1; return true; }
+    if (t->type == 14) { *kernel = "kernel_glm_matvec_q6_k_f32"; *nr0 = 2; return true; }
+    return false;
+}
+
+static bool glm_shexp_direct_quant_metal(const ds4_model *m,
+                                         const ds4_tensor *gsh,
+                                         const ds4_tensor *ush,
+                                         const ds4_tensor *dsh,
+                                         const float *x,
+                                         uint32_t H,
+                                         uint32_t I,
+                                         float *out,
+                                         float *sg,
+                                         float *su) {
+    const char *g_kernel = NULL, *u_kernel = NULL, *d_kernel = NULL;
+    uint32_t g_nr0 = 0, u_nr0 = 0, d_nr0 = 0;
+    if (!glm_direct_qk_kernel_for_tensor(gsh, &g_kernel, &g_nr0) ||
+        !glm_direct_qk_kernel_for_tensor(ush, &u_kernel, &u_nr0)) return false;
+    const bool down_qk = glm_direct_qk_kernel_for_tensor(dsh, &d_kernel, &d_nr0);
+    const bool down_q8 = dsh && dsh->type == DS4_TENSOR_Q8_0;
+    if (!down_qk && !down_q8) return false;
+    if (!ds4_gpu_glm_matvec_qk_f32(tensor_data(m, gsh), gsh->bytes, x, sg,
+                                   I, H, gsh->bytes / I, g_nr0, g_kernel)) return false;
+    if (!ds4_gpu_glm_matvec_qk_f32(tensor_data(m, ush), ush->bytes, x, su,
+                                   I, H, ush->bytes / I, u_nr0, u_kernel)) return false;
+    if (!ds4_gpu_glm_swiglu_f32(sg, su, sg, I)) return false;
+    if (down_qk) {
+        return ds4_gpu_glm_matvec_qk_f32(tensor_data(m, dsh), dsh->bytes, sg, out,
+                                         H, I, dsh->bytes / H, d_nr0, d_kernel) != 0;
+    }
+    return ds4_gpu_glm_matvec_q8_0_f32(tensor_data(m, dsh), dsh->bytes, sg, out, H, I) != 0;
+}
+
+int ds4_engine_glm_shexp_bench(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    const ds4_model *m = &e->model;
+    if (m->arch != DS4_ARCH_GLM_DSA) {
+        fprintf(stderr, "ds4: --glm-shexp-bench requires a GLM-5.2 (glm-dsa) model\n");
+        return 1;
+    }
+    const glm_cpu_shape shape = glm_cpu_shape_real();
+    uint32_t block_count = 0, nextn = 1;
+    if (!model_get_u32(m, "glm-dsa.block_count", &block_count) ||
+        !model_get_u32(m, "glm-dsa.nextn_predict_layers", &nextn)) {
+        fprintf(stderr, "ds4: --glm-shexp-bench missing GLM metadata\n");
+        return 1;
+    }
+    const uint32_t n_layer = block_count >= nextn ? block_count - nextn : block_count;
+    uint32_t il = 3;
+    const char *layer_env = getenv("DS4_GLM_SHEXP_BENCH_LAYER");
+    if (layer_env && layer_env[0]) il = (uint32_t)strtoul(layer_env, NULL, 10);
+    if (il >= n_layer) {
+        fprintf(stderr, "ds4: --glm-shexp-bench layer %u out of range (n_layer=%u)\n", il, n_layer);
+        return 1;
+    }
+    int iters = 3;
+    const char *iters_env = getenv("DS4_GLM_SHEXP_BENCH_ITERS");
+    if (iters_env && iters_env[0]) iters = atoi(iters_env);
+    if (iters < 1) iters = 1;
+    if (iters > 16) iters = 16;
+
+    const ds4_tensor *gsh = glm_layer_tensor(m, il, "ffn_gate_shexp");
+    const ds4_tensor *ush = glm_layer_tensor(m, il, "ffn_up_shexp");
+    const ds4_tensor *dsh = glm_layer_tensor(m, il, "ffn_down_shexp");
+    if (!gsh || !ush || !dsh) {
+        fprintf(stderr, "ds4: --glm-shexp-bench missing shared-expert tensors for blk.%u\n", il);
+        return 1;
+    }
+    const uint32_t H = shape.hidden;
+    if (gsh->elements % H != 0 || ush->elements != gsh->elements || dsh->elements != gsh->elements) {
+        fprintf(stderr, "ds4: --glm-shexp-bench unexpected shared-expert dimensions for blk.%u\n", il);
+        return 1;
+    }
+    const uint32_t I = (uint32_t)(gsh->elements / H);
+    const char *g_kernel = NULL, *u_kernel = NULL, *d_kernel = NULL;
+    uint32_t g_nr0 = 0, u_nr0 = 0, d_nr0 = 0;
+    const bool gate_up_direct_ok =
+        glm_direct_qk_kernel_for_tensor(gsh, &g_kernel, &g_nr0) &&
+        glm_direct_qk_kernel_for_tensor(ush, &u_kernel, &u_nr0);
+    const bool down_qk = glm_direct_qk_kernel_for_tensor(dsh, &d_kernel, &d_nr0);
+    const bool down_q8 = dsh->type == DS4_TENSOR_Q8_0;
+    if (!gate_up_direct_ok || (!down_qk && !down_q8)) {
+        fprintf(stderr, "ds4: --glm-shexp-bench direct path needs Q5_K/Q6_K gate/up and Q5_K/Q6_K/Q8_0 down, got gate=%s up=%s down=%s\n",
+                tensor_type_name(gsh->type), tensor_type_name(ush->type), tensor_type_name(dsh->type));
+        return 1;
+    }
+
+    float *Wg = xmalloc((size_t)I * H * sizeof(float));
+    float *Wu = xmalloc((size_t)I * H * sizeof(float));
+    float *Wd = xmalloc((size_t)H * I * sizeof(float));
+    float *x = xmalloc((size_t)H * sizeof(float));
+    float *base = xmalloc((size_t)H * sizeof(float));
+    float *direct = xmalloc((size_t)H * sizeof(float));
+    float *sg = xmalloc((size_t)I * sizeof(float));
+    float *su = xmalloc((size_t)I * sizeof(float));
+    float *dg = xmalloc((size_t)I * sizeof(float));
+    float *du = xmalloc((size_t)I * sizeof(float));
+    for (uint32_t i = 0; i < H; i++) x[i] = ((float)((int)(i % 251u) - 125)) * (1.0f / 251.0f);
+
+    const double deq0 = now_sec();
+    glm_dequant_weight(m, gsh, Wg);
+    glm_dequant_weight(m, ush, Wu);
+    glm_dequant_weight(m, dsh, Wd);
+    const double dequant_s = now_sec() - deq0;
+
+    bool ok = glm_swiglu_metal(x, Wg, Wu, Wd, H, I, base, sg, su);
+    if (ok) {
+        ok = ds4_gpu_glm_matvec_qk_f32(tensor_data(m, gsh), gsh->bytes, x, dg,
+                                       I, H, gsh->bytes / I, g_nr0, g_kernel) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_glm_matvec_qk_f32(tensor_data(m, ush), ush->bytes, x, du,
+                                       I, H, ush->bytes / I, u_nr0, u_kernel) != 0;
+    }
+    if (ok) ok = ds4_gpu_glm_swiglu_f32(dg, du, dg, I) != 0;
+    if (ok && down_qk) {
+        ok = ds4_gpu_glm_matvec_qk_f32(tensor_data(m, dsh), dsh->bytes, dg, direct,
+                                       H, I, dsh->bytes / H, d_nr0, d_kernel) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_glm_matvec_q8_0_f32(tensor_data(m, dsh), dsh->bytes, dg, direct, H, I) != 0;
+    }
+
+    double current_s = 0.0, gate_s = 0.0, up_s = 0.0, act_s = 0.0, down_s = 0.0;
+    for (int it = 0; ok && it < iters; it++) {
+        const double t0 = now_sec();
+        ok = glm_swiglu_metal(x, Wg, Wu, Wd, H, I, base, sg, su);
+        current_s += now_sec() - t0;
+    }
+    for (int it = 0; ok && it < iters; it++) {
+        double t0 = now_sec();
+        ok = ds4_gpu_glm_matvec_qk_f32(tensor_data(m, gsh), gsh->bytes, x, dg,
+                                       I, H, gsh->bytes / I, g_nr0, g_kernel) != 0;
+        gate_s += now_sec() - t0;
+        t0 = now_sec();
+        if (ok) ok = ds4_gpu_glm_matvec_qk_f32(tensor_data(m, ush), ush->bytes, x, du,
+                                               I, H, ush->bytes / I, u_nr0, u_kernel) != 0;
+        up_s += now_sec() - t0;
+        t0 = now_sec();
+        if (ok) ok = ds4_gpu_glm_swiglu_f32(dg, du, dg, I) != 0;
+        act_s += now_sec() - t0;
+        t0 = now_sec();
+        if (ok && down_qk) ok = ds4_gpu_glm_matvec_qk_f32(tensor_data(m, dsh), dsh->bytes, dg, direct,
+                                                          H, I, dsh->bytes / H, d_nr0, d_kernel) != 0;
+        else if (ok) ok = ds4_gpu_glm_matvec_q8_0_f32(tensor_data(m, dsh), dsh->bytes, dg, direct, H, I) != 0;
+        down_s += now_sec() - t0;
+    }
+    const float direct_max_abs = ok ? max_abs_diff(base, direct, H) : 1.0e30f;
+    const double direct_s = gate_s + up_s + act_s + down_s;
+    fprintf(stderr,
+            "ds4: glm-shexp-bench layer=blk.%u H=%u I=%u types gate=%s up=%s down=%s iters=%d\n",
+            il, H, I, tensor_type_name(gsh->type), tensor_type_name(ush->type),
+            tensor_type_name(dsh->type), iters);
+    fprintf(stderr,
+            "ds4: glm-shexp-bench resident-f32 init-dequant=%.3fs current=%.3fs avg=%.3fs\n",
+            dequant_s, current_s, current_s / (double)iters);
+    fprintf(stderr,
+            "ds4: glm-shexp-bench direct-qk gate=%.3fs up=%.3fs act=%.3fs down=%.3fs total=%.3fs avg=%.3fs max_abs_vs_f32=%g\n",
+            gate_s, up_s, act_s, down_s, direct_s, direct_s / (double)iters,
+            (double)direct_max_abs);
+    printf("glm-shexp-bench: layer=%u current_avg=%.6f direct_avg=%.6f max_abs=%g\n",
+           il, current_s / (double)iters, direct_s / (double)iters, (double)direct_max_abs);
+
+    free(du); free(dg); free(su); free(sg); free(direct); free(base); free(x); free(Wd); free(Wu); free(Wg);
+    return ok ? 0 : 1;
+#else
+    (void)e;
+    fprintf(stderr, "ds4: --glm-shexp-bench requires a Metal build\n");
+    return 1;
+#endif
 }
 
 int ds4_engine_glm_proj_bench(ds4_engine *e) {

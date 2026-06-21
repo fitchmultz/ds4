@@ -413,6 +413,7 @@ int ds4_engine_glm_chat(ds4_engine *e, const char *system, const char *prompt,
 int ds4_engine_glm_raw_generate(ds4_engine *e, const char *prompt,
                                 int n_predict, bool use_metal);
 int ds4_engine_glm_proj_bench(ds4_engine *e);
+int ds4_engine_glm_shexp_bench(ds4_engine *e);
 
 /* Phase 4e synth self-checks (no model on disk): incremental generation must
  * produce the SAME greedy argmax at every decode step as a fresh naive full
