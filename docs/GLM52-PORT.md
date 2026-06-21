@@ -423,7 +423,11 @@ The core GLM port is complete and verified. The active work is usability/speed:
   preserved output while improving no-profile `-n 3` decode from about
   `7.8-9.0s` to `6.4-7.4s`, and the default skips the old 10.55 GiB resident
   F32 shared-expert cache. Profiled `asdfqwer -n 5` now measures decode `13.64s`
-  with shared expert at `0.223s/token`.
+  with shared expert at `0.223s/token`. `--glm-lmhead-bench` scopes the next
+  bucket: current chunked F32 LM head is about `0.50s`/call at 8192-16384 output
+  rows, but direct quantized LM head is blocked because `output.weight` is Q4_K
+  and only Q5_K/Q6_K/Q8_0 direct matvec helpers exist today; no live LM-head
+  change was made.
   Rejected
   broader direct-MLA probe: direct `attn_q_a` alone benchmarks faster
   (`0.0011s` direct vs `0.0048s` cached F32 on `blk.0`), but trying to route

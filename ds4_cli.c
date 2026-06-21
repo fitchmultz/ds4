@@ -61,6 +61,7 @@ typedef struct {
     bool glm_metal_ref;
     bool glm_proj_bench;
     bool glm_shexp_bench;
+    bool glm_lmhead_bench;
     bool glm_chat;          /* Phase 4e: --glm-chat / --glm-chat-cpu */
     bool glm_raw;           /* Raw GLM generation, no chat template */
     bool glm_chat_metal;    /* true = metal backend, false = cpu */
@@ -1633,6 +1634,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--glm-shexp-bench")) {
             c.glm_shexp_bench = true;
             c.engine.glm_chat = true;
+        } else if (!strcmp(arg, "--glm-lmhead-bench")) {
+            c.glm_lmhead_bench = true;
+            c.engine.glm_chat = true;
         } else if (!strcmp(arg, "--glm-chat")) {
             /* Phase 4e: incremental GLM-5.2 chat generation on Metal (default
              * backend if available).  Applies the GLM chat template, prefills,
@@ -1764,6 +1768,8 @@ int main(int argc, char **argv) {
         rc = ds4_engine_glm_proj_bench(engine);
     } else if (cfg.glm_shexp_bench) {
         rc = ds4_engine_glm_shexp_bench(engine);
+    } else if (cfg.glm_lmhead_bench) {
+        rc = ds4_engine_glm_lmhead_bench(engine);
     } else if (cfg.glm_chat) {
         rc = ds4_engine_glm_chat(engine, cfg.gen.system, cfg.gen.prompt,
                                  cfg.gen.n_predict, cfg.glm_chat_metal);

@@ -31959,6 +31959,121 @@ int ds4_engine_glm_shexp_bench(ds4_engine *e) {
 #endif
 }
 
+int ds4_engine_glm_lmhead_bench(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    const ds4_model *m = &e->model;
+    if (m->arch != DS4_ARCH_GLM_DSA) {
+        fprintf(stderr, "ds4: --glm-lmhead-bench requires a GLM-5.2 (glm-dsa) model\n");
+        return 1;
+    }
+    const glm_cpu_shape shape = glm_cpu_shape_real();
+    const uint32_t H = shape.hidden;
+    const ds4_tensor *t_out = model_find_tensor(m, "output.weight");
+    const ds4_tensor *t_onorm = model_find_tensor(m, "output_norm.weight");
+    if (!t_out || !t_onorm || t_out->dim[1] == 0) {
+        fprintf(stderr, "ds4: --glm-lmhead-bench missing output tensors\n");
+        return 1;
+    }
+    const uint32_t vocab = (uint32_t)t_out->dim[1];
+    if (t_out->elements != (uint64_t)vocab * H) {
+        fprintf(stderr, "ds4: --glm-lmhead-bench unexpected output.weight elements: got %llu want %llu\n",
+                (unsigned long long)t_out->elements, (unsigned long long)((uint64_t)vocab * H));
+        return 1;
+    }
+    const char *qk_kernel = NULL;
+    uint32_t nr0 = 0;
+    const bool direct_qk = glm_direct_qk_kernel_for_tensor(t_out, &qk_kernel, &nr0);
+    const bool direct_q8 = t_out->type == DS4_TENSOR_Q8_0;
+    const bool direct_supported = direct_qk || direct_q8;
+    uint32_t chunk_rows = 8192;
+    const char *rows_env = getenv("DS4_GLM_LMHEAD_BENCH_ROWS");
+    if (rows_env && rows_env[0]) chunk_rows = (uint32_t)strtoul(rows_env, NULL, 10);
+    if (chunk_rows < 256u) chunk_rows = 256u;
+    if (chunk_rows > 16384u) chunk_rows = 16384u;
+    if (chunk_rows > vocab) chunk_rows = vocab;
+    int iters = 2;
+    const char *iters_env = getenv("DS4_GLM_LMHEAD_BENCH_ITERS");
+    if (iters_env && iters_env[0]) iters = atoi(iters_env);
+    if (iters < 1) iters = 1;
+    if (iters > 8) iters = 8;
+
+    float *x = xmalloc((size_t)H * sizeof(float));
+    float *xn = xmalloc((size_t)H * sizeof(float));
+    float *base = xmalloc((size_t)vocab * sizeof(float));
+    float *direct = xmalloc((size_t)vocab * sizeof(float));
+    float *chunk_w = xmalloc((size_t)chunk_rows * H * sizeof(float));
+    float *chunk_logits = xmalloc((size_t)chunk_rows * sizeof(float));
+    for (uint32_t i = 0; i < H; i++) x[i] = ((float)((int)(i % 503u) - 251)) * (1.0f / 503.0f);
+
+    const uint64_t row_bytes = t_out->bytes / vocab;
+    bool ok = glm_lm_head_metal(m, x, (const float *)tensor_data(m, t_onorm), t_out,
+                                vocab, &shape, base, xn, chunk_w, chunk_logits, chunk_rows);
+    if (ok && direct_supported) ok = ds4_gpu_glm_rmsnorm_f32(x, (const float *)tensor_data(m, t_onorm), xn, H, shape.rms_eps) != 0;
+    for (uint32_t vstart = 0; ok && direct_supported && vstart < vocab; vstart += chunk_rows) {
+        const uint32_t nrows = (vocab - vstart < chunk_rows) ? (vocab - vstart) : chunk_rows;
+        const uint8_t *Wq = (const uint8_t *)tensor_data(m, t_out) + (uint64_t)vstart * row_bytes;
+        if (direct_qk) ok = ds4_gpu_glm_matvec_qk_f32(Wq, (uint64_t)nrows * row_bytes,
+                                                      xn, direct + vstart,
+                                                      nrows, H, row_bytes, nr0, qk_kernel) != 0;
+        else ok = ds4_gpu_glm_matvec_q8_0_f32(Wq, (uint64_t)nrows * row_bytes,
+                                              xn, direct + vstart, nrows, H) != 0;
+    }
+
+    double current_s = 0.0, norm_s = 0.0, direct_s = 0.0;
+    for (int it = 0; ok && it < iters; it++) {
+        const double t0 = now_sec();
+        ok = glm_lm_head_metal(m, x, (const float *)tensor_data(m, t_onorm), t_out,
+                               vocab, &shape, base, xn, chunk_w, chunk_logits, chunk_rows);
+        current_s += now_sec() - t0;
+    }
+    for (int it = 0; ok && direct_supported && it < iters; it++) {
+        double t0 = now_sec();
+        ok = ds4_gpu_glm_rmsnorm_f32(x, (const float *)tensor_data(m, t_onorm), xn, H, shape.rms_eps) != 0;
+        norm_s += now_sec() - t0;
+        t0 = now_sec();
+        for (uint32_t vstart = 0; ok && vstart < vocab; vstart += chunk_rows) {
+            const uint32_t nrows = (vocab - vstart < chunk_rows) ? (vocab - vstart) : chunk_rows;
+            const uint8_t *Wq = (const uint8_t *)tensor_data(m, t_out) + (uint64_t)vstart * row_bytes;
+            if (direct_qk) ok = ds4_gpu_glm_matvec_qk_f32(Wq, (uint64_t)nrows * row_bytes,
+                                                          xn, direct + vstart,
+                                                          nrows, H, row_bytes, nr0, qk_kernel) != 0;
+            else ok = ds4_gpu_glm_matvec_q8_0_f32(Wq, (uint64_t)nrows * row_bytes,
+                                                  xn, direct + vstart, nrows, H) != 0;
+        }
+        direct_s += now_sec() - t0;
+    }
+    const float direct_max_abs = (ok && direct_supported) ? max_abs_diff(base, direct, vocab) : -1.0f;
+    fprintf(stderr,
+            "ds4: glm-lmhead-bench type=%s vocab=%u H=%u rows=%u chunks=%u iters=%d\n",
+            tensor_type_name(t_out->type), vocab, H, chunk_rows,
+            (vocab + chunk_rows - 1u) / chunk_rows, iters);
+    fprintf(stderr,
+            "ds4: glm-lmhead-bench current chunked-f32 total=%.3fs avg=%.3fs\n",
+            current_s, current_s / (double)iters);
+    if (direct_supported) {
+        fprintf(stderr,
+                "ds4: glm-lmhead-bench direct-quant norm=%.3fs matvec=%.3fs total=%.3fs avg=%.3fs max_abs_vs_f32=%g\n",
+                norm_s, direct_s, norm_s + direct_s, (norm_s + direct_s) / (double)iters,
+                (double)direct_max_abs);
+    } else {
+        fprintf(stderr,
+                "ds4: glm-lmhead-bench direct-quant unsupported for output.weight type=%s (needs Q5_K/Q6_K/Q8_0; Q4_K direct kernel not implemented)\n",
+                tensor_type_name(t_out->type));
+    }
+    printf("glm-lmhead-bench: type=%s rows=%u current_avg=%.6f direct_avg=%.6f max_abs=%g\n",
+           tensor_type_name(t_out->type), chunk_rows, current_s / (double)iters,
+           direct_supported ? (norm_s + direct_s) / (double)iters : -1.0,
+           (double)direct_max_abs);
+
+    free(chunk_logits); free(chunk_w); free(direct); free(base); free(xn); free(x);
+    return ok ? 0 : 1;
+#else
+    (void)e;
+    fprintf(stderr, "ds4: --glm-lmhead-bench requires a Metal build\n");
+    return 1;
+#endif
+}
+
 int ds4_engine_glm_proj_bench(ds4_engine *e) {
 #ifndef DS4_NO_GPU
     const ds4_model *m = &e->model;
