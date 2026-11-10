@@ -29,20 +29,22 @@ keeps its cache.
   (`DS4_KVSTORE_EXT_VISION` in `ds4_kvstore.c`,
   `ds4_session_load_payload_multimodal()` in `ds4.c`).
 
-Every sync must leave this capability working. Run:
+Every sync must leave this capability working. On a Mac, where the build is
+the Metal one, run:
 
 ```sh
-make
+make ds4-server ds4_test
 ./ds4_test --server
 make test-session-state
 ```
 
 With GLM 5.3 Flash weights and the GLM vision encoder, and no other large
-model loaded, also run the test that restarts the server:
+model loaded, also run the test that restarts the server. It needs a new
+output directory for each run:
 
 ```sh
 python3 tests/test_server_vision_disk.py MODEL.gguf \
-	--vision VISION_ENCODER.gguf --output /tmp/ds4-vision-disk
+	--vision VISION_ENCODER.gguf --output "$(mktemp -d)"
 ```
 
 When a merge conflicts with the fork's code, resolve it so that these checks
