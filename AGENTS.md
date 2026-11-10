@@ -28,6 +28,11 @@ keeps its cache.
 - The disk KV cache saves and restores a conversation with images
   (`DS4_KVSTORE_EXT_VISION` in `ds4_kvstore.c`,
   `ds4_session_load_payload_multimodal()` in `ds4.c`).
+- The RAM cache of encoded images holds, without an option, every image that
+  the resident sessions can name, so that a conversation does not encode its
+  images again on every request (`server_image_cache_init()` and
+  `server_image_cache_default_bytes()` in `ds4_server.c`). `--image-cache-mb`
+  sets a different budget.
 
 Every sync must leave this capability working. On a Mac, where the build is
 the Metal one, run:
