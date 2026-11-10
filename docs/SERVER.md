@@ -106,6 +106,14 @@ base64 image sources. Remote URLs and server-side file paths are rejected.
 Image blocks preserve their order in the request. The limit is 16 images and
 a 64 MiB HTTP body.
 
+A client that resends the conversation sends every image again with each
+request. The server keeps the encoder output of recent images in RAM, so that
+it does not encode them again: at most 32 images within `--image-cache-mb`,
+128 by default. An image takes its token count times the embedding width times
+four bytes, about 84 MiB for a 5346-token GLM 5.3 image. When the images of
+one conversation do not fit, every request of that conversation runs the
+encoder again for the images that were dropped.
+
 ## Disk KV cache
 
 Disk caching saves useful prefixes across slot reuse and server restarts:
