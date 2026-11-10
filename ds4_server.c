@@ -10133,8 +10133,7 @@ struct server_slot {
     char decode_err[160];
 };
 
-#define SERVER_IMAGE_CACHE_ENTRIES 32
-#define SERVER_IMAGE_CACHE_DEFAULT_MB 128
+#define SERVER_MAX_BODY_BYTES ((size_t)64 * 1024 * 1024)
 
 typedef struct {
     uint8_t *encoded;
@@ -10145,10 +10144,32 @@ typedef struct {
 } server_image_cache_entry;
 
 typedef struct {
-    server_image_cache_entry entries[SERVER_IMAGE_CACHE_ENTRIES];
+    server_image_cache_entry *entries;
+    size_t cap;
     size_t bytes;
     uint64_t clock;
 } server_image_cache;
+
+/* A request names every image of its conversation again, and an image that
+ * is not cached runs the encoder again. The cache is therefore sized for all
+ * that the resident sessions can name: a smaller one drops images of a
+ * conversation that still fits its context, and every later request of that
+ * conversation then encodes them again. One request names at most
+ * SERVER_MAX_IMAGES images. */
+static void server_image_cache_init(server_image_cache *cache, int sessions) {
+    cache->cap = (size_t)sessions * SERVER_MAX_IMAGES;
+    cache->entries = xmalloc(cache->cap * sizeof(cache->entries[0]));
+    memset(cache->entries, 0, cache->cap * sizeof(cache->entries[0]));
+}
+
+/* The budget without --image-cache-mb. A context has room for ctx_size image
+ * rows, and a request body for SERVER_MAX_BODY_BYTES of image files. */
+static size_t server_image_cache_default_bytes(int ctx_size, int embd_dim,
+                                               int sessions) {
+    return (size_t)sessions *
+           ((size_t)ctx_size * (size_t)embd_dim * sizeof(float) +
+            SERVER_MAX_BODY_BYTES);
+}
 
 static void server_image_cache_remove(server_image_cache *cache,
                                       server_image_cache_entry *entry) {
@@ -10159,7 +10180,7 @@ static void server_image_cache_remove(server_image_cache *cache,
 }
 
 static void server_image_cache_clear(server_image_cache *cache) {
-    for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++)
+    for (size_t i = 0; i < cache->cap; i++)
         server_image_cache_remove(cache, &cache->entries[i]);
     cache->clock = 0;
 }
@@ -10167,7 +10188,7 @@ static void server_image_cache_clear(server_image_cache *cache) {
 static bool server_image_cache_get(server_image_cache *cache,
                                    const server_image_input *input,
                                    ds4_vision_embedding *out) {
-    for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+    for (size_t i = 0; i < cache->cap; i++) {
         server_image_cache_entry *entry = &cache->entries[i];
         if (!entry->encoded || entry->encoded_len != input->encoded_len ||
             memcmp(entry->encoded, input->encoded, input->encoded_len)) continue;
@@ -10188,7 +10209,7 @@ static void server_image_cache_put(server_image_cache *cache,
                                    const server_image_input *input,
                                    const ds4_vision_embedding *embedding,
                                    uint32_t dim, size_t budget) {
-    if (!embedding->data || !dim || !embedding->token_count ||
+    if (!cache->cap || !embedding->data || !dim || !embedding->token_count ||
         !input->encoded_len ||
         embedding->token_count > budget / sizeof(float) / dim) return;
     size_t bytes = (size_t)embedding->token_count * dim * sizeof(float);
@@ -10197,12 +10218,12 @@ static void server_image_cache_put(server_image_cache *cache,
     server_image_cache_entry *dest;
     for (;;) {
         dest = &cache->entries[0];
-        for (size_t i = 1; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+        for (size_t i = 1; i < cache->cap; i++) {
             if (cache->entries[i].used < dest->used) dest = &cache->entries[i];
         }
         if (!dest->encoded && cache->bytes <= budget - total) break;
         if (!dest->encoded) {
-            for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+            for (size_t i = 0; i < cache->cap; i++) {
                 server_image_cache_entry *entry = &cache->entries[i];
                 if (entry->encoded && (!dest->encoded || entry->used < dest->used))
                     dest = entry;
@@ -10244,7 +10265,7 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     server_image_cache image_cache; /* Protected by inference_mu. */
-    size_t image_cache_bytes;       /* --image-cache-mb. */
+    size_t image_cache_bytes;       /* Budget of image_cache. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -10281,11 +10302,8 @@ static void server_inference_unlock(server *s) {
 }
 
 /* The caller holds inference_mu across cache lookup and encoder execution.
- *
- * Clients resend the whole conversation, so every request names every image
- * again and a miss runs the encoder again, even for an image whose rows the
- * session already holds. The budget must hold the images of one conversation,
- * or each of its requests encodes them again. */
+ * A miss runs the encoder also for an image whose rows the session already
+ * holds, so the cache is what keeps a later turn from encoding it again. */
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen) {
@@ -15300,7 +15318,7 @@ static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
-    const size_t max_body = 64 * 1024 * 1024;
+    const size_t max_body = SERVER_MAX_BODY_BYTES;
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -15699,7 +15717,7 @@ typedef struct {
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
-    int image_cache_mb;
+    int image_cache_mb;         /* -1: server_image_cache_default_bytes(). */
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
@@ -15782,6 +15800,7 @@ static void server_close_resources(server *s) {
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
     server_image_cache_clear(&s->image_cache);
+    free(s->image_cache.entries);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         live_tool_state_free(&slot->responses_live);
@@ -15851,7 +15870,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
-        .image_cache_mb = SERVER_IMAGE_CACHE_DEFAULT_MB,
+        .image_cache_mb = -1,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -16225,7 +16244,16 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
-    s.image_cache_bytes = (size_t)cfg.image_cache_mb << 20;
+    server_image_cache_init(&s.image_cache, slot_count);
+    s.image_cache_bytes = cfg.image_cache_mb >= 0 ?
+        (size_t)cfg.image_cache_mb << 20 :
+        server_image_cache_default_bytes(cfg.ctx_size,
+                                         ds4_engine_embd_dim(engine),
+                                         slot_count);
+    if (ds4_engine_has_vision(engine))
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: image cache budget %.2f MiB",
+                   (double)s.image_cache_bytes / (1024.0 * 1024.0));
     s.enable_cors = cfg.enable_cors;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
@@ -23155,6 +23183,7 @@ static void test_responses_tool_image_output(void) {
 
 static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
+    server_image_cache_init(&cache, 1);
     uint8_t key = 1;
     float data[2] = {1.25f, -2.5f};
     server_image_input input = {.encoded = &key, .encoded_len = 1};
@@ -23186,11 +23215,27 @@ static void test_server_image_embedding_cache(void) {
     ds4_vision_embedding_free(&out);
     server_image_cache_clear(&cache);
     TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
-    for (key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++)
-        server_image_cache_put(&cache, &input, &src, 2, 4096);
-    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + 1));
-    key = 1;
-    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+
+    /* Two resident sessions keep the images of two largest requests. */
+    free(cache.entries);
+    server_image_cache_init(&cache, 2);
+    const uint16_t held = 2 * SERVER_MAX_IMAGES;
+    uint16_t id;
+    server_image_input numbered = {.encoded = (uint8_t *)&id,
+                                   .encoded_len = sizeof(id)};
+    const size_t numbered_bytes = sizeof(data) + sizeof(id);
+    for (id = 1; id <= held; id++)
+        server_image_cache_put(&cache, &numbered, &src, 2, SIZE_MAX);
+    TEST_ASSERT(cache.bytes == held * numbered_bytes);
+    id = 1;
+    const bool first_kept = server_image_cache_get(&cache, &numbered, &out);
+    TEST_ASSERT(first_kept);
+    if (first_kept) ds4_vision_embedding_free(&out);
+    id = held + 1;
+    server_image_cache_put(&cache, &numbered, &src, 2, SIZE_MAX);
+    TEST_ASSERT(cache.bytes == held * numbered_bytes);
+    id = 2;
+    TEST_ASSERT(!server_image_cache_get(&cache, &numbered, &out));
     server_image_cache_clear(&cache);
     src.token_count = UINT32_MAX;
     server_image_cache_put(&cache, &input, &src, UINT32_MAX, SIZE_MAX);
@@ -23213,11 +23258,18 @@ static void test_server_image_embedding_cache(void) {
         ds4_vision_embedding_free(&out);
     }
     server_image_cache_clear(&cache);
+    free(cache.entries);
 
+    /* Without the option the budget follows the context: 393216 rows of
+     * 4096 floats are 6144 MiB, and one request body adds 64 MiB. */
     char *default_argv[] = {"ds4-server"};
     char *custom_argv[] = {"ds4-server", "--image-cache-mb", "4096"};
-    TEST_ASSERT(parse_options(1, default_argv).image_cache_mb == 128);
+    TEST_ASSERT(parse_options(1, default_argv).image_cache_mb == -1);
     TEST_ASSERT(parse_options(3, custom_argv).image_cache_mb == 4096);
+    TEST_ASSERT(server_image_cache_default_bytes(393216, 4096, 1) ==
+                (size_t)6208 << 20);
+    TEST_ASSERT(server_image_cache_default_bytes(32768, 4096, 3) ==
+                (size_t)3 * 576 << 20);
 }
 
 static void test_deepseek41_server_stream(void) {
