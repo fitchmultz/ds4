@@ -1876,11 +1876,13 @@ done:
 }
 
 /* The resident context fit keeps every shape that already fits, then gives up
- * the wide-prefill carry and prefill width in order before refusing. */
+ * the wide-prefill carry, prefill width, and (on Metal) the optional bf16
+ * index-key mirror in order before refusing. */
 static int check_context_fit(void) {
     int rc = 1;
     g_ds4_shape = DS4_SHAPE_FLASH41;
     g_ds41_prefill_ceiling = 0;
+    g_ds41_no_index_bf16 = false;
     const uint64_t def8k = ds41_graph_bytes(8192), def256k = ds41_graph_bytes(262144);
     REQUIRE(ds41_carry_cap(8192) > 0 && ds41_carry_cap(262144) > 0);
     REQUIRE(ds41_fit_context(8192, 1, def8k + 1) == 0);
@@ -1895,8 +1897,22 @@ static int check_context_fit(void) {
     REQUIRE(r512 < r1024 && r1024 < r2048 && r2048 < def256k);
     REQUIRE(ds41_fit_context(262144, 1, r2048) == 1024);
     REQUIRE(ds41_fit_context(262144, 1, r1024) == 512);
+#ifdef __APPLE__
+    if (!(ds4_gpu_v41_off() & DS4_GPU_V41_INDEX_BF16)) {
+        REQUIRE(!g_ds41_no_index_bf16 && ds41_index_bf16_on());
+        REQUIRE(ds41_fit_context(262144, 1, r512) == 512);
+        REQUIRE(g_ds41_no_index_bf16 && !ds41_index_bf16_on());
+        const uint64_t r512_plain = ds41_graph_bytes(262144);
+        REQUIRE(r512_plain < r512);
+        REQUIRE(ds41_fit_context(262144, 1, r512_plain) == UINT32_MAX);
+    } else {
+        REQUIRE(ds41_fit_context(262144, 1, r512) == UINT32_MAX);
+    }
+#else
     REQUIRE(ds41_fit_context(262144, 1, r512) == UINT32_MAX);
-    REQUIRE(g_ds41_prefill_ceiling == 0 && ds41_graph_bytes(262144) == def256k);
+#endif
+    REQUIRE(g_ds41_prefill_ceiling == 0 && !g_ds41_no_index_bf16 &&
+            ds41_graph_bytes(262144) == def256k);
     REQUIRE(ds41_fit_context(8192, 2, 2 * def8k + 1) == 0);
     REQUIRE(ds41_fit_context(8192, 2, 2 * def8k) == 2048);
     g_ds41_prefill_ceiling = 2048;
@@ -1904,6 +1920,7 @@ static int check_context_fit(void) {
     rc = 0;
 done:
     g_ds41_prefill_ceiling = 0;
+    g_ds41_no_index_bf16 = false;
     if (!rc) puts("context-fit: OK");
     return rc;
 }
