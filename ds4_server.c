@@ -3359,7 +3359,7 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     int last_user_idx = -1;
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_user_like(m->role) || (i >= lead_end && role_is_system(m->role))) {
+        if (role_is_user_like(m->role)) {
             last_user_idx = i;
         }
     }
@@ -23529,6 +23529,19 @@ static void test_deepseek41_server_tools(void) {
         const char *glm_after_asst = strstr(glm_upd, "Done.");
         TEST_ASSERT(glm_after_asst && !strcmp(glm_after_asst + 5, glm_tail));
         free(glm_top); free(glm_lead); free(glm_upd); free(glm_tail);
+
+        const char *m_sys_tail =
+            "[{\"role\":\"system\",\"content\":\"S0\"},"
+            "{\"role\":\"user\",\"content\":\"U\"},"
+            "{\"role\":\"assistant\",\"reasoning_content\":\"R\",\"content\":\"A\"},"
+            "{\"role\":\"system\",\"content\":\"REMINDER\"}]";
+        chat_msgs sys_tail_msgs = {0};
+        TEST_ASSERT(parse_messages(&m_sys_tail, &sys_tail_msgs));
+        char *glm_sys_tail = render_glm_chat_prompt_text(&sys_tail_msgs, NULL, NULL, DS4_THINK_MAX);
+        TEST_ASSERT(strstr(glm_sys_tail,
+            "<|user|>U<|assistant|><think>R</think>A<|system|>REMINDER<|assistant|><think>") != NULL);
+        free(glm_sys_tail);
+        chat_msgs_free(&sys_tail_msgs);
 
         chat_msgs_free(&plain_msgs);
         chat_msgs_free(&lead_msgs);
