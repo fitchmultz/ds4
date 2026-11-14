@@ -64104,6 +64104,7 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    bool ds41_logits_pending;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
@@ -66307,6 +66308,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     if (!rc && !ds4_gpu_synchronize()) rc = 1;
     if (!rc) {
         s->checkpoint_valid = false;
+        s->ds41_logits_pending = false;
         g->valid = false;
         rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, &remaining, err, errlen);
         if (!rc && !ds4_gpu_tensor_write(g->logits, 0, s->logits,
@@ -66445,6 +66447,28 @@ static bool ds4_session_payload_loses_vision(const ds4_session *s) {
     return s->distributed || (s->engine && s->engine->tp.active);
 }
 
+static bool ds4_session_materialize_checkpoint(ds4_session *s) {
+    if (!s) return false;
+    if (s->checkpoint_valid) return true;
+#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds4_session_is_ds41(s) && s->ds41_logits_pending &&
+        s->ds41_graph_ready && s->ds41_graph.valid &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len && s->engine) {
+        if (ds41_graph_logits(&s->ds41_graph, &s->engine->model,
+                              &s->engine->weights, s->logits)) {
+            s->ds41_logits_pending = false;
+            s->checkpoint_valid = true;
+            return true;
+        }
+        s->ds41_logits_pending = false;
+        s->ds41_graph.valid = false;
+    }
+#endif
+#endif
+    return false;
+}
+
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
     if (!out) {
@@ -66452,7 +66476,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
     memset(out, 0, sizeof(*out));
-    if (!s || !s->checkpoint_valid) {
+    if (!s || !ds4_session_materialize_checkpoint(s)) {
         payload_set_err(err, errlen, "session has no valid checkpoint to stage");
         return 1;
     }
@@ -79661,7 +79685,7 @@ bool ds4_session_has_vision_state(const ds4_session *s) {
 
 int ds4_session_vision_identities(const ds4_session *s,
                                   ds4_vision_span *out, size_t cap) {
-    if (!s || !s->checkpoint_valid) return -1;
+    if (!s || (!s->checkpoint_valid && !s->ds41_logits_pending)) return -1;
     /* checkpoint_images describes the last completed sync. While a multimodal
      * sync runs, the frontier advances through the images of its own prompt,
      * whose historical part was already verified against the checkpoint. */
@@ -80224,8 +80248,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             ds41_graph_reset(g);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+            s->ds41_logits_pending = false;
         }
-        bool pending_logits = false, interrupted = false, decoder_pending = false;
+        bool interrupted = false, decoder_pending = false;
         ds41_encoder_residency encoder = {0};
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
@@ -80249,19 +80274,22 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* Never add an encoder sweep just to defer the decoder. A short
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
+            ds4_session_cancel_fn chunk_cancel = count > 2048u ? s->cancel : NULL;
+            void *chunk_cancel_ud = count > 2048u ? s->cancel_ud : NULL;
             const bool ok = short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
                 layer_major ?
                 (defer_decoder || decoder_pending ?
                  ds41_graph_prefill_sweep(g, &e->model, &e->weights, prompt->v + i, count,
-                    s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud,
+                    s->progress, s->progress_ud, prompt->len, chunk_cancel, chunk_cancel_ud,
                     defer_decoder, decoder_pending) :
                  ds41_graph_prefill(g, &e->model, &e->weights, prompt->v + i, count,
-                    s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
+                    s->progress, s->progress_ud, prompt->len, chunk_cancel, chunk_cancel_ud)) :
                 ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
             if (!ok) {
                 ds41_encoder_release(g, &e->model, &encoder);
                 s->checkpoint_valid = false;
+                s->ds41_logits_pending = false;
                 if (ds4_session_cancelled(s)) {
                     snprintf(err, errlen, "interrupted");
                     return DS4_SESSION_SYNC_INTERRUPTED;
@@ -80273,27 +80301,27 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 token_vec_push(&s->checkpoint, prompt->v[i + (int)t]);
             i += (int)count;
             decoder_pending = defer_decoder;
-            pending_logits = true;
             s->checkpoint_valid = false;
+            s->ds41_logits_pending = !decoder_pending;
             if (s->progress)
                 s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
         ds41_encoder_release(g, &e->model, &encoder);
         if (decoder_pending) {
             s->checkpoint_valid = false;
+            s->ds41_logits_pending = false;
             g->valid = false;
             snprintf(err, errlen, "interrupted");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
         /* Prefill needs only its final output head. An interrupted prefix must
          * still have matching logits before it can be saved or continued. */
-        if (pending_logits) {
-            if (!ds41_graph_logits(g, &e->model, &e->weights, s->logits)) {
+        if (s->ds41_logits_pending) {
+            if (!ds4_session_materialize_checkpoint(s)) {
                 g->valid = false;
                 snprintf(err, errlen, "V4.1 prefill output head failed");
                 return 1;
             }
-            s->checkpoint_valid = true;
             if (s->progress)
                 s->progress(s->progress_ud, "prefill_chunk", s->checkpoint.len, prompt->len);
         }
@@ -90632,6 +90660,7 @@ void ds4_session_invalidate(ds4_session *s) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
     }
     s->checkpoint_valid = false;
+    s->ds41_logits_pending = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
     free(s->checkpoint_images);

@@ -11458,6 +11458,22 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
     return ds4_kvstore_continued_store_target(kc, live_tokens);
 }
 
+static int kv_cache_cold_store_target_len(const kv_disk_cache *kc,
+                                          const ds4_tokens *prompt,
+                                          int user_token_id,
+                                          int assistant_token_id) {
+    if (!kc || !kc->enabled || !prompt ||
+        prompt->len < kc->opt.min_tokens || kc->opt.cold_max_tokens <= 0) {
+        return 0;
+    }
+    const int anchor = kv_cache_chat_anchor_pos(kc, prompt,
+                                                user_token_id,
+                                                assistant_token_id);
+    const int candidate = anchor >= kc->opt.min_tokens ?
+                          anchor : kv_cache_store_len(kc, prompt->len);
+    return candidate <= kc->opt.cold_max_tokens ? candidate : 0;
+}
+
 /* A same-text-prefix file can be reused by a larger context, but not by a
  * smaller one: the payload was validated against the context capacity recorded
  * in the file.  If the existing file cannot be used by this server, replace it
@@ -11769,6 +11785,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
+        slot->continued_last_store_tokens = loaded;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
@@ -13949,7 +13966,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
                    j->req.image_count, cached, prompt_for_sync->len);
     }
-    if (cached == 0) slot->continued_last_store_tokens = 0;
+    if (cached < slot->continued_last_store_tokens) {
+        slot->continued_last_store_tokens = cached;
+    }
     if (s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
@@ -14054,19 +14073,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     int cold_store_len = 0;
     size_t cold_images = 0;
-    if (cached == 0 &&
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
-    {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
-        if (!request_images_before(s, &j->req, cold_store_len, &cold_images))
+    if (cached == 0) {
+        cold_store_len = kv_cache_cold_store_target_len(
+            &s->kv, prompt_for_sync,
+            ds4_token_user(s->engine),
+            ds4_token_assistant(s->engine));
+        if (cold_store_len > 0 &&
+            !request_images_before(s, &j->req, cold_store_len, &cold_images)) {
             cold_store_len = 0;
+        }
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -14086,22 +14101,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync_multimodal(s, slot, &prefix,
-                                           j->req.images, cold_images,
-                                           err, sizeof(err)) != 0) {
+        int cold_sync_rc = server_session_sync_multimodal(
+            s, slot, &prefix, j->req.images, cold_images, err, sizeof(err));
+        if (cold_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-            free(disk_cache_path);
-            if (job_cancelled(j)) {
+            if (job_cancelled(j) || cold_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                kv_cache_maybe_store_continued(s, slot);
+                free(disk_cache_path);
                 request_live_state_clear(s, slot);
                 trace_event(s, trace_id, "cancelled during prefill");
                 return;
             }
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -14129,13 +14146,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-        free(disk_cache_path);
-        if (job_cancelled(j)) {
+        if (job_cancelled(j) || prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            if (ds4_session_pos(slot->session) > cached) {
+                kv_cache_maybe_store_continued(s, slot);
+            }
+            free(disk_cache_path);
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during prefill");
             return;
         }
+        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
@@ -14144,6 +14165,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
+        if (ds4_session_pos(slot->session) > cached) {
+            kv_cache_maybe_store_continued(s, slot);
+        }
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled after prefill");
         ds4_tokens_free(&effective_prompt);
@@ -15032,6 +15056,8 @@ decode_again:
                    ctx_span,
                    req_flags[0] ? " " : "",
                    req_flags);
+    } else if (strcmp(final_finish, "error") != 0) {
+        kv_cache_maybe_store_continued(s, slot);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -22077,11 +22103,39 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 10240;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20525) == 20525);
 
     kc.opt.boundary_align_tokens = 0;
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30117) == 30117);
+
+    {
+        const int user = 9001, assistant = 9002;
+        kv_disk_cache cold_kc = {0};
+        cold_kc.enabled = true;
+        cold_kc.opt = kv_cache_default_options();
+        cold_kc.opt.min_tokens = 4;
+        cold_kc.opt.cold_max_tokens = 10;
+        cold_kc.opt.boundary_trim_tokens = 0;
+        cold_kc.opt.boundary_align_tokens = 0;
+
+        ds4_tokens long_chat = {0};
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&long_chat, 10 + i);
+        ds4_tokens_push(&long_chat, user);
+        ds4_tokens_push(&long_chat, 20);
+        ds4_tokens_push(&long_chat, assistant);
+        for (int i = 0; i < 20; i++) ds4_tokens_push(&long_chat, 30 + i);
+        TEST_ASSERT(kv_cache_cold_store_target_len(&cold_kc, &long_chat, user, assistant) == 6);
+
+        ds4_tokens long_raw = {0};
+        for (int i = 0; i < 25; i++) ds4_tokens_push(&long_raw, 50 + i);
+        TEST_ASSERT(kv_cache_cold_store_target_len(&cold_kc, &long_raw, user, assistant) == 0);
+
+        ds4_tokens_free(&long_chat);
+        ds4_tokens_free(&long_raw);
+    }
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
