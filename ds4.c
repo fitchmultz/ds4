@@ -80556,8 +80556,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (updates_dense) ds4_session_glm_note_dense_cache(s, pos, 1);
                 if (s->progress && ((i - start) % 8 == 0 || last)) {
-                    s->progress(s->progress_ud, "prefill_chunk", i + 1 - start,
-                                prompt->len - start);
+                    s->progress(s->progress_ud, "prefill_chunk", i + 1,
+                                prompt->len);
                 }
             }
             s->checkpoint_valid = true;
