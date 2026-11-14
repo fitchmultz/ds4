@@ -866,6 +866,7 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    bool return_progress;
     bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
@@ -4364,6 +4365,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "return_progress")) {
+            if (!json_bool(&p, &r->return_progress)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "ignore_eos")) {
             if (!parse_ignore_eos_value(&p, r)) {
                 free(key);
@@ -5846,6 +5852,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "return_progress")) {
+            if (!json_bool(&p, &r->return_progress)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -7213,6 +7224,30 @@ static bool sse_chunk(int fd, const request *r, const char *id, const char *text
         if (finish) json_escape(&b, finish); else buf_puts(&b, "null");
         buf_puts(&b, "}]}\n\n");
     }
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool sse_prompt_progress_chunk(int fd, const request *r, const char *id,
+                                      int total, int cache, int processed,
+                                      int64_t time_ms) {
+    if (!r || !id) return false;
+    if (cache < 0) cache = 0;
+    if (total < cache) total = cache;
+    if (processed < cache) processed = cache;
+    if (processed > total) processed = total;
+    if (time_ms < 0) time_ms = 0;
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"%s\",\"created\":%ld,\"model\":",
+               id,
+               r->kind == REQ_CHAT ? "chat.completion.chunk" : "text_completion",
+               now);
+    json_escape(&b, r->model ? r->model : "default");
+    buf_printf(&b, ",\"choices\":[],"
+               "\"prompt_progress\":{\"total\":%d,\"cache\":%d,\"processed\":%d,\"time_ms\":%lld}}\n\n",
+               total, cache, processed, (long long)time_ms);
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
@@ -12345,6 +12380,8 @@ static uint64_t trace_begin(
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
+    fprintf(s->trace, "return_progress: %d\n",
+            j->req.return_progress ? 1 : 0);
     trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
                            cache_source, disk_cached, disk_path);
     if (j->req.raw_body) {
@@ -12459,6 +12496,11 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    const request *req;
+    const char *response_id;
+    bool return_progress;
+    double last_progress_sse;
+    int last_progress_tokens;
     job *request_job;
 } server_prefill_progress;
 
@@ -13059,7 +13101,30 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                 job_mark_cancelled(p->request_job);
                 return;
             }
-        } else if (now - p->last_keepalive >= 5.0) {
+        }
+        if (p->return_progress && p->req && p->response_id) {
+            const int total_tokens = p->prompt_tokens > 0 ? p->prompt_tokens : total;
+            int processed = current;
+            if (processed < p->cached_tokens) processed = p->cached_tokens;
+            if (processed > total_tokens) processed = total_tokens;
+            if (processed > p->last_progress_tokens &&
+                (is_chunk || p->last_progress_sse == 0.0 || now - p->last_progress_sse >= 0.5))
+            {
+                const int64_t time_ms = (int64_t)((now - p->t0) * 1000.0);
+                if (sse_prompt_progress_chunk(p->fd, p->req, p->response_id,
+                                              total_tokens, p->cached_tokens,
+                                              processed, time_ms)) {
+                    p->last_progress_tokens = processed;
+                    p->last_progress_sse = now;
+                    p->last_keepalive = now;
+                } else {
+                    p->stream_failed = true;
+                    job_mark_cancelled(p->request_job);
+                    return;
+                }
+            }
+        }
+        if (now - p->last_keepalive >= 5.0) {
             static const char ka[] = ": prefill\n\n";
             if (send_all(p->fd, ka, sizeof(ka) - 1)) {
                 p->last_keepalive = now;
@@ -14006,6 +14071,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
+    char id[96];
+    responses_random_id(id, sizeof(id),
+                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
@@ -14020,6 +14088,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         .fd = j->fd,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
+        .req = &j->req,
+        .response_id = id,
+        .return_progress = j->req.return_progress && j->req.api == API_OPENAI,
+        .last_progress_tokens = cached,
         .request_job = j,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
@@ -14198,9 +14270,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
         }
     }
-    char id[96];
-    responses_random_id(id, sizeof(id),
-                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -21722,6 +21791,62 @@ static void test_cancelled_progress_callback_is_inert(void) {
     test_cancel_job_destroy(&j);
 }
 
+static void test_return_progress_streams_prompt_progress_chunks(void) {
+    request r;
+    char err[128] = {0};
+    TEST_ASSERT(parse_chat_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4.1-flash\",\"stream\":true,\"return_progress\":true,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        64, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.stream && r.return_progress);
+    request_free(&r);
+
+    TEST_ASSERT(!parse_chat_request(NULL, NULL,
+        "{\"stream\":true,\"return_progress\":\"yes\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        64, 32768, &r, err, sizeof(err)));
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    request_init(&r, REQ_CHAT, 64);
+    r.model = xstrdup("deepseek-v4.1-flash");
+    r.stream = true;
+    r.return_progress = true;
+    job j;
+    test_cancel_job_init(&j);
+    server_prefill_progress progress = {
+        .kind = REQ_CHAT,
+        .prompt_tokens = 1000,
+        .cached_tokens = 200,
+        .t0 = now_sec() - 1.25,
+        .fd = sv[0],
+        .stream = true,
+        .req = &r,
+        .response_id = "chatcmpl-progress",
+        .return_progress = true,
+        .last_progress_tokens = 200,
+        .request_job = &j,
+    };
+    server_progress_cb(&progress, "prefill_display", 350, 1000);
+    server_progress_cb(&progress, "prefill_display", 400, 1000);
+    server_progress_cb(&progress, "prefill_chunk", 600, 1000);
+    close(sv[0]);
+
+    char out[4096];
+    ssize_t n = read(sv[1], out, sizeof(out) - 1);
+    close(sv[1]);
+    TEST_ASSERT(n > 0);
+    out[n] = '\0';
+    TEST_ASSERT(strstr(out, "Content-Type: text/event-stream\r\n") != NULL);
+    TEST_ASSERT(strstr(out, "\"id\":\"chatcmpl-progress\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"choices\":[],\"prompt_progress\":{\"total\":1000,\"cache\":200,\"processed\":350,") != NULL);
+    TEST_ASSERT(strstr(out, "\"processed\":400,") == NULL);
+    TEST_ASSERT(strstr(out, "\"choices\":[],\"prompt_progress\":{\"total\":1000,\"cache\":200,\"processed\":600,") != NULL);
+
+    test_cancel_job_destroy(&j);
+    request_free(&r);
+}
+
 static void test_cancel_server_init(server *s) {
     memset(s, 0, sizeof(*s));
     pthread_mutex_init(&s->mu, NULL);
@@ -23826,6 +23951,7 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
+    test_return_progress_streams_prompt_progress_chunks();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();
     test_cancel_detaches_assigned_job();
