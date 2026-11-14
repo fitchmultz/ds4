@@ -797,6 +797,7 @@ typedef struct {
 typedef struct {
     char *role;
     char *content;
+    char *tool_schemas;
     server_image_inputs images;
     char *reasoning;
     char *tool_call_id;
@@ -865,6 +866,7 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    bool return_progress;
     bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
@@ -939,6 +941,7 @@ static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
 static void chat_msg_free(chat_msg *m) {
     free(m->role);
     free(m->content);
+    free(m->tool_schemas);
     server_image_inputs_free(&m->images);
     free(m->reasoning);
     free(m->tool_call_id);
@@ -1983,6 +1986,19 @@ bad:
     return false;
 }
 
+static void register_parsed_tool_schemas(tool_schema_orders *orders, const char *schemas) {
+    if (!orders || !schemas || !schemas[0]) return;
+    const char *p = schemas;
+    json_ws(&p);
+    while (*p) {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) break;
+        tool_schema_orders_add_json(orders, raw);
+        free(raw);
+        json_ws(&p);
+    }
+}
+
 static bool parse_image_url_value(const char **p, char **url) {
     json_ws(p);
     if (**p == '"') return json_string(p, url);
@@ -2120,6 +2136,10 @@ static bool text_is_blank(const char *s) {
     return true;
 }
 
+static bool role_is_system(const char *role) {
+    return !strcmp(role, "system") || !strcmp(role, "developer");
+}
+
 static bool parse_messages(const char **p, chat_msgs *msgs) {
     json_ws(p);
     if (**p != '[') return false;
@@ -2176,6 +2196,13 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                     free(key);
                     goto fail;
                 }
+            } else if (!strcmp(key, "tools")) {
+                free(msg.tool_schemas);
+                msg.tool_schemas = NULL;
+                if (!parse_tools_value(p, &msg.tool_schemas, NULL)) {
+                    free(key);
+                    goto fail;
+                }
             } else if (!json_skip_value(p)) {
                 free(key);
                 goto fail;
@@ -2190,6 +2217,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
         if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        if (msg.tool_schemas && msg.tool_schemas[0] && !role_is_system(msg.role)) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2658,6 +2686,14 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41)
                 "Use the exact parameter names from the schemas.");
 }
 
+static void append_inline_tools_update_text(buf *b, const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf_puts(b, "### Available Tool Schemas\n\n");
+    buf_puts(b, tool_schemas);
+    buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
+                "If a tool name was declared earlier, this schema replaces the earlier declaration.");
+}
+
 static void json_escape(buf *b, const char *s);
 
 typedef struct {
@@ -3124,10 +3160,6 @@ static void append_tool_calls_text_for_syntax(buf *b,
     }
 }
 
-static bool role_is_system(const char *role) {
-    return !strcmp(role, "system") || !strcmp(role, "developer");
-}
-
 static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
@@ -3137,11 +3169,19 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     if (tool_schemas && tool_schemas[0]) return true;
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if ((!strcmp(m->role, "assistant") && m->calls.len > 0) ||
+        if ((m->tool_schemas && m->tool_schemas[0]) ||
+            (!strcmp(m->role, "assistant") && m->calls.len > 0) ||
             !strcmp(m->role, "tool") || !strcmp(m->role, "function"))
         {
             return true;
         }
+    }
+    return false;
+}
+
+static bool chat_msgs_have_tool_schemas(const chat_msgs *msgs) {
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (msgs->v[i].tool_schemas && msgs->v[i].tool_schemas[0]) return true;
     }
     return false;
 }
@@ -3252,16 +3292,77 @@ static void append_glm_assistant_message_prefix(buf *out,
     }
 }
 
+static void append_glm_system_tools(buf *out, const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf tools = {0};
+    append_glm_tools_prompt_text(&tools, tool_schemas);
+    if (tools.len) {
+        buf_puts(out, "<|system|>");
+        buf_puts(out, tools.ptr);
+    }
+    buf_free(&tools);
+}
+
+static void append_glm_conversation(buf *out, const chat_msgs *msgs, int start,
+                                    int last_user_idx, bool tool_context,
+                                    const tool_schema_orders *tool_orders,
+                                    bool think) {
+    bool pending_assistant = false;
+    bool observation_open = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            observation_open = false;
+            append_glm_system_tools(out, m->tool_schemas);
+            if ((m->content && m->content[0]) || !(m->tool_schemas && m->tool_schemas[0])) {
+                buf_puts(out, "<|system|>");
+                buf_puts(out, m->content ? m->content : "");
+            }
+            pending_assistant = true;
+        } else if (chat_msg_is_glm_tool_result(m)) {
+            if (!observation_open) buf_puts(out, "<|observation|>");
+            append_glm_tool_result_message(out, m);
+            observation_open = true;
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "user")) {
+            observation_open = false;
+            buf_puts(out, "<|user|>");
+            buf_puts(out, m->content ? m->content : "");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            observation_open = false;
+            buf_puts(out, "<|assistant|>");
+            append_glm_assistant_message_prefix(
+                out, m, think && (tool_context || i > last_user_idx));
+            append_trimmed_text(out, m->content);
+            append_tool_calls_text_for_syntax(out, SERVER_MODEL_SYNTAX_GLM,
+                                              &m->calls, tool_orders);
+            pending_assistant = false;
+        }
+    }
+
+    if (pending_assistant) {
+        buf_puts(out, "<|assistant|>");
+        buf_puts(out, think ? "<think>" : "<think></think>");
+    }
+}
+
 static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
                                          const char *tool_schemas,
                                          const tool_schema_orders *tool_orders,
                                          ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
+    int lead_end = 0;
+    while (msgs && lead_end < msgs->len && role_is_system(msgs->v[lead_end].role)) {
+        lead_end++;
+    }
     int last_user_idx = -1;
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_user_like(m->role)) last_user_idx = i;
+        if (role_is_user_like(m->role)) {
+            last_user_idx = i;
+        }
     }
 
     buf out = {0};
@@ -3271,56 +3372,17 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         buf_puts(&out, "<|system|>");
         buf_puts(&out, effort ? effort : "Reasoning Effort: Max");
     }
-    if (tool_schemas && tool_schemas[0]) {
-        buf tools = {0};
-        append_glm_tools_prompt_text(&tools, tool_schemas);
-        if (tools.len) {
+    append_glm_system_tools(&out, tool_schemas);
+    for (int i = 0; i < lead_end; i++) {
+        const chat_msg *m = &msgs->v[i];
+        append_glm_system_tools(&out, m->tool_schemas);
+        if ((m->content && m->content[0]) || !(m->tool_schemas && m->tool_schemas[0])) {
             buf_puts(&out, "<|system|>");
-            buf_puts(&out, tools.ptr);
-        }
-        buf_free(&tools);
-    }
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (!role_is_system(m->role)) continue;
-        buf_puts(&out, "<|system|>");
-        buf_puts(&out, m->content ? m->content : "");
-    }
-
-    bool pending_assistant = false;
-    bool observation_open = false;
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            observation_open = false;
-            continue;
-        } else if (chat_msg_is_glm_tool_result(m)) {
-            if (!observation_open) buf_puts(&out, "<|observation|>");
-            append_glm_tool_result_message(&out, m);
-            observation_open = true;
-            pending_assistant = true;
-        } else if (!strcmp(m->role, "user")) {
-            observation_open = false;
-            buf_puts(&out, "<|user|>");
             buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
-        } else if (!strcmp(m->role, "assistant")) {
-            observation_open = false;
-            (void)pending_assistant;
-            buf_puts(&out, "<|assistant|>");
-            append_glm_assistant_message_prefix(
-                &out, m, think && (tool_context || i > last_user_idx));
-            append_trimmed_text(&out, m->content);
-            append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
-                                              &m->calls, tool_orders);
-            pending_assistant = false;
         }
     }
-
-    if (pending_assistant) {
-        buf_puts(&out, "<|assistant|>");
-        buf_puts(&out, think ? "<think>" : "<think></think>");
-    }
+    append_glm_conversation(&out, msgs, lead_end, last_user_idx, tool_context,
+                            tool_orders, think);
 
     return buf_take(&out);
 }
@@ -3434,7 +3496,20 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
     const bool think = ds4_think_mode_enabled(mode);
     const bool keep_reasoning = live_tail || chat_history_uses_tool_context(msgs, tool_schemas);
     const char *effort = ds4_deepseek41_reasoning_effort_text(mode);
-    bool initial_system = false, pending = false, user_open = false;
+    const char *lead_tools = (!live_tail && start == 0 && ordered && msgs && msgs->len > 0 &&
+                              role_is_system(ordered[0]->role))
+        ? ordered[0]->tool_schemas
+        : NULL;
+    bool initial_system = false, initial_tools = false, pending = false, user_open = false;
+    bool had_tools = tool_schemas && tool_schemas[0];
+    for (int i = 0; !had_tools && msgs && i < start && i < msgs->len; i++) {
+        const chat_msg *pm = ordered[i];
+        if ((pm->tool_schemas && pm->tool_schemas[0]) ||
+            (!strcmp(pm->role, "assistant") && pm->calls.len > 0) ||
+            !strcmp(pm->role, "tool") || !strcmp(pm->role, "function")) {
+            had_tools = true;
+        }
+    }
     int last_user = -1;
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
@@ -3444,21 +3519,42 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
         buf_puts(&out, "<｜end▁of▁sentence｜>");
     } else {
         buf_puts(&out, "<｜begin▁of▁sentence｜>");
-        if (effort || (tool_schemas && tool_schemas[0])) {
+        if (effort || (tool_schemas && tool_schemas[0]) || (lead_tools && lead_tools[0])) {
             buf_puts(&out, "<｜System｜>");
             initial_system = true;
             if (effort) buf_puts(&out, effort);
-            if (tool_schemas && tool_schemas[0])
+            if (tool_schemas && tool_schemas[0]) {
                 append_tools_prompt_text(&out, tool_schemas, true);
+                initial_tools = had_tools = true;
+            }
+            if (lead_tools && lead_tools[0]) {
+                if (initial_tools) buf_puts(&out, "\n\n");
+                append_tools_prompt_text(&out, lead_tools, true);
+                initial_tools = had_tools = true;
+            }
         }
     }
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = ordered[i];
         if (role_is_system(m->role)) {
             if (i == 0 && initial_system) {
-                if (tool_schemas && tool_schemas[0]) buf_puts(&out, "\n\n");
-            } else buf_puts(&out, "<｜System｜>");
-            buf_puts(&out, m->content ? m->content : "");
+                if (m->content && m->content[0]) {
+                    if (initial_tools) buf_puts(&out, "\n\n");
+                    buf_puts(&out, m->content);
+                }
+            } else {
+                buf_puts(&out, "<｜System｜>");
+                const bool msg_has_tools = m->tool_schemas && m->tool_schemas[0];
+                if (msg_has_tools) {
+                    if (had_tools) append_inline_tools_update_text(&out, m->tool_schemas);
+                    else append_tools_prompt_text(&out, m->tool_schemas, true);
+                    had_tools = true;
+                }
+                if (m->content && m->content[0]) {
+                    if (msg_has_tools) buf_puts(&out, "\n\n");
+                    buf_puts(&out, m->content);
+                }
+            }
             pending = i > 0 || live_tail;
             user_open = false;
         } else if (role_is_user_like(m->role)) {
@@ -3736,7 +3832,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     size_t count = 0;
     for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
     if (count == 0) {
-        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        if (e) ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
     if (count > SERVER_MAX_IMAGES) {
@@ -3886,38 +3982,7 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
                                        ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
-    bool pending_assistant = false;
-    bool observation_open = false;
-    for (int i = start; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            observation_open = false;
-            continue;
-        } else if (chat_msg_is_glm_tool_result(m)) {
-            if (!observation_open) buf_puts(&out, "<|observation|>");
-            append_glm_tool_result_message(&out, m);
-            observation_open = true;
-            pending_assistant = true;
-        } else if (!strcmp(m->role, "user")) {
-            observation_open = false;
-            buf_puts(&out, "<|user|>");
-            buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
-        } else if (!strcmp(m->role, "assistant")) {
-            observation_open = false;
-            buf_puts(&out, "<|assistant|>");
-            append_glm_assistant_message_prefix(&out, m, think);
-            append_trimmed_text(&out, m->content);
-            append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
-                                              &m->calls, tool_orders);
-            pending_assistant = false;
-        }
-    }
-
-    if (pending_assistant) {
-        buf_puts(&out, "<|assistant|>");
-        buf_puts(&out, think ? "<think>" : "<think></think>");
-    }
+    append_glm_conversation(&out, msgs, start, -1, true, tool_orders, think);
     return buf_take(&out);
 }
 
@@ -4300,6 +4365,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "return_progress")) {
+            if (!json_bool(&p, &r->return_progress)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "ignore_eos")) {
             if (!parse_ignore_eos_value(&p, r)) {
                 free(key);
@@ -4355,7 +4425,19 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
-    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    if (tool_choice_none) {
+        tool_schema_orders_free(&r->tool_orders);
+        for (int i = 0; i < msgs.len; i++) {
+            free(msgs.v[i].tool_schemas);
+            msgs.v[i].tool_schemas = NULL;
+        }
+    } else {
+        for (int i = 0; i < msgs.len; i++) {
+            register_parsed_tool_schemas(&r->tool_orders, msgs.v[i].tool_schemas);
+        }
+    }
+    r->has_tools = !tool_choice_none &&
+        ((tool_schemas && tool_schemas[0]) || chat_msgs_have_tool_schemas(&msgs));
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -5770,6 +5852,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "return_progress")) {
+            if (!json_bool(&p, &r->return_progress)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -7137,6 +7224,30 @@ static bool sse_chunk(int fd, const request *r, const char *id, const char *text
         if (finish) json_escape(&b, finish); else buf_puts(&b, "null");
         buf_puts(&b, "}]}\n\n");
     }
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool sse_prompt_progress_chunk(int fd, const request *r, const char *id,
+                                      int total, int cache, int processed,
+                                      int64_t time_ms) {
+    if (!r || !id) return false;
+    if (cache < 0) cache = 0;
+    if (total < cache) total = cache;
+    if (processed < cache) processed = cache;
+    if (processed > total) processed = total;
+    if (time_ms < 0) time_ms = 0;
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"%s\",\"created\":%ld,\"model\":",
+               id,
+               r->kind == REQ_CHAT ? "chat.completion.chunk" : "text_completion",
+               now);
+    json_escape(&b, r->model ? r->model : "default");
+    buf_printf(&b, ",\"choices\":[],"
+               "\"prompt_progress\":{\"total\":%d,\"cache\":%d,\"processed\":%d,\"time_ms\":%lld}}\n\n",
+               total, cache, processed, (long long)time_ms);
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
@@ -11382,6 +11493,22 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
     return ds4_kvstore_continued_store_target(kc, live_tokens);
 }
 
+static int kv_cache_cold_store_target_len(const kv_disk_cache *kc,
+                                          const ds4_tokens *prompt,
+                                          int user_token_id,
+                                          int assistant_token_id) {
+    if (!kc || !kc->enabled || !prompt ||
+        prompt->len < kc->opt.min_tokens || kc->opt.cold_max_tokens <= 0) {
+        return 0;
+    }
+    const int anchor = kv_cache_chat_anchor_pos(kc, prompt,
+                                                user_token_id,
+                                                assistant_token_id);
+    const int candidate = anchor >= kc->opt.min_tokens ?
+                          anchor : kv_cache_store_len(kc, prompt->len);
+    return candidate <= kc->opt.cold_max_tokens ? candidate : 0;
+}
+
 /* A same-text-prefix file can be reused by a larger context, but not by a
  * smaller one: the payload was validated against the context capacity recorded
  * in the file.  If the existing file cannot be used by this server, replace it
@@ -11693,6 +11820,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
+        slot->continued_last_store_tokens = loaded;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
@@ -12252,6 +12380,8 @@ static uint64_t trace_begin(
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
+    fprintf(s->trace, "return_progress: %d\n",
+            j->req.return_progress ? 1 : 0);
     trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
                            cache_source, disk_cached, disk_path);
     if (j->req.raw_body) {
@@ -12366,6 +12496,11 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    const request *req;
+    const char *response_id;
+    bool return_progress;
+    double last_progress_sse;
+    int last_progress_tokens;
     job *request_job;
 } server_prefill_progress;
 
@@ -12966,7 +13101,30 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                 job_mark_cancelled(p->request_job);
                 return;
             }
-        } else if (now - p->last_keepalive >= 5.0) {
+        }
+        if (p->return_progress && p->req && p->response_id) {
+            const int total_tokens = p->prompt_tokens > 0 ? p->prompt_tokens : total;
+            int processed = current;
+            if (processed < p->cached_tokens) processed = p->cached_tokens;
+            if (processed > total_tokens) processed = total_tokens;
+            if (processed > p->last_progress_tokens &&
+                (is_chunk || p->last_progress_sse == 0.0 || now - p->last_progress_sse >= 0.5))
+            {
+                const int64_t time_ms = (int64_t)((now - p->t0) * 1000.0);
+                if (sse_prompt_progress_chunk(p->fd, p->req, p->response_id,
+                                              total_tokens, p->cached_tokens,
+                                              processed, time_ms)) {
+                    p->last_progress_tokens = processed;
+                    p->last_progress_sse = now;
+                    p->last_keepalive = now;
+                } else {
+                    p->stream_failed = true;
+                    job_mark_cancelled(p->request_job);
+                    return;
+                }
+            }
+        }
+        if (now - p->last_keepalive >= 5.0) {
             static const char ka[] = ": prefill\n\n";
             if (send_all(p->fd, ka, sizeof(ka) - 1)) {
                 p->last_keepalive = now;
@@ -13873,7 +14031,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
                    j->req.image_count, cached, prompt_for_sync->len);
     }
-    if (cached == 0) slot->continued_last_store_tokens = 0;
+    if (cached < slot->continued_last_store_tokens) {
+        slot->continued_last_store_tokens = cached;
+    }
     if (s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
@@ -13911,6 +14071,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
+    char id[96];
+    responses_random_id(id, sizeof(id),
+                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
@@ -13925,6 +14088,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         .fd = j->fd,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
+        .req = &j->req,
+        .response_id = id,
+        .return_progress = j->req.return_progress && j->req.api == API_OPENAI,
+        .last_progress_tokens = cached,
         .request_job = j,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
@@ -13978,19 +14145,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     int cold_store_len = 0;
     size_t cold_images = 0;
-    if (cached == 0 &&
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
-    {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
-        if (!request_images_before(s, &j->req, cold_store_len, &cold_images))
+    if (cached == 0) {
+        cold_store_len = kv_cache_cold_store_target_len(
+            &s->kv, prompt_for_sync,
+            ds4_token_user(s->engine),
+            ds4_token_assistant(s->engine));
+        if (cold_store_len > 0 &&
+            !request_images_before(s, &j->req, cold_store_len, &cold_images)) {
             cold_store_len = 0;
+        }
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -14010,22 +14173,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync_multimodal(s, slot, &prefix,
-                                           j->req.images, cold_images,
-                                           err, sizeof(err)) != 0) {
+        int cold_sync_rc = server_session_sync_multimodal(
+            s, slot, &prefix, j->req.images, cold_images, err, sizeof(err));
+        if (cold_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-            free(disk_cache_path);
-            if (job_cancelled(j)) {
+            if (job_cancelled(j) || cold_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                kv_cache_maybe_store_continued(s, slot);
+                free(disk_cache_path);
                 request_live_state_clear(s, slot);
                 trace_event(s, trace_id, "cancelled during prefill");
                 return;
             }
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -14053,13 +14218,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-        free(disk_cache_path);
-        if (job_cancelled(j)) {
+        if (job_cancelled(j) || prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            if (ds4_session_pos(slot->session) > cached) {
+                kv_cache_maybe_store_continued(s, slot);
+            }
+            free(disk_cache_path);
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during prefill");
             return;
         }
+        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
@@ -14068,6 +14237,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
+        if (ds4_session_pos(slot->session) > cached) {
+            kv_cache_maybe_store_continued(s, slot);
+        }
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled after prefill");
         ds4_tokens_free(&effective_prompt);
@@ -14098,9 +14270,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
         }
     }
-    char id[96];
-    responses_random_id(id, sizeof(id),
-                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -14956,6 +15125,8 @@ decode_again:
                    ctx_span,
                    req_flags[0] ? " " : "",
                    req_flags);
+    } else if (strcmp(final_finish, "error") != 0) {
+        kv_cache_maybe_store_continued(s, slot);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -21620,6 +21791,62 @@ static void test_cancelled_progress_callback_is_inert(void) {
     test_cancel_job_destroy(&j);
 }
 
+static void test_return_progress_streams_prompt_progress_chunks(void) {
+    request r;
+    char err[128] = {0};
+    TEST_ASSERT(parse_chat_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4.1-flash\",\"stream\":true,\"return_progress\":true,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        64, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.stream && r.return_progress);
+    request_free(&r);
+
+    TEST_ASSERT(!parse_chat_request(NULL, NULL,
+        "{\"stream\":true,\"return_progress\":\"yes\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        64, 32768, &r, err, sizeof(err)));
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    request_init(&r, REQ_CHAT, 64);
+    r.model = xstrdup("deepseek-v4.1-flash");
+    r.stream = true;
+    r.return_progress = true;
+    job j;
+    test_cancel_job_init(&j);
+    server_prefill_progress progress = {
+        .kind = REQ_CHAT,
+        .prompt_tokens = 1000,
+        .cached_tokens = 200,
+        .t0 = now_sec() - 1.25,
+        .fd = sv[0],
+        .stream = true,
+        .req = &r,
+        .response_id = "chatcmpl-progress",
+        .return_progress = true,
+        .last_progress_tokens = 200,
+        .request_job = &j,
+    };
+    server_progress_cb(&progress, "prefill_display", 350, 1000);
+    server_progress_cb(&progress, "prefill_display", 400, 1000);
+    server_progress_cb(&progress, "prefill_chunk", 600, 1000);
+    close(sv[0]);
+
+    char out[4096];
+    ssize_t n = read(sv[1], out, sizeof(out) - 1);
+    close(sv[1]);
+    TEST_ASSERT(n > 0);
+    out[n] = '\0';
+    TEST_ASSERT(strstr(out, "Content-Type: text/event-stream\r\n") != NULL);
+    TEST_ASSERT(strstr(out, "\"id\":\"chatcmpl-progress\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"choices\":[],\"prompt_progress\":{\"total\":1000,\"cache\":200,\"processed\":350,") != NULL);
+    TEST_ASSERT(strstr(out, "\"processed\":400,") == NULL);
+    TEST_ASSERT(strstr(out, "\"choices\":[],\"prompt_progress\":{\"total\":1000,\"cache\":200,\"processed\":600,") != NULL);
+
+    test_cancel_job_destroy(&j);
+    request_free(&r);
+}
+
 static void test_cancel_server_init(server *s) {
     memset(s, 0, sizeof(*s));
     pthread_mutex_init(&s->mu, NULL);
@@ -22001,11 +22228,39 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 10240;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20525) == 20525);
 
     kc.opt.boundary_align_tokens = 0;
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30117) == 30117);
+
+    {
+        const int user = 9001, assistant = 9002;
+        kv_disk_cache cold_kc = {0};
+        cold_kc.enabled = true;
+        cold_kc.opt = kv_cache_default_options();
+        cold_kc.opt.min_tokens = 4;
+        cold_kc.opt.cold_max_tokens = 10;
+        cold_kc.opt.boundary_trim_tokens = 0;
+        cold_kc.opt.boundary_align_tokens = 0;
+
+        ds4_tokens long_chat = {0};
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&long_chat, 10 + i);
+        ds4_tokens_push(&long_chat, user);
+        ds4_tokens_push(&long_chat, 20);
+        ds4_tokens_push(&long_chat, assistant);
+        for (int i = 0; i < 20; i++) ds4_tokens_push(&long_chat, 30 + i);
+        TEST_ASSERT(kv_cache_cold_store_target_len(&cold_kc, &long_chat, user, assistant) == 6);
+
+        ds4_tokens long_raw = {0};
+        for (int i = 0; i < 25; i++) ds4_tokens_push(&long_raw, 50 + i);
+        TEST_ASSERT(kv_cache_cold_store_target_len(&cold_kc, &long_raw, user, assistant) == 0);
+
+        ds4_tokens_free(&long_chat);
+        ds4_tokens_free(&long_raw);
+    }
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -23364,6 +23619,113 @@ static void test_deepseek41_server_tools(void) {
     TEST_ASSERT(strstr(tail, "</tool_result>\n\n<tool_result>"));
     TEST_ASSERT(strstr(tail, "<｜System｜>Continue<｜Assistant｜><think>"));
     free(full); free(tail); chat_msgs_free(&msgs);
+
+    /* Leading inline system tools match top-level tools byte-for-byte, and
+     * mid-conversation system tool updates render at the tail without mutating
+     * the cached prefix. */
+    const char *top_req_body =
+        "{\"messages\":["
+        "{\"role\":\"system\",\"content\":\"Base rules.\"},"
+        "{\"role\":\"user\",\"content\":\"Run.\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"notes\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\"}}}}}]"
+        "}";
+    const char *inline_lead_body =
+        "{\"messages\":["
+        "{\"role\":\"system\",\"content\":\"Base rules.\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"notes\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\"}}}}}]},"
+        "{\"role\":\"user\",\"content\":\"Run.\"}]"
+        "}";
+    const char *inline_update_body =
+        "{\"messages\":["
+        "{\"role\":\"system\",\"content\":\"Base rules.\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"notes\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\"}}}}}]},"
+        "{\"role\":\"user\",\"content\":\"Run.\"},"
+        "{\"role\":\"assistant\",\"reasoning_content\":\"Plan.\",\"content\":\"Done.\"},"
+        "{\"role\":\"system\",\"content\":\"Updated cwd.\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"notes\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"op\":{\"type\":\"string\"}}}}}]},"
+        "{\"role\":\"user\",\"content\":\"Resume.\"}]"
+        "}";
+    {
+        request top_req = {0}, lead_req = {0}, upd_req = {0}, none_req = {0};
+        char err[128] = {0};
+        TEST_ASSERT(parse_chat_request(NULL, NULL, top_req_body, 64, 300000, &top_req, err, sizeof(err)));
+        TEST_ASSERT(parse_chat_request(NULL, NULL, inline_lead_body, 64, 300000, &lead_req, err, sizeof(err)));
+        TEST_ASSERT(parse_chat_request(NULL, NULL, inline_update_body, 64, 300000, &upd_req, err, sizeof(err)));
+        TEST_ASSERT(parse_chat_request(NULL, NULL,
+            "{\"tool_choice\":\"none\",\"messages\":[{\"role\":\"system\",\"content\":\"Base.\","
+            "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"notes\",\"parameters\":{}}}]},"
+            "{\"role\":\"user\",\"content\":\"Hi\"}]}",
+            64, 300000, &none_req, err, sizeof(err)));
+        TEST_ASSERT(top_req.has_tools && lead_req.has_tools && upd_req.has_tools && !none_req.has_tools);
+        TEST_ASSERT(lead_req.prompt_preserves_reasoning && upd_req.prompt_preserves_reasoning);
+        const tool_schema_order *redefined = tool_schema_orders_find(&upd_req.tool_orders, "notes");
+        TEST_ASSERT(redefined && redefined->len == 2 && !strcmp(redefined->prop[0], "path"));
+        request_free(&top_req);
+        request_free(&lead_req);
+        request_free(&upd_req);
+        request_free(&none_req);
+
+        const char *bad_user_tools =
+            "[{\"role\":\"user\",\"content\":\"Hi\","
+            "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"notes\",\"parameters\":{}}}]}]";
+        chat_msgs bad_msgs = {0};
+        TEST_ASSERT(!parse_messages(&bad_user_tools, &bad_msgs));
+    }
+    {
+        const char *m_lead = &inline_lead_body[12];
+        const char *m_upd = &inline_update_body[12];
+        chat_msgs lead_msgs = {0}, upd_msgs = {0};
+        TEST_ASSERT(parse_messages(&m_lead, &lead_msgs));
+        TEST_ASSERT(parse_messages(&m_upd, &upd_msgs));
+        const char *top_schema =
+            "{\"name\":\"notes\",\"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\"}}}}";
+        chat_msgs plain_msgs = {0};
+        const char *m_plain = "[{\"role\":\"system\",\"content\":\"Base rules.\"},{\"role\":\"user\",\"content\":\"Run.\"}]";
+        TEST_ASSERT(parse_messages(&m_plain, &plain_msgs));
+
+        char *v41_top = render_deepseek41_chat(&plain_msgs, 0, top_schema, DS4_THINK_MAX, false);
+        char *v41_lead = render_deepseek41_chat(&lead_msgs, 0, NULL, DS4_THINK_MAX, false);
+        TEST_ASSERT(!strcmp(v41_top, v41_lead));
+        char *v41_upd = render_deepseek41_chat(&upd_msgs, 0, NULL, DS4_THINK_MAX, false);
+        const size_t v41_prefix_len = (size_t)(strstr(v41_lead, "<｜Assistant｜>") - v41_lead);
+        TEST_ASSERT(!strncmp(v41_lead, v41_upd, v41_prefix_len));
+        char *v41_tail = render_deepseek41_chat(&upd_msgs, 3, NULL, DS4_THINK_MAX, true);
+        const char *v41_eos = strstr(v41_upd, "<｜end▁of▁sentence｜>");
+        TEST_ASSERT(v41_eos && !strcmp(v41_eos, v41_tail));
+        free(v41_top); free(v41_lead); free(v41_upd); free(v41_tail);
+
+        char *glm_top = render_glm_chat_prompt_text(&plain_msgs, top_schema, NULL, DS4_THINK_MAX);
+        char *glm_lead = render_glm_chat_prompt_text(&lead_msgs, NULL, NULL, DS4_THINK_MAX);
+        TEST_ASSERT(!strcmp(glm_top, glm_lead));
+        char *glm_upd = render_glm_chat_prompt_text(&upd_msgs, NULL, NULL, DS4_THINK_MAX);
+        const size_t glm_prefix_len = (size_t)(strstr(glm_lead, "<|assistant|>") - glm_lead);
+        TEST_ASSERT(!strncmp(glm_lead, glm_upd, glm_prefix_len));
+        char *glm_tail = render_glm_live_tool_tail(&upd_msgs, 3, NULL, DS4_THINK_MAX);
+        const char *glm_after_asst = strstr(glm_upd, "Done.");
+        TEST_ASSERT(glm_after_asst && !strcmp(glm_after_asst + 5, glm_tail));
+        free(glm_top); free(glm_lead); free(glm_upd); free(glm_tail);
+
+        const char *m_sys_tail =
+            "[{\"role\":\"system\",\"content\":\"S0\"},"
+            "{\"role\":\"user\",\"content\":\"U\"},"
+            "{\"role\":\"assistant\",\"reasoning_content\":\"R\",\"content\":\"A\"},"
+            "{\"role\":\"system\",\"content\":\"REMINDER\"}]";
+        chat_msgs sys_tail_msgs = {0};
+        TEST_ASSERT(parse_messages(&m_sys_tail, &sys_tail_msgs));
+        char *glm_sys_tail = render_glm_chat_prompt_text(&sys_tail_msgs, NULL, NULL, DS4_THINK_MAX);
+        TEST_ASSERT(strstr(glm_sys_tail,
+            "<|user|>U<|assistant|><think>R</think>A<|system|>REMINDER<|assistant|><think>") != NULL);
+        free(glm_sys_tail);
+        chat_msgs_free(&sys_tail_msgs);
+
+        chat_msgs_free(&plain_msgs);
+        chat_msgs_free(&lead_msgs);
+        chat_msgs_free(&upd_msgs);
+    }
 }
 
 static void test_deepseek41_anthropic_results(void) {
@@ -23589,6 +23951,7 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
+    test_return_progress_streams_prompt_progress_chunks();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();
     test_cancel_detaches_assigned_job();
