@@ -41976,8 +41976,10 @@ static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
 
 /* Engine-wide prefill ceiling. Zero keeps the ctx-tiered prefill width and
  * the wide-prefill carry; ds41_fit_context sets it, which also drops the
- * carry, only when a resident context would not fit otherwise. */
+ * carry (and, at the 512-row floor, the optional bf16 index-key mirror),
+ * only when a resident context would not fit otherwise. */
 static uint32_t g_ds41_prefill_ceiling;
+static bool g_ds41_no_index_bf16;
 
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
     uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
@@ -42099,7 +42101,9 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
 }
 
 #ifdef __APPLE__
-static bool ds41_index_bf16_on(void) { return !(ds4_gpu_v41_off() & DS4_GPU_V41_INDEX_BF16); }
+static bool ds41_index_bf16_on(void) {
+    return !g_ds41_no_index_bf16 && !(ds4_gpu_v41_off() & DS4_GPU_V41_INDEX_BF16);
+}
 #endif
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
@@ -42189,17 +42193,26 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
 
 /* Picks the widest buffer shape whose graphs fit in `room` bytes: the
  * ctx-tiered default, then no wide-prefill carry with 2048, 1024 and 512
- * prefill rows. Without the carry, prefill already runs in chunks of at most
- * 2048 rows, so the first fallback keeps that arithmetic and gives up only
- * the layer-major sweep. Returns the ceiling (0 for the default), or
- * UINT32_MAX with the default restored when nothing fits. */
+ * prefill rows, and finally 512 prefill rows without the optional bf16
+ * index-key mirror (scoring the resident f32 index cache directly). Returns
+ * the ceiling (0 for the default), or UINT32_MAX with defaults restored when
+ * nothing fits. */
 static uint32_t ds41_fit_context(uint32_t ctx, uint32_t sessions, uint64_t room) {
     static const uint32_t ceilings[] = {0u, 2048u, 1024u, 512u};
+    g_ds41_no_index_bf16 = false;
     for (size_t i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]); i++) {
         g_ds41_prefill_ceiling = ceilings[i];
         if (ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions) < room) return ceilings[i];
     }
+#ifdef __APPLE__
+    if (!(ds4_gpu_v41_off() & DS4_GPU_V41_INDEX_BF16)) {
+        g_ds41_no_index_bf16 = true;
+        g_ds41_prefill_ceiling = 512u;
+        if (ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions) < room) return 512u;
+    }
+#endif
     g_ds41_prefill_ceiling = 0;
+    g_ds41_no_index_bf16 = false;
     return UINT32_MAX;
 }
 
@@ -74841,7 +74854,9 @@ static bool ds41_admit_engine_context(ds4_engine *e, const ds4_engine_options *o
     const uint32_t sessions = e->placement_session_count_hint > 0 ?
         (uint32_t)e->placement_session_count_hint : 1;
     const uint32_t previous = g_ds41_prefill_ceiling;
+    const bool previous_no_bf16 = g_ds41_no_index_bf16;
     g_ds41_prefill_ceiling = 0;
+    g_ds41_no_index_bf16 = false;
     uint64_t base = 0, budget = 0, expert = 0;
     if (e->backend == DS4_BACKEND_METAL && !e->ssd_streaming && !e->tp.active &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE &&
@@ -74851,9 +74866,11 @@ static bool ds41_admit_engine_context(ds4_engine *e, const ds4_engine_options *o
         budget > base) {
         const uint32_t ceiling = ds41_fit_context(ctx, sessions, budget - base);
         /* Engine open admits twice; report a fitted shape once. */
-        if (ceiling != 0 && ceiling != UINT32_MAX && ceiling != previous)
-            fprintf(stderr, "ds4: V4.1 ctx %u fits resident without the wide-prefill carry, "
-                            "in %u-row prefill chunks\n", ctx, ceiling);
+        if (ceiling != 0 && ceiling != UINT32_MAX &&
+            (ceiling != previous || g_ds41_no_index_bf16 != previous_no_bf16))
+            fprintf(stderr, "ds4: V4.1 ctx %u fits resident without the wide-prefill carry%s, "
+                            "in %u-row prefill chunks\n",
+                    ctx, g_ds41_no_index_bf16 ? " or bf16 index copy" : "", ceiling);
     }
     return ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true);
 }
