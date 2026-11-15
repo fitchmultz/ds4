@@ -2605,6 +2605,42 @@ void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x
     }
 }
 
+static inline ushort ds4_pack_iq1s_grid_u16(ulong w) {
+    ulong u = ((w & 0x0303030303030303ull) + 0x0101010101010101ull) & 0x0303030303030303ull;
+    u = (u | (u >> 6)) & 0x000f000f000f000full;
+    u = (u | (u >> 12)) & 0x000000ff000000ffull;
+    return (ushort)(u | (u >> 24));
+}
+
+static inline void ds4_stage_iq1s_grid_u16(threadgroup ushort *sgrid, ushort tid, ushort nthreads) {
+    for (ushort i = tid; i < 2048; i += nthreads) {
+        sgrid[i] = ds4_pack_iq1s_grid_u16(ds4_metal_iq1s_grid[i]);
+    }
+}
+
+template <typename type4x4>
+static inline void dequantize_iq1_s_sgrid(
+        device const block_iq1_s * xb,
+        short il,
+        thread type4x4 & reg,
+        const threadgroup ushort * sgrid) {
+    const float d = xb->d;
+    const int ib32 = il/2;
+    il = il%2;
+    const uint16_t qh = xb->qh[ib32];
+    const float dl = d * (float)(2 * ((qh >> 12) & 7) + 1);
+    const float bias = (qh & 0x8000) ? -1.125f : -0.875f;
+    device const uint8_t * qs = xb->qs + 4*ib32;
+    for (int l = 0; l < 2; ++l) {
+        const int g = 2*il + l;
+        const ushort packed = sgrid[qs[g] | (((qh >> (3*g)) & 7) << 8)];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            reg[2*l + i/4][i%4] = dl * ((float)((packed >> (2*i)) & 3u) + bias);
+        }
+    }
+}
+
 template <typename type4x4>
 void dequantize_iq1_s(device const block_iq1_s * xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -3598,6 +3634,56 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows(
     };
 
     kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+        args0,
+        src0_cur,
+        src1_cur,
+        dst_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+}
+
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_seq4(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int idx = tgpig.z;
+
+    tgpig.z = 0;
+
+    device const char * src0_cur = src0s + idx*args.nb02;
+    device const char * src1_cur = src1  + idx*args.nb11;
+    device       char * dst_cur  = dst   + idx*args.ne0*sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        /*.ne00 =*/ args.ne00,
+        /*.ne01 =*/ args.ne01,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ args.nb00,
+        /*.nb01 =*/ args.nb01,
+        /*.nb02 =*/ args.nb02,
+        /*.nb03 =*/ args.nb02,
+        /*.ne10 =*/ args.ne10,
+        /*.ne11 =*/ args.ne12,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ args.nb10,
+        /*.nb11 =*/ args.nb12,
+        /*.nb12 =*/ (uint64_t)args.ne12 * args.nb12,
+        /*.nb13 =*/ (uint64_t)args.ne12 * args.nb12,
+        /*.ne0  =*/ args.ne1*args.ne0,
+        /*.ne1  =*/ args.ne12,
+        /*.nr0  =*/ 4,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    kernel_mul_mv_q8_0_f32_rows_seq_impl<4, thread ds4_metal_args_mul_mv &>(
         args0,
         src0_cur,
         src1_cur,
@@ -9525,6 +9611,12 @@ kernel void kernel_mul_mm_id_mpp_packed(
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i)) acc[i] = 0;
 
+    threadgroup ushort sgrid_iq1s[is_same<block_q, block_iq1_s>::value ? 2048 : 1];
+    if (is_same<block_q, block_iq1_s>::value) {
+        ds4_stage_iq1s_grid_u16(sgrid_iq1s, tid, 128);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     auto stage = [&](int k, threadgroup half *tile) {
         if (tid >= M*2) return;
         const int row = min((int)tid/2, nr0 - 1);
@@ -9533,7 +9625,11 @@ kernel void kernel_mul_mm_id_mpp_packed(
             (uint64_t)(expert - args.tp_expert_base)*args.nb02 +
             (r0 + row)*args.nb01);
         half4x4 values;
-        dequantize_func(w + col/(16*nl), (col/16)%nl, values);
+        if (is_same<block_q, block_iq1_s>::value) {
+            dequantize_iq1_s_sgrid((device const block_iq1_s *)(w + col/(16*nl)), (col/16)%nl, values, sgrid_iq1s);
+        } else {
+            dequantize_func(w + col/(16*nl), (col/16)%nl, values);
+        }
         *((threadgroup half4x4 *)(tile + (tid/2)*K + 16*(tid%2))) = values;
     };
     stage(0, sa);
@@ -9562,6 +9658,7 @@ kernel void kernel_mul_mm_id_mpp_packed(
 
 typedef decltype(kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>) mm_id_packed_t;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_id_iq1_s_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq1_s, QK_NL, dequantize_iq1_s>;
 template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K>;
 template [[host_name("kernel_mul_mm_id_mxfp4_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed_m32n128")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, 32, 128>;
@@ -9897,6 +9994,12 @@ kernel void kernel_mul_mm_id_mpp_dbuf(
         }
     }
 
+    threadgroup ushort sgrid_iq1s[is_same<block_q, block_iq1_s>::value ? 2048 : 1];
+    if (is_same<block_q, block_iq1_s>::value) {
+        ds4_stage_iq1s_grid_u16(sgrid_iq1s, tiitg, 128);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     auto stage_a = [&](int chunk_k, threadgroup S0 *buf) {
         if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
             for (short i = 0; i < 16; i++) {
@@ -9910,7 +10013,11 @@ kernel void kernel_mul_mm_id_mpp_dbuf(
             }
         } else {
             S0_4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            if (is_same<block_q, block_iq1_s>::value) {
+                dequantize_iq1_s_sgrid((device const block_iq1_s *)x, il, temp_a, sgrid_iq1s);
+            } else {
+                dequantize_func(x, il, temp_a);
+            }
 
             FOR_UNROLL (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
@@ -10007,6 +10114,8 @@ typedef decltype(kernel_mul_mm_id_mpp_dbuf<half, half4x4, simdgroup_half8x8, hal
 
 template [[host_name("kernel_mul_mm_id_q4_K_f32_dbuf_mpp")]] kernel mul_mm_id_mpp_dbuf_t kernel_mul_mm_id_mpp_dbuf<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f16_dbuf_mpp")]] kernel mul_mm_id_mpp_dbuf_f16_rhs_t kernel_mul_mm_id_mpp_dbuf<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_iq1_s_f32_dbuf_mpp")]] kernel mul_mm_id_mpp_dbuf_t kernel_mul_mm_id_mpp_dbuf<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq1_s, QK_NL, dequantize_iq1_s, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_iq1_s_f16_dbuf_mpp")]] kernel mul_mm_id_mpp_dbuf_f16_rhs_t kernel_mul_mm_id_mpp_dbuf<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq1_s, QK_NL, dequantize_iq1_s, half, half4x4, half, half2x4>;
 
 typedef decltype(kernel_attn_out_low_mpp_direct_rhs<
         block_q8_0, 2, dequantize_q8_0_pairs, 64>)

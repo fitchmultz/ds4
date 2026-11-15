@@ -301,6 +301,9 @@ int ds4_gpu_dsv41_attention_low_plain(ds4_gpu_tensor *low, const void *model_map
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
 /* Two weighted RMS norms rounded to bf16 in one dispatch. */
+#ifdef __APPLE__
+void ds4_gpu_warm_v41_verify_pipelines(void);
+#endif
 int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0, uint64_t weight0_offset, uint32_t n0,
                                  ds4_gpu_tensor *out1, const ds4_gpu_tensor *x1, uint64_t weight1_offset, uint32_t n1,
                                  const void *model_map, uint64_t model_size, float eps, uint32_t rows);

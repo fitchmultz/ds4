@@ -692,6 +692,56 @@ void kernel_mul_mv_q8_0_f32_rows_seq_impl(
     const short ix = tiisg/(NW/NQ);
     const short il = tiisg%(NW/NQ);
     const int ib0 = sgitg*NQ + ix;
+    if (args.ne11 >= 2 && args.ne11 <= 8) {
+        device const block_q8_0 * ax_safe[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            const int clamped_row = min(r0 + (int)row, args.ne01 - 1);
+            const uint64_t offset0 = (uint64_t)clamped_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+            ax_safe[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+        }
+        const int n_rows = args.ne11;
+        float sumf[8][NR0];
+        FOR_UNROLL (short r = 0; r < 8; ++r) {
+            FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[r][row] = 0.f;
+        }
+        for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+            float q[NR0][NQ];
+            float d[NR0];
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                device const int8_t * qs = ax_safe[row][ib].qs + il*NQ;
+                d[row] = ax_safe[row][ib].d;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) q[row][i] = qs[i];
+            }
+            for (int r1 = 0; r1 < n_rows; ++r1) {
+                const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+                device const float * yb = (device const float *) (src1 + offset1) + ib*QK8_0 + il*NQ;
+                float yl[NQ];
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    yl[i] = ROUND_IN ? ds4_bf16_round(yb[i]) : yb[i];
+                }
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    float sumq = 0.f;
+                    FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                        sumq += q[row][i] * yl[i];
+                    }
+                    sumf[r1][row] += sumq * d[row];
+                }
+            }
+        }
+        for (int r1 = 0; r1 < n_rows; ++r1) {
+            if (HC_OUT) {
+                const uint64_t hc_dim = 4ull * hc->n_embd, stride = hc->split_stride;
+                helper_mv_reduce_and_write_hc_expand4<NR0>((device float *) dst + r1*hc_dim, sumf[r1], r0, args.ne01,
+                    tiisg, sgitg, shmem, *hc, hc_add + r1*hc->n_embd, hc_residual + r1*hc_dim,
+                    hc_post + r1*stride, hc_comb + r1*stride);
+            } else {
+                device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+                helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf[r1], r0, args.ne01, tiisg, sgitg, shmem);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        return;
+    }
     for (int r1 = 0; r1 < args.ne11; ++r1) {
         const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
         device const float * y = (device const float *) (src1 + offset1);
@@ -2013,6 +2063,114 @@ kernel void kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (args.ne11 >= 2 && args.ne11 <= 8 && tgpig.x == 0) {
+        const short NSG = FC_mul_mv_nsg;
+        constexpr short NR0 = N_R0_Q8_0;
+        constexpr short NW = N_SIMDWIDTH;
+        constexpr short NQ = 8;
+        const int nb = args.ne00 / QK8_0;
+        const int r0 = (int)tgpig.y * NR0;
+        const int im = (int)tgpig.z;
+        const uint i12 = im % args.ne12;
+        const uint i13 = im / args.ne12;
+        device const block_q8_0 *ag[NR0];
+        device const block_q8_0 *au[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            const int clamped_row = min(r0 + (int)row, args.ne01 - 1);
+            const uint64_t offset0 = (uint64_t)clamped_row * args.nb01 +
+                                     (i12 / args.r2) * args.nb02 +
+                                     (i13 / args.r3) * args.nb03;
+            ag[row] = (device const block_q8_0 *)(src0_gate + offset0);
+            au[row] = (device const block_q8_0 *)(src0_up   + offset0);
+        }
+        const short ix = tiisg / (NW / NQ);
+        const short il = tiisg % (NW / NQ);
+        const int ib0 = sgitg * NQ + ix;
+        const int n_rows = args.ne11;
+        float sumg[8][NR0];
+        float sumu[8][NR0];
+        FOR_UNROLL (short r = 0; r < 8; ++r) {
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                sumg[r][row] = 0.f;
+                sumu[r][row] = 0.f;
+            }
+        }
+        for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+            float qg_reg[NR0][NQ];
+            float qu_reg[NR0][NQ];
+            float dg[NR0];
+            float du[NR0];
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                device const int8_t *qg = ag[row][ib].qs + il * NQ;
+                device const int8_t *qu = au[row][ib].qs + il * NQ;
+                dg[row] = ag[row][ib].d;
+                du[row] = au[row][ib].d;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    qg_reg[row][i] = qg[i];
+                    qu_reg[row][i] = qu[i];
+                }
+            }
+            for (int r1 = 0; r1 < n_rows; ++r1) {
+                const uint64_t offset1 = r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+                device const float *yb = (device const float *)(src1 + offset1) + ib * QK8_0 + il * NQ;
+                float yl[NQ];
+                FOR_UNROLL (short i = 0; i < NQ; ++i) yl[i] = yb[i];
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    float sg = 0.f;
+                    float su = 0.f;
+                    FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                        sg += qg_reg[row][i] * yl[i];
+                        su += qu_reg[row][i] * yl[i];
+                    }
+                    sumg[r1][row] += sg * dg[row];
+                    sumu[r1][row] += su * du[row];
+                }
+            }
+        }
+        threadgroup float *shmem_f32 = (threadgroup float *)shmem;
+        threadgroup float *sh_gate[NR0];
+        threadgroup float *sh_up[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            sh_gate[row] = shmem_f32 + NW * row;
+            sh_up[row]   = shmem_f32 + NW * (NR0 + row);
+        }
+        for (int r1 = 0; r1 < n_rows; ++r1) {
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                if (sgitg == 0) {
+                    sh_gate[row][tiisg] = 0.0f;
+                    sh_up[row][tiisg] = 0.0f;
+                }
+                sumg[r1][row] = simd_sum(sumg[r1][row]);
+                sumu[r1][row] = simd_sum(sumu[r1][row]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                if (tiisg == 0) {
+                    sh_gate[row][sgitg] = sumg[r1][row];
+                    sh_up[row][sgitg] = sumu[r1][row];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            device float *mid_f32 = (device float *)dst_mid +
+                (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
+            FOR_UNROLL (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
+                const float gate = simd_sum(sh_gate[row][tiisg]);
+                const float up = simd_sum(sh_up[row][tiisg]);
+                if (tiisg == 0 && sgitg == 0) {
+                    float g = ds4_bf16_round(gate);
+                    float u = ds4_bf16_round(up);
+                    if (clamp_value > 1.0e-6f) {
+                        g = min(g, clamp_value);
+                        u = clamp(u, -clamp_value, clamp_value);
+                    }
+                    const float silu = g / (1.0f + exp(-g));
+                    mid_f32[r0 + row] = silu * u;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        return;
+    }
     kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false, true>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, uint3(tgpig.y, tgpig.x, tgpig.z), tiisg, sgitg);
