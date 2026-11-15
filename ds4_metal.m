@@ -45680,14 +45680,10 @@ int ds4_gpu_routed_moe_batch_tensor(
             if (use_packed_mpp) {
                 gate_mm_pipeline = up_mm_pipeline =
                     ds4_gpu_get_pipeline(
-                        gate_type == DS4_METAL_TENSOR_IQ1_S ?
-                            "kernel_mul_mm_id_iq1_s_mpp_packed" :
                         gate_type == DS4_METAL_TENSOR_MXFP4 ?
                         "kernel_mul_mm_id_mxfp4_mpp_packed" : packed_m32n128 ?
                         "kernel_mul_mm_id_iq2_xxs_mpp_packed_m32n128" : "kernel_mul_mm_id_iq2_xxs_mpp_packed");
                 down_mm_pipeline = ds4_gpu_get_pipeline(
-                        down_type == DS4_METAL_TENSOR_IQ1_S ?
-                            "kernel_mul_mm_id_iq1_s_mpp_packed" :
                         down_type == DS4_METAL_TENSOR_MXFP4 ?
                         "kernel_mul_mm_id_mxfp4_mpp_packed" : packed_m32n128 ?
                         "kernel_mul_mm_id_q2_K_mpp_packed_m32n128" : "kernel_mul_mm_id_q2_K_mpp_packed");

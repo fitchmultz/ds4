@@ -9658,7 +9658,6 @@ kernel void kernel_mul_mm_id_mpp_packed(
 
 typedef decltype(kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>) mm_id_packed_t;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
-template [[host_name("kernel_mul_mm_id_iq1_s_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq1_s, QK_NL, dequantize_iq1_s>;
 template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K>;
 template [[host_name("kernel_mul_mm_id_mxfp4_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed_m32n128")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, 32, 128>;
