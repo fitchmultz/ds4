@@ -71,6 +71,7 @@ typedef struct {
     bool show_output;
     bool teacher_forced_decode;
     bool dspark;
+    bool suffix_spec;
     bool dspark_confidence_threshold_set;
     float dspark_confidence_threshold;
 } bench_config;
@@ -272,6 +273,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dspark")) {
             c.dspark = true;
+        } else if (!strcmp(arg, "--suffix-spec")) {
+            c.suffix_spec = true;
         } else if (!strcmp(arg, "--dspark-confidence")) {
             const double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
             if (v < 0.0 || v > 1.0) {
@@ -390,9 +393,9 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: --dspark requires --mtp-model FILE\n");
         exit(2);
     }
-    if (c.dspark && c.teacher_forced_decode) {
+    if ((c.dspark || c.suffix_spec) && c.teacher_forced_decode) {
         fprintf(stderr,
-                "ds4-bench: --dspark cannot be combined with "
+                "ds4-bench: speculative decoding cannot be combined with "
                 "--teacher-forced-decode\n");
         exit(2);
     }
@@ -661,6 +664,7 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .dspark = cfg.dspark,
+        .suffix_spec = cfg.suffix_spec,
         .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
         .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
@@ -786,9 +790,9 @@ int main(int argc, char **argv) {
     const bool distributed =
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
-    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
-    if (cfg.dspark && !speculative) {
-        fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
+    const bool speculative = (cfg.dspark || cfg.suffix_spec) && ds4_engine_mtp_draft_tokens(engine) > 1;
+    if ((cfg.dspark || cfg.suffix_spec) && !speculative) {
+        fprintf(stderr, "ds4-bench: speculative decoding did not enable draft verification\n");
         if (out != stdout) fclose(out);
         ds4_session_free(session);
         ds4_tokens_free(&prompt);

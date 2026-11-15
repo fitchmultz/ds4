@@ -156,6 +156,7 @@ typedef struct {
     bool dspark;
     bool dspark_strict;
     bool dspark_exact_sampling;
+    bool suffix_spec;
     bool dspark_confidence_threshold_set;
     bool cuda_tensor_parallel;
     bool ssd_streaming;

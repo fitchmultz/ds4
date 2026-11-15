@@ -4,7 +4,10 @@
 
 #define DS41_DRAFT_WINDOW 128u
 #define DS41_DRAFT_ROWS 5u
+#define DS41_SUFFIX_DRAFT_ROWS 3u
 #define DS41_VERIFY_ROWS (DS41_DRAFT_ROWS + 1u)
+#define DS41_SUFFIX_BUCKETS 65536u
+#define DS41_SUFFIX_VERIFIER_BYTES (UINT64_C(8) << 20)
 
 struct ds41_dspark {
     const ds4_dspark_weights *weights;
@@ -22,6 +25,11 @@ struct ds41_dspark {
     ds41_gpu_graph verified[DS41_VERIFY_ROWS + 1u];
     float *host_verified;
     uint32_t verify_start, verify_count, rewind_end;
+    uint32_t suffix_cap, suffix_indexed_len, zero_streak;
+    float accept_ema;
+    float v0_ms, vk_ms[DS41_VERIFY_ROWS];
+    int32_t *suffix_tokens, *suffix_prev3;
+    int32_t *suffix_head3, *recycle_top1;
 };
 
 static void ds41_dspark_reset(ds41_dspark *d) {
@@ -31,6 +39,16 @@ static void ds41_dspark_reset(ds41_dspark *d) {
     d->kv_end = 0;
     d->verify_count = 0;
     d->rewind_end = 0;
+    d->suffix_indexed_len = 0;
+    d->zero_streak = 0;
+    d->accept_ema = 0.5f;
+    d->v0_ms = 26.2f;
+    static const float vk_init[DS41_VERIFY_ROWS] = {
+        26.2f, 40.8f, 55.5f, 70.5f, 108.0f, 135.0f
+    };
+    for (unsigned i = 0; i < DS41_VERIFY_ROWS; i++) d->vk_ms[i] = vk_init[i];
+    if (d->suffix_head3) memset(d->suffix_head3, 0xff, DS41_SUFFIX_BUCKETS * sizeof(int32_t));
+    if (d->recycle_top1) memset(d->recycle_top1, 0xff, DS4_N_VOCAB * sizeof(int32_t));
 }
 
 static void ds41_dspark_free(ds41_dspark *d) {
@@ -65,7 +83,226 @@ static void ds41_dspark_free(ds41_dspark *d) {
     free(d->host_verified);
     free(d->host_logits);
     free(d->draft_probs);
+    free(d->suffix_tokens);
+    free(d->suffix_prev3);
+    free(d->suffix_head3);
+    free(d->recycle_top1);
     free(d);
+}
+
+static DS4_MAYBE_UNUSED ds41_dspark *ds41_dspark_alloc_verifier(uint32_t ctx_cap) {
+    if (!ctx_cap) return NULL;
+    ds41_dspark *d = calloc(1, sizeof(*d));
+    if (!d) return NULL;
+    d->suffix_cap = ctx_cap;
+#define DS41_VERIFY_A(name, count) \
+    if (!(d->name = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)))) goto fail;
+    DS41_VERIFY_A(verify_residual, (DS41_VERIFY_ROWS + 1u) * DS4_N_HC * DS4_N_EMBD)
+    DS41_VERIFY_A(verify_pre, (DS41_VERIFY_ROWS + 1u) * DS4_N_HC)
+    DS41_VERIFY_A(verify_logits, (DS41_VERIFY_ROWS + 1u) * DS4_N_VOCAB)
+    DS41_VERIFY_A(verify_pool, (DS41_VERIFY_ROWS + 1u) * 8u * DS4_N_HEAD_DIM)
+    DS41_VERIFY_A(old_raw, 40u * DS41_VERIFY_ROWS * DS4_N_HEAD_DIM)
+#undef DS41_VERIFY_A
+    d->host_verified = malloc((uint64_t)(DS41_VERIFY_ROWS + 1u) * DS4_N_VOCAB * sizeof(float));
+    d->suffix_tokens = malloc((size_t)ctx_cap * sizeof(int32_t));
+    d->suffix_prev3 = malloc((size_t)ctx_cap * sizeof(int32_t));
+    d->suffix_head3 = malloc(DS41_SUFFIX_BUCKETS * sizeof(int32_t));
+    d->recycle_top1 = malloc(DS4_N_VOCAB * sizeof(int32_t));
+    if (!d->host_verified || !d->suffix_tokens || !d->suffix_prev3 ||
+        !d->suffix_head3 || !d->recycle_top1)
+        goto fail;
+    ds41_dspark_reset(d);
+#ifdef __APPLE__
+    ds4_gpu_warm_v41_verify_pipelines();
+#endif
+    return d;
+fail:
+    ds41_dspark_free(d);
+    return NULL;
+}
+
+static inline uint32_t ds41_suffix_hash3(int a, int b, int c) {
+    uint32_t h = (uint32_t)a * 3266489917u ^ ((uint32_t)b * 668265263u) ^ ((uint32_t)c * 374761393u);
+    return (h ^ (h >> 16)) & (DS41_SUFFIX_BUCKETS - 1u);
+}
+
+static inline void ds41_suffix_note_timing(ds41_dspark *d, uint32_t verify_rows, double elapsed_ms) {
+    if (!d || !verify_rows || verify_rows > DS41_VERIFY_ROWS || elapsed_ms <= 1.0) return;
+    const float ms = (float)elapsed_ms;
+    if (verify_rows == 1u) {
+        d->v0_ms = 0.88f * d->v0_ms + 0.12f * ms;
+    } else {
+        d->vk_ms[verify_rows - 1u] = 0.88f * d->vk_ms[verify_rows - 1u] + 0.12f * ms;
+    }
+}
+
+static inline float ds41_suffix_marginal_cost(const ds41_dspark *d, uint32_t k) {
+    if (!d || k == 0u || k >= DS41_VERIFY_ROWS || d->v0_ms <= 1.0f) return 0.50f;
+    const float prev = (k == 1u) ? d->v0_ms : d->vk_ms[k - 1u];
+    float ck = (d->vk_ms[k] - prev) / d->v0_ms;
+    if (ck < 0.12f) ck = 0.12f;
+    if (ck > 0.85f) ck = 0.85f;
+    return ck;
+}
+
+static inline void ds41_suffix_note_recycle(ds41_dspark *d, int prev_token, int next_top1) {
+    if (d && d->recycle_top1 && prev_token >= 0 && (uint32_t)prev_token < DS4_N_VOCAB &&
+        next_top1 >= 0 && (uint32_t)next_top1 < DS4_N_VOCAB) {
+        d->recycle_top1[prev_token] = next_top1;
+    }
+}
+
+static inline void ds41_suffix_note_outcome(ds41_dspark *d, uint32_t proposed, uint32_t accepted) {
+    if (!d || !proposed) return;
+    if (accepted == 0) d->zero_streak++;
+    else d->zero_streak = 0;
+    d->accept_ema = 0.85f * d->accept_ema + 0.15f * ((float)accepted / (float)proposed);
+}
+
+static void ds41_suffix_sync_index(ds41_dspark *d, const int *v, uint32_t len) {
+    if (!d || !d->suffix_tokens) return;
+    if (len > d->suffix_cap) len = d->suffix_cap;
+    bool rebuild = len < d->suffix_indexed_len;
+    if (!rebuild && d->suffix_indexed_len > 0) {
+        const uint32_t last = d->suffix_indexed_len - 1u;
+        const uint32_t mid = d->suffix_indexed_len >> 1;
+        if (d->suffix_tokens[last] != v[last] ||
+            d->suffix_tokens[0] != v[0] ||
+            d->suffix_tokens[mid] != v[mid] ||
+            memcmp(d->suffix_tokens, v, (size_t)d->suffix_indexed_len * sizeof(int32_t)) != 0) {
+            rebuild = true;
+        }
+    }
+    if (rebuild) {
+        memset(d->suffix_head3, 0xff, DS41_SUFFIX_BUCKETS * sizeof(int32_t));
+        d->suffix_indexed_len = 0;
+    }
+    for (uint32_t i = d->suffix_indexed_len; i < len; i++) {
+        d->suffix_tokens[i] = v[i];
+        if (i >= 2u) {
+            const uint32_t h3 = ds41_suffix_hash3(v[i - 2u], v[i - 1u], v[i]);
+            d->suffix_prev3[i] = d->suffix_head3[h3];
+            d->suffix_head3[h3] = (int32_t)i;
+        } else {
+            d->suffix_prev3[i] = -1;
+        }
+    }
+    d->suffix_indexed_len = len;
+}
+
+static inline int ds41_suffix_seq_at(const int *v, uint32_t n, const int *tokens, uint32_t idx) {
+    return idx < n ? v[idx] : tokens[idx - n];
+}
+
+/* Lan-staircase (arXiv:2610.34440) live-calibrated 3-gram SuffixDecoding +
+ * Token Recycling proposer. Extends a draft to step k only while cumulative
+ * empirical continuation probability P_cum exceeds 1.32 * c_k, where
+ * c_k = (V(k) - V(k-1)) / V(0) is calibrated online from actual Metal verify
+ * latencies under the active thermal/power envelope. */
+static DS4_MAYBE_UNUSED uint32_t ds41_suffix_propose(
+        ds41_dspark *d, const int *v, uint32_t n, int first_token,
+        uint32_t cap, int eos, bool in_thinking, int *tokens) {
+    tokens[0] = first_token;
+    /* Inside <think> free-form reasoning, IQ1_S MoE 8-expert fanout makes
+     * multi-row verify cost ~0.56 * V(0) per draft row while prose paraphrases
+     * prompt phrases; restrict speculation to post-</think> structured output
+     * (code, tables, patches, and <｜DSML｜...> tool calls). */
+    if (!d || !d->suffix_tokens || in_thinking || cap < 2u || n < 1u) return 1u;
+    if (cap > DS41_VERIFY_ROWS) cap = DS41_VERIFY_ROWS;
+    if (n > d->suffix_cap) n = d->suffix_cap;
+    ds41_suffix_sync_index(d, v, n);
+    /* Keep verify batches within count <= 4 (max_drafts <= 3) so every dense
+     * Q8_0 projection stays on the single-pass seq4 kernel family. */
+    const uint32_t max_drafts = (cap - 1u) < 3u ? (cap - 1u) : 3u;
+
+    int32_t active_p[48];
+    uint32_t active_n = 0;
+    uint32_t best_l = 0;
+    if (n >= 2u) {
+        const int t2 = v[n - 2u], t1 = v[n - 1u], t0 = first_token;
+        const uint32_t h3 = ds41_suffix_hash3(t2, t1, t0);
+        uint32_t scanned = 0;
+        for (int32_t p = d->suffix_head3[h3]; p >= 2 && scanned < 96u; p = d->suffix_prev3[p]) {
+            if (v[p] != t0 || v[p - 1] != t1 || v[p - 2] != t2) continue;
+            scanned++;
+            uint32_t l = 3u;
+            const uint32_t max_l = p + 1 < (int32_t)(n + 1u) ? (uint32_t)(p + 1) : (n + 1u);
+            const uint32_t lim = max_l < 64u ? max_l : 64u;
+            while (l < lim && v[(uint32_t)p - l] == ds41_suffix_seq_at(v, n, tokens, n - l)) l++;
+            if (l > best_l) {
+                best_l = l;
+                active_p[0] = p;
+                active_n = 1u;
+            } else if (l == best_l && active_n < 48u) {
+                active_p[active_n++] = p;
+            }
+        }
+    }
+
+    if (best_l >= 6u && active_n > 0u) {
+        const int recycled0 = (first_token >= 0 && (uint32_t)first_token < DS4_N_VOCAB && d->recycle_top1) ?
+            d->recycle_top1[first_token] : -1;
+        const float streak_scale = d->zero_streak >= 2u ? 0.80f : 1.0f;
+        float p_cum = 1.0f;
+        uint32_t count = 1u;
+        for (uint32_t k = 1u; k <= max_drafts && active_n > 0u; k++) {
+            int cand_tok[48];
+            int32_t cand_pos[48];
+            uint32_t valid_n = 0;
+            for (uint32_t i = 0; i < active_n; i++) {
+                const uint32_t src_idx = (uint32_t)active_p[i] + k;
+                if (src_idx >= n + count) continue;
+                const int tok = ds41_suffix_seq_at(v, n, tokens, src_idx);
+                if (tok < 0 || (uint32_t)tok >= DS4_N_VOCAB) continue;
+                cand_pos[valid_n] = active_p[i];
+                cand_tok[valid_n] = tok;
+                valid_n++;
+            }
+            if (!valid_n) break;
+
+            int modal_tok = cand_tok[0];
+            uint32_t modal_agree = 0;
+            for (uint32_t i = 0; i < valid_n; i++) {
+                uint32_t c = 0;
+                for (uint32_t j = 0; j < valid_n; j++) {
+                    if (cand_tok[j] == cand_tok[i]) c++;
+                }
+                if (c > modal_agree) {
+                    modal_agree = c;
+                    modal_tok = cand_tok[i];
+                }
+            }
+
+            float p_step = 0.0f;
+            if (valid_n == 1u) {
+                if (best_l >= 12u) p_step = 0.92f;
+                else if (best_l >= 8u) p_step = 0.85f;
+                else p_step = 0.74f;
+            } else {
+                float prior = 0.72f;
+                float psu = 1.0f;
+                if (best_l >= 8u) { prior = 0.85f; psu = 1.0f; }
+                p_step = ((float)modal_agree + psu * prior) / ((float)valid_n + psu);
+                if (k == 1u && modal_tok == recycled0 && p_step > 0.0f) {
+                    p_step += 0.06f;
+                    if (p_step > 0.96f) p_step = 0.96f;
+                }
+            }
+            p_cum *= p_step * streak_scale;
+            if (p_cum <= 1.32f * ds41_suffix_marginal_cost(d, k)) break;
+
+            tokens[count++] = modal_tok;
+            if (modal_tok == eos) break;
+
+            uint32_t next_n = 0;
+            for (uint32_t i = 0; i < valid_n; i++) {
+                if (cand_tok[i] == modal_tok) active_p[next_n++] = cand_pos[i];
+            }
+            active_n = next_n;
+        }
+        if (count > 1u) return count;
+    }
+    return 1u;
 }
 
 static DS4_MAYBE_UNUSED ds41_dspark *ds41_dspark_alloc(const ds4_dspark_weights *dw) {
@@ -112,6 +349,9 @@ static DS4_MAYBE_UNUSED ds41_dspark *ds41_dspark_alloc(const ds4_dspark_weights 
         1.0f / DS4_N_HC, DS41_DRAFT_WINDOW * DS4_N_HC) ||
         !ds4_gpu_tensor_fill_f32(d->tokens, 0, DS41_DRAFT_ROWS)) goto fail;
     ds41_dspark_reset(d);
+#ifdef __APPLE__
+    ds4_gpu_warm_v41_verify_pipelines();
+#endif
     return d;
 fail:
     ds41_dspark_free(d);
@@ -122,6 +362,7 @@ static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows) {
     if (!d) return true;
     d->rewind_end = 0;
+    if (!d->weights) return true;
     unsigned stage = 0;
     while (stage < 3 && d->weights->target_layers[stage] != layer) stage++;
     if (stage == 3) return true;
@@ -372,7 +613,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         for (uint32_t il = 0; ok && i < count && il < 40; il++)
             ok = ds4_gpu_tensor_copy(d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv,
                 g->window[il], slot * kv, kv);
-        for (uint32_t stage = 0; ok && i < count && stage < 3; stage++) {
+        for (uint32_t stage = 0; ok && d->weights && i < count && stage < 3; stage++) {
             d->old_positions[stage][i] = d->positions[stage][slot];
             ok = ds4_gpu_tensor_copy(d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature,
                 d->target[stage], slot * feature, feature);
@@ -446,7 +687,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_commit(ds41_dspark *d, ds41_gpu_graph *
         for (uint32_t il = 0; ok && il < 40; il++)
             ok = ds4_gpu_tensor_copy(g->window[il], slot * kv,
                 d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv, kv);
-        for (uint32_t stage = 0; ok && stage < 3; stage++) {
+        for (uint32_t stage = 0; ok && d->weights && stage < 3; stage++) {
             ok = ds4_gpu_tensor_copy(d->target[stage], slot * feature,
                 d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature, feature);
             d->positions[stage][slot] = d->old_positions[stage][i];
